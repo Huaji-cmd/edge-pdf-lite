@@ -17,6 +17,8 @@ const props = defineProps<{
   stats: RendererStats | null
   tool: ToolKind
   annotCount: number
+  /** 侧边栏（目录 / 缩略图）是否展开 */
+  sideOpen: boolean
   /**
    * 有没有还没写回文件的批注。
    *
@@ -37,6 +39,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   open: []
+  /** 展开 / 收起侧边栏（目录 / 缩略图） */
+  'toggle-side': []
   'go-to': [pageNumber: number]
   /** 按行翻页（双页模式一次翻一屏） */
   'step-page': [dir: -1 | 1]
@@ -122,6 +126,14 @@ function isOn(c: Rgb): boolean {
 <template>
   <div class="toolbar">
     <button class="btn primary" @click="emit('open')">打开 PDF</button>
+    <button
+      class="btn"
+      :class="{ on: sideOpen }"
+      title="目录 / 缩略图（PDF 没书签时这边是空的，用缩略图翻页）"
+      @click="emit('toggle-side')"
+    >
+      目录
+    </button>
 
     <span class="sep" />
 
@@ -365,6 +377,12 @@ function isOn(c: Rgb): boolean {
 .btn.primary {
   background: #2b6cb0;
   border-color: #2b6cb0;
+}
+/* 侧边栏开着时，"目录"按钮要亮着 —— 否则用户不知道去哪儿关 */
+.btn.on {
+  background: #2b3d57;
+  border-color: #4aa3ff;
+  color: #cfe4ff;
 }
 .btn.primary:hover {
   background: #3478c0;

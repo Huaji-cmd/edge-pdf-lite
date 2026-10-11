@@ -805,15 +805,37 @@ async function applyScale(next: number, anchor?: { x: number; y: number }): Prom
 }
 
 /** 滚到指定页（双页模式下滚到该页所在行） */
+/** 跳到某一页的页顶 */
 async function goToPage(pageNumber: number): Promise<void> {
+  await goToDestination(pageNumber, null)
+}
+
+/**
+ * 跳到某个书签位置：页 + **页内纵向位置**（目录点击走这条）。
+ *
+ * ⚠️ 坐标必须翻一下：`destTop` 是 **PDF 页面坐标**（原点在左下），
+ *    而版面里的 `p.y` 是**基准坐标**（原点在左上）：
+ *      y = p.y + (p.height − destTop)
+ *    漏了这一步的表现是"点标题跳到了那一页的**相反**一端"。
+ *
+ * ⚠️ 已知限制：`destTop` 是**未旋转**坐标，而 `p.height` 已含 /Rotate。
+ *    旋转页（/Rotate 90/270）上纵向会不准 —— 这类 PDF 少见，
+ *    且退化只是"落在页内某个位置"，不会跳错页。
+ */
+async function goToDestination(pageNumber: number, destTop: number | null): Promise<void> {
   const vp = viewportRef.value
   const l = layout.value
   if (!vp || !l) return
-  const target = l.pages.find((p) => p.pageNumber === pageNumber)
-  if (!target) return
-  // 页可能在更高的一行里，直接按基准 y 乘 scale 定位。
+  const p = l.pages.find((x) => x.pageNumber === pageNumber)
+  if (!p) return
+  let y = p.y
+  if (destTop !== null && Number.isFinite(destTop)) {
+    // 夹到页内：dest 有可能指到页外（比如指向页脚以下）
+    const fromTop = Math.max(0, Math.min(p.height, p.height - destTop))
+    y = p.y + fromTop
+  }
   // ⚠️ 这里的 `− ANCHOR_GAP` 必须和 `updateCurrentPage` 里的 `+ ANCHOR_GAP` 配对。
-  vp.scrollTop = Math.max(0, target.y * scale.value - ANCHOR_GAP)
+  vp.scrollTop = Math.max(0, y * scale.value - ANCHOR_GAP)
 }
 
 /** 所有行的基准 y（去重 + 升序） */
@@ -909,8 +931,12 @@ async function restoreTo(nextScale: number, pageNumber: number): Promise<void> {
 defineExpose({
   applyScale,
   goToPage,
+  /** 跳到书签位置：页 + 页内纵向位置（目录点击用） */
+  goToDestination,
   /** 按行翻页（‹ › / PageUp·PageDown）。双页模式一次翻一屏，见函数注释 */
   stepPage,
+  /** 版面基准尺寸，缩略图算宽高比要用 */
+  pageSizes: () => baseSizes.value,
   fitWidth,
   fitPage,
   restoreTo,

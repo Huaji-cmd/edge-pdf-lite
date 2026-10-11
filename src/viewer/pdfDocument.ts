@@ -1,5 +1,7 @@
 import { pdfjsLib, installPdfWorker, describePdfError } from '@/pdfjs'
 import type { PageSize } from './types'
+import type { OutlineNode } from './outline'
+import { parseOutline } from './outline'
 
 installPdfWorker()
 
@@ -28,6 +30,8 @@ export class PdfDocument {
   private readonly doc: pdfjsLib.PDFDocumentProxy
   private readonly pagePromises = new Map<number, Promise<pdfjsLib.PDFPageProxy>>()
   private readonly sizes = new Map<number, PageSize>()
+  /** 大纲只解析一次。缓存的是 **Promise 本身**，见 getOutline */
+  private outline: Promise<OutlineNode[]> | null = null
 
   private constructor(
     task: pdfjsLib.PDFDocumentLoadingTask,
@@ -95,9 +99,24 @@ export class PdfDocument {
     return Promise.all(pageNumbers.map((n) => this.getPageSize(n)))
   }
 
+  /**
+   * 大纲（书签 / 目录）。没有书签的文档返回空数组。
+   *
+   * ⚠️ 缓存的是 **Promise 本身**而不是结果：并发调用只会解析一次；
+   * 而且解析失败也会被记住，不会每次打开面板都重试一遍。
+   *
+   * ⚠️ 很多 PDF **根本没有书签** —— 尤其是扫描件（我那本《现代操作系统教程》
+   *    就是）。这不是错误，UI 要给一句清楚的空状态说明，别让人以为工具坏了。
+   */
+  getOutline(): Promise<OutlineNode[]> {
+    if (!this.outline) this.outline = parseOutline(this.doc)
+    return this.outline
+  }
+
   async close(): Promise<void> {
     this.pagePromises.clear()
     this.sizes.clear()
+    this.outline = null
     await this.task.destroy().catch(() => {})
   }
 }

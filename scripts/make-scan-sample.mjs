@@ -22,7 +22,14 @@ const OUT = join(ROOT, 'public', 'testdata', 'scan-like.pdf')
 
 const PAGE_W = 595.28 // A4 pt
 const PAGE_H = 841.89
-const PAGES = 3
+/**
+ * 页数可传参（默认 40）。
+ *
+ * 为什么要够多：缩略图的**懒渲染**只有在大文档上才测得出来 ——
+ * 十几页的样本全部落在预取窗口内，全渲染是正确行为，
+ * 拿它断言"不能全渲染"只会得到一条永远失败的假断言。
+ */
+const PAGES = Number(process.argv[2] ?? 40)
 
 /** 确定性伪随机 —— 每次生成的样本必须完全一致，否则测试截图没法比 */
 function makeRng(seed) {

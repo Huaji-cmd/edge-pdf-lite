@@ -3,6 +3,9 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch 
 import { PdfDocument } from './viewer/pdfDocument'
 import PdfViewer from './viewer/PdfViewer.vue'
 import ViewerToolbar from './viewer/ViewerToolbar.vue'
+import SidePanel from './viewer/SidePanel.vue'
+import type { PageSize } from './viewer/types'
+import type { OutlineNode } from './viewer/outline'
 import { loadReadingState, saveReadingState } from './viewer/readingState'
 import type { RendererStats } from './viewer/pageRenderer'
 import type { ViewMode } from './viewer/types'
@@ -18,6 +21,36 @@ const scale = ref(1.5)
 const mode = ref<ViewMode>('single')
 const spreadOffset = ref<0 | 1>(0)
 const page = ref(1)
+
+// ---------------------------------------------------------------- 侧边栏：目录 / 缩略图
+
+const sideOpen = ref(false)
+const outline = ref<OutlineNode[]>([])
+const outlineLoading = ref(false)
+/** 各页基准尺寸 —— 缩略图靠它算宽高比和占位高度（没渲染出来之前也要占位） */
+const pageSizes = ref<PageSize[] | null>(null)
+
+/**
+ * 加载书签目录。
+ *
+ * ⚠️ 空数组是**正常结果**，不是错误 —— 很多 PDF（尤其扫描件）根本没有书签。
+ *    真正的提示交给 `OutlinePanel` 的空状态文案，这里不要弹错误框。
+ */
+async function loadOutline(): Promise<void> {
+  const d = doc.value
+  if (!d) {
+    outline.value = []
+    return
+  }
+  outlineLoading.value = true
+  try {
+    outline.value = await d.getOutline()
+  } catch {
+    outline.value = []
+  } finally {
+    outlineLoading.value = false
+  }
+}
 const stats = ref<RendererStats | null>(null)
 const errorText = ref('')
 const busy = ref(false)
@@ -209,6 +242,11 @@ function scheduleSave(): void {
 async function onViewerReady(): Promise<void> {
   const d = doc.value
   if (!d) return
+
+  // ⚠️ 必须**无条件**设置（下面"没有记忆位置"时会提前 return）：
+  //    缩略图要拿各页尺寸算宽高比和占位高度
+  pageSizes.value = viewerRef.value?.pageSizes() ?? null
+
   const saved = loadReadingState(d.fingerprint)
   if (!saved) return
 
@@ -309,6 +347,9 @@ async function openBytes(bytes: Uint8Array, name: string): Promise<void> {
     flushSave()
     doc.value = next
     fileName.value = name
+    pageSizes.value = null
+    // 目录要重新解析 —— 批注和书签都是按文档归属的，不能跨文件漂
+    void loadOutline()
     page.value = 1
     scale.value = 1.5
     mode.value = 'single'
@@ -371,6 +412,11 @@ function goTo(p: number): void {
  */
 function stepPage(dir: 1 | -1): void {
   void viewerRef.value?.stepPage(dir)
+}
+
+/** 从目录跳转（带页内纵向位置，所以能落到具体段落而不是页顶） */
+function goToDest(p: number, top: number | null): void {
+  void viewerRef.value?.goToDestination(p, top)
 }
 
 function setScale(s: number): void {
@@ -535,12 +581,14 @@ onBeforeUnmount(() => {
       :tool="tool"
       :annot-count="annotCount"
       :unsaved="unsaved"
+      :side-open="sideOpen"
       :pointer-mode="pointerMode"
       :colors="colors"
       :selected="selected"
       :can-undo="canUndo"
       :can-redo="canRedo"
       @open="fileInputRef?.click()"
+      @toggle-side="sideOpen = !sideOpen"
       @go-to="goTo"
       @step-page="(d) => stepPage(d)"
       @set-scale="setScale"
@@ -557,57 +605,72 @@ onBeforeUnmount(() => {
       @export-annot="exportAnnotated"
     />
 
-    <PdfViewer
-      v-if="doc"
-      ref="viewerRef"
-      v-model:scale="scale"
-      :doc="doc"
-      :mode="mode"
-      :spread-offset="spreadOffset"
-      :tool="tool"
-      :pointer-mode="pointerMode"
-      :colors="colors"
-      @page-change="(p) => (page = p)"
-      @stats="(s) => (stats = s)"
-      @ready="onViewerReady"
-      @annot-count="onAnnotCount"
-      @sel-change="(s) => (selected = s)"
-      @history-change="onHistoryChange"
-      @tool-auto-exit="tool = 'none'"
-    />
+    <!-- 侧边栏：目录 / 缩略图。没打开文档时不显示（那时候目录没意义） -->
+    <div class="main">
+      <SidePanel
+        v-if="sideOpen && doc"
+        :doc="doc"
+        :outline="outline"
+        :outline-loading="outlineLoading"
+        :sizes="pageSizes"
+        :current-page="page"
+        @go-dest="goToDest"
+        @go-page="goTo"
+      />
 
-    <div v-else class="welcome">
-      <div class="welcome-box">
-        <h1>edge-pdf-lite</h1>
-        <p>把 PDF 拖进来，或者点左上角的「打开 PDF」。</p>
-        <div class="welcome-actions">
-          <button class="btn primary" @click="fileInputRef?.click()">选择文件</button>
-          <button v-if="canInstall" class="btn" @click="installApp">安装为应用</button>
+      <PdfViewer
+        v-if="doc"
+        ref="viewerRef"
+        v-model:scale="scale"
+        :doc="doc"
+        :mode="mode"
+        :spread-offset="spreadOffset"
+        :tool="tool"
+        :pointer-mode="pointerMode"
+        :colors="colors"
+        @page-change="(p) => (page = p)"
+        @stats="(s) => (stats = s)"
+        @ready="onViewerReady"
+        @annot-count="onAnnotCount"
+        @sel-change="(s) => (selected = s)"
+        @history-change="onHistoryChange"
+        @tool-auto-exit="tool = 'none'"
+      />
+
+      <div v-else class="welcome">
+        <div class="welcome-box">
+          <h1>edge-pdf-lite</h1>
+          <p>把 PDF 拖进来，或者点左上角的「打开 PDF」。</p>
+          <div class="welcome-actions">
+            <button class="btn primary" @click="fileInputRef?.click()">选择文件</button>
+            <button v-if="canInstall" class="btn" @click="installApp">安装为应用</button>
+          </div>
+          <p v-if="isTouchDevice" class="touch-hint">
+            触屏：<strong>单指</strong>画 / 选文字 · <strong>双指</strong>拖动或捏合缩放
+          </p>
+          <p class="hint">
+            快捷键：<kbd>Ctrl</kbd>+<kbd>滚轮</kbd> 缩放 ·
+            <kbd>PageUp</kbd>/<kbd>PageDown</kbd> 翻页 ·
+            <kbd>Ctrl</kbd>+<kbd>0</kbd> 回到 100%<br />
+            批注：<kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤销 ·
+            <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> 重做 ·
+            <kbd>Delete</kbd> 删除所选 ·
+            <kbd>Esc</kbd> 退出工具
+          </p>
+          <!--
+            B3 的说明。文件里已有的注释不进 store（符合"只改自己画的"这个设计），
+            但对用户来说那批批注是"看得见却点不动" —— 不说明就会被当成工具坏了。
+          -->
+          <p class="hint caveat">
+            ⚠️ 只改自己画的：PDF 里<b>原有的</b>批注看得见，但擦不掉、也拖不动<br />
+            ⚠️ <b>中文</b>文本框在别的查看器里只显示占位框（标准字体没有中文字形）——
+            文字没丢，在应用内和注释面板里都能看全
+          </p>
         </div>
-        <p v-if="isTouchDevice" class="touch-hint">
-          触屏：<strong>单指</strong>画 / 选文字 · <strong>双指</strong>拖动或捏合缩放
-        </p>
-        <p class="hint">
-          快捷键：<kbd>Ctrl</kbd>+<kbd>滚轮</kbd> 缩放 ·
-          <kbd>PageUp</kbd>/<kbd>PageDown</kbd> 翻页 ·
-          <kbd>Ctrl</kbd>+<kbd>0</kbd> 回到 100%<br />
-          批注：<kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤销 ·
-          <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> 重做 ·
-          <kbd>Delete</kbd> 删除所选 ·
-          <kbd>Esc</kbd> 退出工具
-        </p>
-        <!--
-          B3 的说明。文件里已有的注释不进 store（符合"只改自己画的"这个设计），
-          但对用户来说那批批注是"看得见却点不动" —— 不说明就会被当成工具坏了。
-        -->
-        <p class="hint caveat">
-          ⚠️ 只改自己画的：PDF 里<b>原有的</b>批注看得见，但擦不掉、也拖不动<br />
-          ⚠️ <b>中文</b>文本框在别的查看器里只显示占位框（标准字体没有中文字形）——
-          文字没丢，在应用内和注释面板里都能看全
-        </p>
       </div>
     </div>
 
+    <!-- 下面这些是覆盖层（position: fixed），留在 .app 下而不是侧边栏的 .main 里 -->
     <div v-if="dragging" class="drop-hint">松手打开 PDF</div>
     <div v-if="busy" class="overlay">{{ busyLabel }}</div>
     <div v-if="toast" class="toast">{{ toast }}</div>
@@ -635,6 +698,13 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   background: #14161a;
+}
+
+/* 工具栏下面这一横排：[侧边栏] [阅读区] */
+.main {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
 }
 
 .btn {
