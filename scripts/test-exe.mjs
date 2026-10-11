@@ -17,9 +17,10 @@
  * 然后用 CDP 连上去，塞一个 PDF 进去，数画布。
  */
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, renameSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
-import { resolve, dirname } from 'node:path'
+import { tmpdir } from 'node:os'
+import { resolve, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { clickByTidExpr } from './testids.mjs'
 
@@ -48,6 +49,32 @@ if (!existsSync(PDF)) {
 
 console.log(`exe: ${EXE}`)
 console.log(`PDF: ${PDF}\n`)
+
+/**
+ * ⚠️ 启动前必须清掉 WebView2 的数据目录。
+ *
+ * WebView2 会**缓存 index.html**。更新应用后如果旧的那份还在缓存里，
+ * 它会引用**已经不存在**的 chunk（构建产物的 hash 变了）→ 页面白屏、
+ * 而且**控制台一个错都不报**（请求返回的是 SPA fallback 的 index.html）。
+ * 我在这个问题上绕了好几圈，最后靠对比"exe 里嵌的文件名 vs 运行时请求的
+ * 文件名"才定位到 —— 两者的 hash 根本不一样。
+ *
+ * 用 rename 而不是删除：删除整个目录在部分环境下会触发批量删除护栏。
+ */
+function clearWebViewData() {
+  const base = process.env.LOCALAPPDATA
+  if (!base) return
+  for (const id of ['com.edge-pdf-lite.desktop', 'com.edge-pdf-lite.app']) {
+    const p = join(base, id)
+    if (!existsSync(p)) continue
+    try {
+      renameSync(p, join(tmpdir(), `epl-wv-${Date.now()}-${Math.random().toString(36).slice(2)}`))
+    } catch {
+      /* 清不掉就算了，只是可能影响这次测试 */
+    }
+  }
+}
+clearWebViewData()
 
 // ---------------------------------------------------------------- 启动 exe
 const proc = spawn(EXE, [], {
@@ -244,8 +271,64 @@ check(
   `最大间隔 ${blocked} ms（worker 正常时应该在几十 ms 量级）`,
 )
 
-// ---------------------------------------------------------------- 5. 控制台
-console.log('\n[5] 控制台')
+// ---------------------------------------------------------------- 5. 文件列表（桌面端专有能力）
+console.log('\n[5] 文件列表：真实路径 + 持久化 + 懒加载')
+/*
+ * 系统文件对话框在 headless 下没法模拟，所以不测"点添加文件"。
+ * 改测**更有价值的两件事**：列表能不能跨会话记住、点开文件夹是不是只扫一层。
+ * 做法：直接往 localStorage 里写一份"上次记住的列表"，重载看它回不回得来。
+ */
+const TDIR = resolve(ROOT, 'public/testdata')
+await evaluate(`
+  localStorage.setItem('epl:file-list', JSON.stringify([
+    { name: 'testdata', path: ${JSON.stringify(TDIR)}, kind: 'folder' },
+  ]))
+`)
+await send('Page.reload')
+await sleep(2600)
+
+await evaluate(clickByTidExpr('文件'))
+await sleep(700)
+
+const listRows = await evaluate(
+  `document.querySelectorAll('[data-tid="files-panel"] [data-node-id]').length`,
+)
+check('重载后列表自己回来了（持久化生效）', listRows >= 1, `条目数=${listRows}`)
+
+// 展开文件夹 —— 桌面端这时才去扫盘（懒加载）
+await evaluate(`document.querySelector('[data-tid="files-panel"] [data-kind="folder"]')?.click()`)
+await sleep(1500)
+const kidFiles = await evaluate(
+  `document.querySelectorAll('[data-tid="files-panel"] [data-node-id][data-kind="file"]').length`,
+)
+check('点开文件夹才扫出里面的 PDF（懒加载生效）', kidFiles > 0, `扫出 ${kidFiles} 个`)
+
+const listShot = await send('Page.captureScreenshot', { format: 'png' })
+await writeFile(
+  resolve(SHOTS, '02-exe-filelist.png'),
+  Buffer.from(listShot.data, 'base64'),
+)
+
+// 真的点开一个 —— 走 Rust 的 read_pdf_bytes
+await evaluate(`
+  (() => {
+    const rows = [...document.querySelectorAll('[data-tid="files-panel"] [data-kind="file"]')];
+    rows.find(r => /1706/.test(r.textContent))?.click();
+  })()
+`)
+let openedFromList = false
+for (let i = 0; i < 60; i++) {
+  await sleep(400)
+  const nm = await evaluate(`(document.querySelector('[data-tid="file-name"]')||{}).textContent||''`)
+  if (String(nm).includes('1706')) {
+    openedFromList = true
+    break
+  }
+}
+check('点列表里的文件真的打开了（Rust 读字节这条路通）', openedFromList)
+
+// ---------------------------------------------------------------- 6. 控制台
+console.log('\n[6] 控制台')
 const real = errors.filter((e) => !/favicon/i.test(e))
 check('没有未捕获异常 / error', real.length === 0, real.slice(0, 3).join(' | ') || '干净')
 

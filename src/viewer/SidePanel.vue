@@ -35,8 +35,8 @@ const emit = defineEmits<{
   'go-dest': [pageNumber: number, destTop: number | null]
   /** 跳到某一页 */
   'go-page': [pageNumber: number]
-  /** 点文件列表 / 搜索结果里的一个文件 */
-  'open-file': [file: File, nodeId: string]
+  /** 点文件列表 / 搜索结果里的一个文件（桌面端有真实路径，浏览器端只有 File） */
+  'open-file': [node: FileNode]
   /** 文件列表内容变了 */
   'files-change': []
 }>()
@@ -50,14 +50,14 @@ const emit = defineEmits<{
         :nodes="fileNodes"
         :current-id="currentFileId"
         :busy="busy"
-        @open="(f, id) => emit('open-file', f, id)"
+        @open="(n) => emit('open-file', n)"
         @change="emit('files-change')"
       />
       <SearchPanel
         v-else-if="panel === 'search'"
         :nodes="fileNodes"
         :current-id="currentFileId"
-        @open="(f, id) => emit('open-file', f, id)"
+        @open="(n) => emit('open-file', n)"
       />
 
       <OutlinePanel

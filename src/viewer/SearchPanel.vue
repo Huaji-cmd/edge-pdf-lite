@@ -18,7 +18,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  open: [file: File, nodeId: string]
+  open: [node: FileNode]
 }>()
 
 const q = ref('')
@@ -42,8 +42,13 @@ const hits = computed(() => {
   return allFiles.value.filter((f) => f.node.name.toLowerCase().includes(key))
 })
 
+/**
+ * 点搜索结果。
+ * ⚠️ 别在这里判 `node.file` —— 桌面端的文件是**真实路径**，没有 File 对象，
+ *    那样判断会让整个搜索结果在 exe 里点不动。
+ */
 function pick(node: FileNode): void {
-  if (node.file) emit('open', node.file, node.id)
+  emit('open', node)
 }
 </script>
 

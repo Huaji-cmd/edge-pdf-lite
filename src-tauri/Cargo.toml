@@ -45,3 +45,4 @@ tauri-plugin-log = "2"
 #    显式在这里依赖 indexmap 并开启 std，靠 Cargo 的 feature 统一
 #    把 has_std 打开，schemars 那行就合法了。
 indexmap = { version = "1.9", features = ["std"] }
+tauri-plugin-dialog = "2.8.2"

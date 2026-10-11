@@ -13,7 +13,6 @@
 import { computed, ref, onMounted, onBeforeUnmount } from 'vue'
 import Icon from './Icon.vue'
 import type { ViewMode } from './types'
-import type { RendererStats } from './pageRenderer'
 import type { ToolKind, ToolColors, PointerMode, Rgb } from '@/annot/types'
 import { swatchesFor, POINTER_MODES, isColorTool } from '@/annot/types'
 import type { SelectedInfo } from '@/annot/types'
@@ -25,7 +24,6 @@ const props = defineProps<{
   scale: number
   mode: ViewMode
   spreadOffset: 0 | 1
-  stats: RendererStats | null
   tool: ToolKind
   annotCount: number
   /**
@@ -438,13 +436,6 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
       <Icon name="save" />
     </button>
 
-    <span v-if="stats" class="stats">
-      <template v-if="stats.running > 0 || stats.queued > 0">
-        渲染中 {{ stats.running }} · 排队 {{ stats.queued }}
-      </template>
-      <template v-else-if="stats.lastRenderMs > 0">单页 {{ stats.lastRenderMs.toFixed(0) }} ms</template>
-      <template v-else>就绪</template>
-    </span>
   </div>
 
   <!-- 颜色菜单：fixed 定位，避免被功能区的横向溢出裁掉 -->
@@ -627,13 +618,6 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
   color: #fbbf24;
   font-size: 11px;
   padding: 0 6px;
-  white-space: nowrap;
-}
-
-.stats {
-  color: #6b7480;
-  font-size: 11px;
-  padding-left: 8px;
   white-space: nowrap;
 }
 

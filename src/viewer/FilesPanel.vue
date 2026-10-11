@@ -8,7 +8,15 @@
  */
 import { computed, ref } from 'vue'
 import Icon from './Icon.vue'
-import { addFiles, addFolder, removeNode, type FileNode } from './fileList'
+import {
+  addFiles,
+  addFolder,
+  addFilesViaDialog,
+  addFolderViaDialog,
+  loadChildren,
+  removeNode,
+  type FileNode,
+} from './fileList'
 import { IS_TAURI } from '@/platform'
 
 const props = defineProps<{
@@ -20,8 +28,8 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  /** 用户点了一个文件 —— 由上层去读字节并打开 */
-  open: [file: File, nodeId: string]
+  /** 用户点了一个文件 —— 由上层去读字节并打开（桌面端走 Rust 读，浏览器端读 File） */
+  open: [node: FileNode]
   /** 列表内容变了 */
   change: []
 }>()
@@ -34,11 +42,38 @@ function isOpen(id: string): boolean {
   return expanded.value.has(id)
 }
 
-function toggle(id: string): void {
-  // ⚠️ Set 是引用类型，必须换一个新 Set 才会触发 Vue 更新
+/**
+ * 展开 / 收起一个文件夹。
+ *
+ * ⚠️ 只在**第一次展开**时去扫目录（桌面端 `loadChildren`）——
+ *    这就是"懒加载"：用户误加一个大目录也不会一上来就卡住。
+ */
+async function toggle(node: FileNode): Promise<void> {
+  if (node.kind !== 'folder') return
   const next = new Set(expanded.value)
-  next.has(id) ? next.delete(id) : next.add(id)
+  if (next.has(node.id)) {
+    next.delete(node.id)
+  } else {
+    next.add(node.id)
+    // 扫大目录会有一点延迟，不给反馈的话点箭头像"没反应"
+    markLoading(node.id, true)
+    try {
+      await loadChildren(node) // 内部有 loaded 标记，扫过就不再重复扫
+    } finally {
+      markLoading(node.id, false)
+    }
+  }
+  // ⚠️ Set 是引用类型，必须换一个新 Set 才会触发 Vue 更新
   expanded.value = next
+}
+
+/** 正在扫盘的文件夹（显示"…"用） */
+const loading = ref<Set<string>>(new Set())
+
+function markLoading(id: string, on: boolean): void {
+  const next = new Set(loading.value)
+  on ? next.add(id) : next.delete(id)
+  loading.value = next
 }
 
 // ---------------- 添加
@@ -88,8 +123,19 @@ function closeMenu(): void {
   menu.value = null
 }
 
-function menuPick(which: 'file' | 'folder'): void {
+/**
+ * 菜单里的「添加文件…」/「添加文件夹…」。
+ *
+ * ⚠️ 桌面端和浏览器端是**两套**：桌面端弹系统对话框拿**真实路径**
+ *    （可持久化、可懒加载），浏览器端只能调 `<input>` 拿临时 File。
+ */
+async function menuPick(which: 'file' | 'folder'): Promise<void> {
   closeMenu()
+  if (IS_TAURI) {
+    const n = which === 'file' ? await addFilesViaDialog() : await addFolderViaDialog()
+    if (n > 0) emit('change')
+    return
+  }
   which === 'file' ? pickFiles() : pickFolder()
 }
 
@@ -97,11 +143,10 @@ function menuPick(which: 'file' | 'folder'): void {
 
 function openNode(n: FileNode): void {
   if (n.kind === 'folder') {
-    toggle(n.id)
+    void toggle(n)
     return
   }
-  if (!n.file) return
-  emit('open', n.file, n.id)
+  emit('open', n)
 }
 
 function dropNode(n: FileNode): void {
@@ -173,6 +218,7 @@ const rows = computed(() => {
 
         <Icon :name="r.node.kind === 'folder' ? 'folder' : 'file'" class="leaf" />
         <span class="name">{{ r.node.name }}</span>
+        <span v-if="loading.has(r.node.id)" class="busy" title="正在读这一层…">…</span>
 
         <button
           class="rm"
@@ -247,6 +293,21 @@ const rows = computed(() => {
 .row.cur {
   background: #2b3d57;
   color: #9ecbff;
+}
+
+.busy {
+  flex: 0 0 auto;
+  color: #6b7480;
+  animation: pulse 1s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 /* 缩进用行内 padding-left 给（见模板），这里不写死层级 */

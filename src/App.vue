@@ -5,12 +5,18 @@ import PdfViewer from './viewer/PdfViewer.vue'
 import ViewerToolbar from './viewer/ViewerToolbar.vue'
 import SidePanel from './viewer/SidePanel.vue'
 import TitleBar from './viewer/TitleBar.vue'
-import { useFileList } from './viewer/fileList'
+import {
+  useFileList,
+  readPdfBytes,
+  stillExists,
+  restoreList,
+  pruneMissing,
+} from './viewer/fileList'
+import type { FileNode } from './viewer/fileList'
 import { IS_TAURI } from './platform'
 import type { PageSize, SidePanelKind } from './viewer/types'
 import type { OutlineNode } from './viewer/outline'
 import { loadReadingState, saveReadingState } from './viewer/readingState'
-import type { RendererStats } from './viewer/pageRenderer'
 import type { ViewMode } from './viewer/types'
 import type { ToolKind, ToolColors, PointerMode, Rgb, SelectedInfo } from './annot/types'
 import { defaultToolColors, isColorTool } from './annot/types'
@@ -56,7 +62,6 @@ async function loadOutline(): Promise<void> {
     outlineLoading.value = false
   }
 }
-const stats = ref<RendererStats | null>(null)
 const errorText = ref('')
 const busy = ref(false)
 const busyLabel = ref('正在打开…')
@@ -364,7 +369,6 @@ async function openBytes(bytes: Uint8Array, name: string): Promise<boolean> {
     scale.value = 1.5
     mode.value = 'single'
     spreadOffset.value = 0
-    stats.value = null
     // 新文档接管之后再关掉旧的，避免中间出现空白
     if (prev) void prev.close()
     return true
@@ -385,12 +389,26 @@ const currentFileId = ref<string | null>(null)
 /**
  * 点文件列表 / 搜索结果里的一个文件。
  *
+ * 读字节这一步**两套实现**：桌面端用真实路径走 Rust 读，
+ * 浏览器端读那个临时 File 对象（见 fileList.ts 的文件头）。
+ *
  * ⚠️ 高亮**只在真的打开成功之后**才切过去 —— 用户在"未保存批注"的确认框上
  *    点了取消的话，列表还停在原来那份文件上，不能提前跳走。
  */
-async function openFromList(file: File, nodeId: string): Promise<void> {
-  const buf = new Uint8Array(await file.arrayBuffer())
-  if (await openBytes(buf, file.name)) currentFileId.value = nodeId
+async function openFromList(node: FileNode): Promise<void> {
+  // 桌面端：上次记住的文件可能已经被删了/移走了
+  if (!(await stillExists(node))) {
+    showToast(`《${node.name}》已经不在原来的位置了`)
+    return
+  }
+  let bytes: Uint8Array
+  try {
+    bytes = await readPdfBytes(node)
+  } catch (e) {
+    errorText.value = (e as Error).message
+    return
+  }
+  if (await openBytes(bytes, node.name)) currentFileId.value = node.id
 }
 
 async function onPickFile(e: Event): Promise<void> {
@@ -620,6 +638,12 @@ onMounted(() => {
   window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt)
   window.addEventListener('appinstalled', onInstalled)
 
+  // 桌面端：恢复上次记住的文件列表，并清掉其中已经不存在的条目
+  if (IS_TAURI) {
+    restoreList()
+    void pruneMissing()
+  }
+
   // 桌面端：同步最大化状态，并跟着窗口变化更新（标题栏的图标要靠它切换）
   if (IS_TAURI) {
     void syncMaximized()
@@ -668,7 +692,6 @@ onBeforeUnmount(() => {
       :scale="scale"
       :mode="mode"
       :spread-offset="spreadOffset"
-      :stats="stats"
       :tool="tool"
       :annot-count="annotCount"
       :unsaved="unsaved"
@@ -726,7 +749,6 @@ onBeforeUnmount(() => {
         :pointer-mode="pointerMode"
         :colors="colors"
         @page-change="(p) => (page = p)"
-        @stats="(s) => (stats = s)"
         @ready="onViewerReady"
         @annot-count="onAnnotCount"
         @sel-change="(s) => (selected = s)"
@@ -737,7 +759,7 @@ onBeforeUnmount(() => {
       <div v-else class="welcome">
         <div class="welcome-box">
           <h1>edge-pdf-lite</h1>
-          <p>把 PDF 拖进来，或者点左上角的「打开 PDF」。</p>
+          <p>把 PDF 拖进来，或者点顶栏的文件夹图标 / 左侧「文件」面板添加。</p>
           <div class="welcome-actions">
             <button class="btn primary" @click="fileInputRef?.click()">选择文件</button>
             <button v-if="canInstall" class="btn" @click="installApp">安装为应用</button>
@@ -753,15 +775,6 @@ onBeforeUnmount(() => {
             <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> 重做 ·
             <kbd>Delete</kbd> 删除所选 ·
             <kbd>Esc</kbd> 退出工具
-          </p>
-          <!--
-            B3 的说明。文件里已有的注释不进 store（符合"只改自己画的"这个设计），
-            但对用户来说那批批注是"看得见却点不动" —— 不说明就会被当成工具坏了。
-          -->
-          <p class="hint caveat">
-            ⚠️ 只改自己画的：PDF 里<b>原有的</b>批注看得见，但擦不掉、也拖不动<br />
-            ⚠️ <b>中文</b>文本框在别的查看器里只显示占位框（标准字体没有中文字形）——
-            文字没丢，在应用内和注释面板里都能看全
           </p>
         </div>
       </div>
@@ -859,15 +872,6 @@ onBeforeUnmount(() => {
 .hint {
   margin-top: 22px !important;
   font-size: 12px !important;
-}
-/* 这条是"限制说明"，不能跟普通快捷键提示一个观感 —— 它要能被当成警示 */
-.hint.caveat {
-  margin-top: 8px !important;
-  color: #b9954f !important;
-}
-.hint.caveat b {
-  color: #e0c07a;
-  font-weight: 600;
 }
 kbd {
   background: #262b33;
