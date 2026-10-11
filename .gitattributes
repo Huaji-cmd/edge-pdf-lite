@@ -1,0 +1,15 @@
+# 行尾：仓库里统一存 LF，检出时按平台自动转换
+* text=auto
+
+# ⚠️ Windows 批处理必须是 CRLF。LF 的 .bat 在部分系统上会解析异常
+#    （症状是"命令莫名跳行"或直接不执行），这里强制覆盖上面的 auto
+*.bat text eol=crlf
+
+# 二进制，不要做行尾转换也不要做 diff
+*.png binary
+*.jpg binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary

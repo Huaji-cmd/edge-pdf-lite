@@ -1,0 +1,48 @@
+{
+  "name": "edge-pdf-lite",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "轻量 PDF 阅读 + 批注编辑器（面向低配 Windows）",
+  "scripts": {
+    "postinstall": "node scripts/copy-pdfjs-assets.mjs",
+    "pdfjs-assets": "node scripts/copy-pdfjs-assets.mjs",
+    "testdata": "node scripts/make-testdata.mjs",
+    "testdata:annot": "node scripts/make-annot-fixture.mjs",
+    "dev": "vite",
+    "dev:host": "vite --host",
+    "icons": "node scripts/make-icons.mjs",
+    "prebuild": "npm run icons",
+    "build-only": "vite build",
+    "build": "vue-tsc --noEmit -p tsconfig.json && vite build",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json",
+    "preview": "vite preview",
+    "preview:host": "vite preview --host",
+    "serve:dist": "node scripts/serve-dist.mjs",
+    "app": "node scripts/app.mjs",
+    "spike": "node scripts/spike-run-crop-render.mjs",
+    "test:viewer": "node scripts/test-viewer.mjs",
+    "test:annot": "node scripts/test-annot.mjs",
+    "test:writer": "node scripts/test-writer.mjs",
+    "test:interact": "node scripts/test-interact.mjs",
+    "test:touch": "node scripts/test-touch.mjs",
+    "test:pwa": "node scripts/test-pwa.mjs",
+    "test": "node scripts/test-viewer.mjs && node scripts/test-annot.mjs && node scripts/test-writer.mjs && node scripts/test-interact.mjs && node scripts/test-touch.mjs && node scripts/test-pwa.mjs",
+    "variants": "node scripts/make-highlight-variants.mjs",
+    "edge:shot": "node scripts/edge-pdf-shot.mjs",
+    "probe:worker": "node scripts/probe-worker.mjs"
+  },
+  "dependencies": {
+    "@cantoo/pdf-lib": "^2.11.1",
+    "pdfjs-dist": "^6.4.299",
+    "pinia": "^4.0.3",
+    "vue": "^3.5.43"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@vitejs/plugin-vue": "^6.0.10",
+    "typescript": "~5.9.3",
+    "vite": "^8.3.4",
+    "vue-tsc": "^3.3.13"
+  }
+}

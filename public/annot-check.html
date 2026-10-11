@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>批注兼容性核对清单 · edge-pdf-lite</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#14161a; color:#e6e9ef; font:14px/1.6 system-ui,"Microsoft YaHei",sans-serif; padding:28px; max-width:1000px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 6px; }
+  .sub { color:#8b93a1; font-size:13px; margin-bottom:20px; }
+  table { border-collapse:collapse; width:100%; margin:16px 0 24px; }
+  th,td { border:1px solid #2a2f38; padding:9px 11px; text-align:left; vertical-align:top; font-size:13px; }
+  th { background:#1b1f26; color:#a8b0bd; font-weight:600; }
+  td.pg { font-weight:700; color:#6ea8fe; white-space:nowrap; }
+  .hint { background:#1a1d23; border-left:3px solid #6ea8fe; padding:12px 16px; border-radius:6px; margin:18px 0; font-size:13px; }
+  .warn { border-left-color:#f0b429; }
+  code { background:#22262e; padding:1px 5px; border-radius:4px; font-size:12px; }
+  a.btn { display:inline-block; background:#2b5fd9; color:#fff; padding:9px 16px; border-radius:7px; text-decoration:none; font-weight:600; margin-right:10px; }
+  a.btn.alt { background:#2a2f38; }
+</style>
+</head>
+<body>
+  <h1>批注兼容性核对清单</h1>
+  <div class="sub">
+    样本：<code>testdata/annot-fixture.pdf</code> · 共 7 页 · 每条注释的 <code>/NM</code> 前缀为 <code>epl:</code>，作者 <code>edge-pdf-lite</code>
+  </div>
+
+  <a class="btn" href="testdata/annot-fixture.pdf" target="_blank">打开样本 PDF</a>
+  <a class="btn alt" href="./index.html">回到阅读器</a>
+
+  <div class="hint">
+    <b>怎么用：</b>在<b>每个查看器</b>里各打开一次这个 PDF，对照下面每一行看两处 ——
+    ① <b>页面上有没有画出来</b>（外观）；② <b>注释面板里有没有列出来</b>（结构）。
+    两处都要看：有些查看器不画但会列出，有些反过来。
+  </div>
+
+  <table>
+    <tr><th>页</th><th>内容</th><th>页面上应该看到</th><th>注释面板应该列出</th><th>关注点</th></tr>
+    <tr><td class="pg">P1</td><td>Highlight + /AP + Z 序</td><td>黄色高亮压在 Line 2 / Line 3 上</td><td>列出 1 条 Highlight</td><td>基准</td></tr>
+    <tr><td class="pg">P2</td><td>Highlight 无 /AP + Z 序</td><td>能否画出高亮？（看查看器）</td><td>列出 1 条 Highlight</td><td>与 P1 对比</td></tr>
+    <tr><td class="pg">P3</td><td>Highlight 无 /AP + 逆时针序</td><td>与 P2 相比是否错位/翻转</td><td>列出 1 条 Highlight</td><td>与 P2 对比</td></tr>
+    <tr><td class="pg">P4</td><td>Ink 手写 + /AP</td><td>红色波浪线</td><td>列出 1 条 Ink</td><td>扫描件唯一可用工具</td></tr>
+    <tr><td class="pg">P5</td><td>FreeText 文本框 + /AP</td><td>蓝框 + 蓝字</td><td>列出 1 条 FreeText</td><td></td></tr>
+    <tr><td class="pg">P6</td><td>Square + StrikeOut + Underline</td><td>红框 / 删除线 / 下划线</td><td>列出 3 条</td><td></td></tr>
+    <tr><td class="pg">P7</td><td>Highlight + /AP + 逆时针序</td><td>应与 P1 完全一样</td><td>列出 1 条 Highlight</td><td>验证 /AP 优先</td></tr>
+  </table>
+
+  <div class="hint warn">
+    <b>最要紧的三条：</b><br />
+    1. <b>P2 如果是空白</b> → 说明 <code>/AP</code> 是<b>必须</b>生成的，我们的写回方案必须强制带上它。<br />
+    2. <b>P3 如果错位或翻转</b>（而 P2 正常）→ 说明 QuadPoints 顺序真的有影响，一律用 Z 序。<br />
+    3. <b>P7 如果和 P1 一样</b> → 说明有 <code>/AP</code> 时顺序不重要，<code>/AP</code> 是最终的兜底。
+  </div>
+
+  <div class="hint">
+    建议逐个试：<b>Edge</b>（你的日常）、<b>Chrome</b>、<b>Adobe Acrobat</b>（如果有）、<b>Firefox</b>。
+    在每个里面截一张 P1~P7 的图，再把注释面板展开截一张。
+  </div>
+</body>
+</html>

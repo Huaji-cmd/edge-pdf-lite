@@ -1,0 +1,62 @@
+:root {
+  color-scheme: dark;
+  --bg: #16181d;
+  --panel: #1e2128;
+  --line: #2e333d;
+  --fg: #e6e8ec;
+  --dim: #9aa3b2;
+  --accent: #60a5fa;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --err: #f87171;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+/*
+ * 触屏基线（Surface / 平板 / 触屏笔记本）。
+ *
+ * ⚠️ `overscroll-behavior: none` 是「手指一滑就返回上一页」的**直接解药**。
+ *    横向滑到滚动容器边界时，Edge/Chrome 会把这次 overscroll 翻译成历史导航
+ *    （swipe to go back）。这条跟 touch-action 是两件事：
+ *      touch-action 管「这一片区域的手势归谁」
+ *      overscroll-behavior 管「滚到头之后还能干嘛」
+ *    只加 touch-action 拦不住导航。
+ *
+ * ⚠️ `touch-action: manipulation` 干掉**双击缩放**（我们自己实现了 Ctrl+滚轮
+ *    和捏合缩放，浏览器那套会跟我们抢），但保留 pan，所以正常滚动不受影响。
+ *
+ * ⚠️ `-webkit-touch-callout` + `-webkit-tap-highlight` 去掉长按菜单和点击高亮 ——
+ *    在拖动/书写场景下它们表现为"按下去半天没反应"和满屏蓝框。
+ */
+html,
+body {
+  overscroll-behavior: none;
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.6 -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+}
+
+button {
+  font: inherit;
+}

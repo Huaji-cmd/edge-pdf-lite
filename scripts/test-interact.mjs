@@ -1,0 +1,856 @@
+/**
+ * 批注交互（M7）端到端验证：选色 · 拖动 · 改大小 · 撤销/重做 · 三种指针模式。
+ *
+ * 为什么要单独一个脚本而不是塞进 test-viewer.mjs：
+ * 那套测的是"阅读器"（渲染/懒加载/缩放/版面），断言建立在"文档上没有批注"的前提上；
+ * 这一套测的是"编辑器"，会往页面上画东西、拖动、撤销 —— 混在一起会互相干扰
+ * （比如 test-viewer 断言"高亮是黄色"，这里偏偏要把高亮改成绿色）。
+ *
+ * 判据用**数据 + 像素双通道**：
+ *   · 数据：`__eplViewer.annots()` 读 rect / color，能抓到"框没动""手柄方向反了"
+ *   · 像素：数画布里特定颜色的像素，能抓到"数据对了但没画出来"
+ *
+ * 用法：node scripts/test-interact.mjs [url]
+ */
+import { spawn } from 'node:child_process'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const SHOTS = resolve(ROOT, 'interact-shots')
+await mkdir(SHOTS, { recursive: true })
+
+const URL_TARGET = process.argv[2] ?? 'http://localhost:4173/'
+const PDF = resolve(ROOT, 'public/testdata/real-1706.03762.pdf')
+const PORT = Number(process.env.EPL_PORT ?? 9511)
+
+const EDGE = [
+  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+].find((p) => existsSync(p))
+
+if (!EDGE) {
+  console.error('找不到浏览器')
+  process.exit(1)
+}
+if (!existsSync(PDF)) {
+  console.error(`找不到测试 PDF：${PDF}\n先跑 node scripts/make-testdata.mjs`)
+  process.exit(1)
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const userDataDir = await mkdtemp(join(tmpdir(), 'epl-interact-'))
+let child
+let ws
+let passed = 0
+let failed = 0
+
+function check(name, ok, detail = '') {
+  if (ok) {
+    passed++
+    console.log(`  ✅ ${name}${detail ? '  ' + detail : ''}`)
+  } else {
+    failed++
+    console.log(`  ❌ ${name}${detail ? '  ' + detail : ''}`)
+  }
+  return ok
+}
+
+const near = (a, b, tol) => Math.abs(a - b) <= tol
+
+try {
+  child = spawn(
+    EDGE,
+    [
+      '--headless=new',
+      `--remote-debugging-port=${PORT}`,
+      `--user-data-dir=${userDataDir}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-extensions',
+      '--window-size=1280,900',
+      'about:blank',
+    ],
+    { stdio: 'ignore' },
+  )
+
+  let wsUrl = null
+  for (let i = 0; i < 80 && !wsUrl; i++) {
+    await sleep(250)
+    try {
+      const list = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json()
+      wsUrl = list.find((t) => t.type === 'page')?.webSocketDebuggerUrl ?? null
+    } catch {
+      /* 还没起来 */
+    }
+  }
+  if (!wsUrl) throw new Error('DevTools 没起来')
+
+  ws = new WebSocket(wsUrl)
+  await new Promise((res, rej) => {
+    ws.addEventListener('open', res)
+    ws.addEventListener('error', rej)
+  })
+
+  let id = 0
+  const pending = new Map()
+  const consoleErrors = []
+  ws.addEventListener('message', (ev) => {
+    const m = JSON.parse(ev.data)
+    if (m.id !== undefined && pending.has(m.id)) {
+      const { resolve: res, reject } = pending.get(m.id)
+      pending.delete(m.id)
+      m.error ? reject(new Error(JSON.stringify(m.error))) : res(m.result)
+      return
+    }
+    if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') {
+      consoleErrors.push(
+        (m.params.args ?? []).map((a) => a.value ?? a.description ?? '').join(' ').slice(0, 300),
+      )
+    }
+    if (m.method === 'Runtime.exceptionThrown') {
+      consoleErrors.push(
+        'EXCEPTION: ' + (m.params.exceptionDetails?.exception?.description ?? '').slice(0, 300),
+      )
+    }
+  })
+  const send = (method, params = {}) =>
+    new Promise((res, rej) => {
+      const n = ++id
+      pending.set(n, { resolve: res, reject: rej })
+      ws.send(JSON.stringify({ id: n, method, params }))
+    })
+
+  const evaluate = async (expression, awaitPromise = true) => {
+    const r = await send('Runtime.evaluate', { expression, awaitPromise, returnByValue: true })
+    if (r.exceptionDetails) {
+      throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text)
+    }
+    return r.result?.value
+  }
+
+  const shot = async (name) => {
+    const r = await send('Page.captureScreenshot', { format: 'png' })
+    await writeFile(join(SHOTS, `${name}.png`), Buffer.from(r.data, 'base64'))
+  }
+
+  /** 截一块区域，返回 base64（不落盘）。
+   *  用来做"高亮前 vs 高亮后"的同区域像素对比。 */
+  const captureClip = async (clip) => {
+    const r = await send('Page.captureScreenshot', { format: 'png', clip: { ...clip, scale: 1 } })
+    return r.data
+  }
+
+  /**
+   * 对比同一区域的两张截图，回答一个问题：**加了高亮之后，字本身变了吗？**
+   *
+   * 判据（这是"染背景"和"盖色板"的分水岭）：
+   *  - multiply 只能让像素**变暗或不变**（黑 × 任何色 = 黑）。所以"原本是字的像素
+   *    任何一个被提亮"就说明走的是半透明覆盖，直接判失败。
+   *  - 反过来，原本是白底的像素必须真的变成高亮色 —— 否则等于没画上去。
+   *
+   * 两张 PNG 丢回页面里解码（浏览器自带解码器，省掉一个 Node 端 PNG 库）。
+   */
+  const compareShots = async (b64Before, b64After) =>
+    JSON.parse(
+      await evaluate(`
+        (async () => {
+          const load = async (b64) => {
+            const img = new Image();
+            img.src = 'data:image/png;base64,' + b64;
+            await img.decode();
+            const c = document.createElement('canvas');
+            c.width = img.naturalWidth; c.height = img.naturalHeight;
+            const x = c.getContext('2d');
+            x.drawImage(img, 0, 0);
+            return x.getImageData(0, 0, c.width, c.height).data;
+          };
+          const A = await load(${JSON.stringify(b64Before)});
+          const B = await load(${JSON.stringify(b64After)});
+          const lum = (d, i) => 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+          let textN = 0, bgN = 0;
+          let beforeSum = 0, afterSum = 0, maxAfter = 0, lightened = 0;
+          let bgR = 0, bgG = 0, bgB = 0;
+          const n = Math.min(A.length, B.length);
+          for (let i = 0; i < n; i += 4) {
+            const la = lum(A, i), lb = lum(B, i);
+            if (la < 120) {              // 字的笔画（含抗锯齿边缘）
+              textN++; beforeSum += la; afterSum += lb;
+              if (lb > maxAfter) maxAfter = lb;
+              if (lb > la + 2) lightened++;
+            } else if (la > 240) {       // 干净的白底
+              bgN++; bgR += B[i]; bgG += B[i+1]; bgB += B[i+2];
+            }
+          }
+          return JSON.stringify({
+            textN, bgN,
+            beforeLum: textN ? beforeSum / textN : 0,
+            afterLum: textN ? afterSum / textN : 0,
+            maxAfterLum: maxAfter,
+            lightened,
+            bg: bgN ? [bgR / bgN, bgG / bgN, bgB / bgN] : null,
+          });
+        })()
+      `),
+    )
+
+  await send('Runtime.enable')
+  await send('Page.enable')
+  await send('DOM.enable')
+
+  // ---------------------------------------------------------------- 探针
+
+  /** 点工具栏上某个按钮（按文字精确匹配） */
+  const toolbarBtn = (label) =>
+    evaluate(`
+      (() => {
+        const b = [...document.querySelectorAll('.toolbar .btn')]
+          .find(x => x.textContent.trim() === ${JSON.stringify(label)});
+        if (!b) return false;
+        b.click();
+        return true;
+      })()
+    `)
+
+  /** 点第 i 个色块（0 起）。返回它的背景色，便于确认点对了 */
+  const clickSwatch = (i) =>
+    evaluate(`
+      (() => {
+        const sw = document.querySelectorAll('.toolbar .sw');
+        if (!sw[${i}]) return null;
+        const bg = getComputedStyle(sw[${i}]).backgroundColor;
+        sw[${i}].click();
+        return bg;
+      })()
+    `)
+
+  const swatchCount = () => evaluate(`document.querySelectorAll('.toolbar .sw').length`)
+
+  const snap = async () => JSON.parse(await evaluate(`JSON.stringify(globalThis.__eplViewer.snapshot())`))
+  const annots = async () => JSON.parse(await evaluate(`JSON.stringify(globalThis.__eplViewer.annots())`))
+
+  /** 选中框 + 8 个手柄在**屏幕**上的位置 —— 直接测用户看到和点到的东西 */
+  const selGeometry = async () =>
+    JSON.parse(
+      await evaluate(`
+        (() => {
+          const box = document.querySelector('.sel-box');
+          if (!box) return JSON.stringify(null);
+          const r = box.getBoundingClientRect();
+          const handles = {};
+          for (const h of document.querySelectorAll('.sel-handle')) {
+            const hr = h.getBoundingClientRect();
+            handles[h.dataset.handle] = { x: hr.left + hr.width / 2, y: hr.top + hr.height / 2 };
+          }
+          return JSON.stringify({
+            left: r.left, top: r.top, width: r.width, height: r.height,
+            cx: r.left + r.width / 2, cy: r.top + r.height / 2,
+            handles, handleCount: Object.keys(handles).length,
+          });
+        })()
+      `),
+    )
+
+  /** 数批注浮层上"某个颜色"的像素 —— 数据对了但没画出来，靠这条抓 */
+  const colorPixels = async (rgb, tol = 40) =>
+    Number(
+      await evaluate(`
+        (() => {
+          // 每页两层 canvas（under=高亮 / over=其余），全部扫一遍
+          const layers = [...document.querySelectorAll('.page-slot .annot-layer')];
+          if (!layers.length) return 0;
+          let n = 0;
+          for (const layer of layers) {
+            const d = layer.getContext('2d').getImageData(0, 0, layer.width, layer.height).data;
+            for (let i = 0; i < d.length; i += 4) {
+              if (d[i+3] < 40) continue;
+              if (Math.abs(d[i]-${rgb[0]}) <= ${tol} &&
+                  Math.abs(d[i+1]-${rgb[1]}) <= ${tol} &&
+                  Math.abs(d[i+2]-${rgb[2]}) <= ${tol}) n++;
+            }
+          }
+          return n;
+        })()
+      `),
+    )
+
+  /**
+   * 某条批注在**屏幕**上的中心点。
+   *
+   * 页面空间 → 屏幕：`x_screen = slot.left + x_page * scale`，
+   * `y_screen = slot.top + slot.height - y_page * scale`（y 轴翻转）。
+   *
+   * ⚠️ 别用"创建时点击的那一点"当中心：文本框是从点击处**向左上**长出来的，
+   * 点下的那一点是框的右下角，拿它当中心会点空。
+   */
+  const centerOf = async (id) =>
+    JSON.parse(
+      await evaluate(`
+        (() => {
+          const a = globalThis.__eplViewer.annots().find(x => x.id === ${JSON.stringify(id)});
+          if (!a) return JSON.stringify(null);
+          const snap = globalThis.__eplViewer.snapshot();
+          const s = document.querySelector('.page-slot[data-page="' + a.pageNumber + '"]');
+          if (!s) return JSON.stringify(null);
+          const r = s.getBoundingClientRect();
+          return JSON.stringify({
+            x: r.left + ((a.rect[0] + a.rect[2]) / 2) * snap.scale,
+            y: r.top + r.height - ((a.rect[1] + a.rect[3]) / 2) * snap.scale,
+          });
+        })()
+      `),
+    )
+
+  const mouseAt = (type, x, y, buttons) =>
+    send('Input.dispatchMouseEvent', {
+      type,
+      x: Math.round(x),
+      y: Math.round(y),
+      button: 'left',
+      buttons,
+      clickCount: 1,
+    })
+
+  const dragOn = async (x0, y0, x1, y1, steps = 12) => {
+    await mouseAt('mousePressed', x0, y0, 1)
+    await sleep(30)
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps
+      await mouseAt('mouseMoved', x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, 1)
+      await sleep(12)
+    }
+    await mouseAt('mouseReleased', x1, y1, 0)
+    await sleep(260)
+  }
+
+  const tap = async (x, y) => {
+    await mouseAt('mousePressed', x, y, 1)
+    await sleep(30)
+    await mouseAt('mouseReleased', x, y, 0)
+    await sleep(220)
+  }
+
+  /** 发一个组合键。modifiers：Ctrl=2 · Shift=8 */
+  const hotkey = async (key, vk, modifiers = 0) => {
+    await send('Input.dispatchKeyEvent', {
+      type: 'keyDown',
+      key,
+      code: key,
+      windowsVirtualKeyCode: vk,
+      modifiers,
+    })
+    await send('Input.dispatchKeyEvent', {
+      type: 'keyUp',
+      key,
+      code: key,
+      windowsVirtualKeyCode: vk,
+      modifiers,
+    })
+    await sleep(280)
+  }
+  const UNDO = () => hotkey('z', 90, 2)
+  const REDO = () => hotkey('Z', 90, 2 | 8)
+  const DEL = () => hotkey('Delete', 46, 0)
+
+  // ---------------------------------------------------------------- 打开文档
+
+  console.log(`→ 打开 ${URL_TARGET}`)
+  await send('Page.navigate', { url: URL_TARGET })
+  await sleep(2000)
+
+  console.log('\n[1] 打开 PDF')
+  const { root } = await send('DOM.getDocument', { depth: -1 })
+  const { nodeId } = await send('DOM.querySelector', {
+    nodeId: root.nodeId,
+    selector: 'input[type=file]',
+  })
+  if (!nodeId) throw new Error('找不到 file input')
+  await send('DOM.setFileInputFiles', { files: [PDF], nodeId })
+
+  let ready = false
+  for (let i = 0; i < 120; i++) {
+    await sleep(500)
+    const c = await evaluate(`document.querySelectorAll('.pdf-page-canvas').length`)
+    const loading = await evaluate(`!!document.querySelector('.loading')`)
+    if (!loading && c > 0) {
+      ready = true
+      break
+    }
+  }
+  check('文档加载完成', ready)
+  if (!ready) {
+    await shot('00-load-failed')
+    throw new Error('文档没加载起来')
+  }
+
+  await toolbarBtn('单页')
+  await evaluate(`document.querySelector('.viewport').scrollTop = 0; true`)
+  await sleep(800)
+
+  const box = JSON.parse(
+    await evaluate(`
+      (() => {
+        const s = document.querySelector('.page-slot[data-page="1"]');
+        if (!s) return JSON.stringify(null);
+        const r = s.getBoundingClientRect();
+        return JSON.stringify({ x: r.left, y: r.top, w: r.width, h: r.height });
+      })()
+    `),
+  )
+  check('拿到第 1 页位置', !!box && box.w > 100, box ? `${Math.round(box.w)}×${Math.round(box.h)}` : 'null')
+
+  const s1 = await snap()
+  check('默认指针模式是「选择」', s1.pointerMode === 'select', `mode=${s1.pointerMode}`)
+  check('默认没有工具、色板不显示', s1.tool === 'none' && (await swatchCount()) === 0)
+
+  // ---------------------------------------------------------------- 2. 手写选色
+
+  console.log('\n[2] 手写 → 选蓝色 → 画一笔')
+  check('切到「手写」', await toolbarBtn('手写'))
+  await sleep(200)
+  check('出现色板（10 个色块）', (await swatchCount()) === 10, `块数=${await swatchCount()}`)
+
+  const blueBg = await clickSwatch(5)
+  check('点中第 6 个色块（蓝）', /rgb\(33,\s*102,\s*235\)/.test(String(blueBg)), String(blueBg))
+  await sleep(150)
+
+  const inkX = box.x + box.w / 2
+  const inkY = box.y + Math.min(box.h * 0.42, 380)
+  await dragOn(inkX - 80, inkY, inkX + 80, inkY + 30)
+
+  const list2 = await annots()
+  const ink = list2.find((a) => a.kind === 'ink')
+  check('画出了一条手写批注', !!ink, `批注数=${list2.length}`)
+  check(
+    '写进数据的是**蓝**色，不是默认红（色板真的生效了）',
+    !!ink && near(ink.color[0], 0.13, 0.02) && near(ink.color[1], 0.4, 0.02) && near(ink.color[2], 0.92, 0.02),
+    ink ? `color=[${ink.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
+  )
+  const bluePx = await colorPixels([33, 102, 235])
+  const redPx = await colorPixels([230, 48, 48])
+  check('画布上真的出现蓝色像素', bluePx > 200, `blue=${bluePx}px`)
+  check('画布上没有默认红的墨迹', redPx < 50, `red=${redPx}px`)
+  await shot('01-ink-blue')
+
+  // ---------------------------------------------------------------- 3. 高亮改色
+
+  console.log('\n[3] 高亮 → 选绿色 → 划选文字')
+  check('切到「高亮」', await toolbarBtn('高亮'))
+  await sleep(200)
+  // 高亮走 multiply：黑会把整行乘黑（字消失）、白等于没画 → 这两块必须不出现
+  const hlSwatches = await swatchCount()
+  check('高亮色板挡掉了黑/白（10 → 8）', hlSwatches === 8, `块数=${hlSwatches}`)
+  await clickSwatch(6)
+  await sleep(150)
+
+  const line = JSON.parse(
+    await evaluate(`
+      (() => {
+        const slot = document.querySelector('.page-slot[data-page="1"]');
+        if (!slot) return JSON.stringify(null);
+        const spans = [...slot.querySelectorAll('.text-layer span')]
+          .filter(s => (s.textContent || '').trim().length > 6);
+        if (!spans.length) return JSON.stringify(null);
+        const r = spans[0].getBoundingClientRect();
+        return JSON.stringify({ x1: r.left + 1, x2: r.right - 1, y: r.top + r.height / 2 });
+      })()
+    `),
+  )
+  check('找到可选的文字行', !!line)
+  if (line) {
+    // 高亮**前**先把这一行原样截下来 —— 这是后面"字有没有被改"的基准
+    const clip = {
+      x: Math.floor(line.x1),
+      y: Math.floor(line.y - 9),
+      width: Math.max(20, Math.ceil(line.x2 - line.x1)),
+      height: 18,
+    }
+    const before = await captureClip(clip)
+
+    await dragOn(line.x1, line.y, line.x2, line.y, 10)
+    const hl = (await annots()).find((a) => a.kind === 'highlight')
+    check('生成了高亮批注', !!hl)
+    check(
+      '高亮用的是选中的**绿**色（不是默认黄）',
+      !!hl && near(hl.color[0], 0.1, 0.02) && near(hl.color[1], 0.72, 0.02) && near(hl.color[2], 0.55, 0.02),
+      hl ? `color=[${hl.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
+    )
+
+    // ---------------------------------------------------------------- 高亮不污染文字
+    // 用户反馈的原话："高亮已经影响到字本来的颜色了"。
+    // 这里用**浏览器合成后的真实像素**来判，而不是只看数据或只看单层画布。
+    const after = await captureClip(clip)
+    const cmp = await compareShots(before, after)
+    check(
+      '对比区域里真的有字也有白底（判据没空转）',
+      cmp.textN > 40 && cmp.bgN > 100,
+      `字 ${cmp.textN}px / 白底 ${cmp.bgN}px`,
+    )
+    check(
+      '🔴 高亮后**没有一个字的像素被提亮**（multiply 只能变暗，盖板会提亮）',
+      cmp.lightened === 0,
+      `被提亮 ${cmp.lightened}px，字亮度 ${cmp.beforeLum.toFixed(1)} → ${cmp.afterLum.toFixed(1)}`,
+    )
+    check(
+      '字在高亮区里仍然是深色（字还是黑的，没被冲成灰）',
+      cmp.afterLum < 45,
+      `平均亮度 ${cmp.afterLum.toFixed(1)}（改前 ${cmp.beforeLum.toFixed(1)}）`,
+    )
+    check(
+      '白底真的被染成了高亮绿（背景上色生效）',
+      !!cmp.bg &&
+        Math.abs(cmp.bg[0] - 26) < 35 &&
+        Math.abs(cmp.bg[1] - 184) < 35 &&
+        Math.abs(cmp.bg[2] - 140) < 35,
+      cmp.bg ? `底色 rgb(${cmp.bg.map((n) => n.toFixed(0)).join(', ')})` : 'null',
+    )
+
+    // 结构层：高亮必须在 under 层且整层 multiply，alpha 必须满格
+    const hlLayer = JSON.parse(
+      await evaluate(`
+        (() => {
+          const u = document.querySelector('.page-slot .annot-layer-under');
+          if (!u) return JSON.stringify({ has: false });
+          const cs = getComputedStyle(u);
+          const d = u.getContext('2d').getImageData(0, 0, u.width, u.height).data;
+          let opaque = 0, painted = 0;
+          for (let i = 0; i < d.length; i += 4) {
+            if (d[i+3] > 10) { painted++; if (d[i+3] >= 250) opaque++; }
+          }
+          return JSON.stringify({
+            has: true, blend: cs.mixBlendMode, zIndex: cs.zIndex,
+            painted, opaque,
+          });
+        })()
+      `),
+    )
+    check('高亮画在独立的 under 层上', hlLayer.has)
+    check('under 层整层是 multiply 混合', hlLayer.blend === 'multiply', `mix-blend-mode=${hlLayer.blend}`)
+    // ⚠️ 不能要求"每一个着色像素都 alpha=255" —— 四边形边界的抗锯齿天生是半透明。
+    // 判"主体"即可：盖板写法下不透明像素占比是 **0**（整层 alpha=140）。
+    const opaqueRatio = hlLayer.painted ? hlLayer.opaque / hlLayer.painted : 0
+    check(
+      '高亮主体是**不透明**的（不是 alpha=.55 的半透明板）',
+      hlLayer.painted > 100 && opaqueRatio > 0.85,
+      `不透明占比 ${(opaqueRatio * 100).toFixed(1)}%（${hlLayer.opaque}/${hlLayer.painted}px，余量是边缘抗锯齿）`,
+    )
+
+    await shot('02-highlight-green')
+  }
+
+  // ---------------------------------------------------------------- 4. 文本框
+
+  console.log('\n[4] 文本框：创建 → 自动选中')
+  check('切到「文字」', await toolbarBtn('文字'))
+  await sleep(200)
+
+  const ftX = box.x + box.w * 0.3
+  const ftY = box.y + Math.min(box.h * 0.65, 560)
+  await tap(ftX, ftY)
+  await sleep(300)
+  const modalOpen = await evaluate(`!!document.querySelector('.modal textarea')`)
+  check('弹出输入框', modalOpen)
+  if (modalOpen) {
+    await evaluate(`
+      (() => {
+        const ta = document.querySelector('.modal textarea');
+        ta.value = '测试文本框';
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      })()
+    `)
+    await sleep(120)
+    await evaluate(`
+      (() => {
+        const b = [...document.querySelectorAll('.modal .mbtn')].find(x => x.textContent.trim() === '确定');
+        b?.click();
+        return true;
+      })()
+    `)
+    await sleep(400)
+  }
+
+  const ft = (await annots()).find((a) => a.kind === 'freetext')
+  check('生成了文本框批注', !!ft, `批注数=${(await annots()).length}`)
+  const s4 = await snap()
+  check('新建的框**自动被选中**（接着就能拖动）', s4.sel?.kind === 'freetext', s4.sel ? s4.sel.kind : 'null')
+  await sleep(400) // 等选中框异步算完位置
+  await shot('03-freetext-created')
+
+  // ---------------------------------------------------------------- 5. 拖动
+
+  console.log('\n[5] 拖动文本框')
+  const g1 = await selGeometry()
+  check('选中框渲染出来了，且有 8 个手柄', !!g1 && g1.handleCount === 8, g1 ? `手柄=${g1.handleCount}` : 'null')
+
+  const beforeRect = ft ? [...ft.rect] : null
+  const MOVE_DX = 70
+  const MOVE_DY = 40
+  await dragOn(g1.cx, g1.cy, g1.cx + MOVE_DX, g1.cy + MOVE_DY)
+
+  const afterMove = (await annots()).find((a) => a.id === ft?.id)
+  const g2 = await selGeometry()
+  check(
+    '数据里的 rect 跟着平移了',
+    !!afterMove &&
+      near(afterMove.rect[0] - beforeRect[0], MOVE_DX / s4.scale, 6) &&
+      near(afterMove.rect[2] - beforeRect[2], MOVE_DX / s4.scale, 6),
+    afterMove
+      ? `Δx=${(afterMove.rect[0] - beforeRect[0]).toFixed(1)}pt（期望≈${(MOVE_DX / s4.scale).toFixed(1)}）`
+      : '找不到',
+  )
+  check(
+    '宽高没变（拖动不是缩放）',
+    !!afterMove &&
+      near(afterMove.rect[2] - afterMove.rect[0], beforeRect[2] - beforeRect[0], 0.6) &&
+      near(afterMove.rect[3] - afterMove.rect[1], beforeRect[3] - beforeRect[1], 0.6),
+    afterMove ? `${(afterMove.rect[2] - afterMove.rect[0]).toFixed(1)}×${(afterMove.rect[3] - afterMove.rect[1]).toFixed(1)}pt` : '',
+  )
+  check(
+    '选中框跟着走到了新位置（屏幕坐标）',
+    !!g2 && near(g2.cx - g1.cx, MOVE_DX, 8) && near(g2.cy - g1.cy, MOVE_DY, 8),
+    g2 ? `Δ=(${(g2.cx - g1.cx).toFixed(0)}, ${(g2.cy - g1.cy).toFixed(0)})px` : 'null',
+  )
+  await shot('04-freetext-moved')
+
+  // ---------------------------------------------------------------- 6. 改大小
+
+  console.log('\n[6] 拉右下手柄改大小')
+  const g3 = await selGeometry()
+  const RESIZE_DX = 60
+  const RESIZE_DY = 34
+  await dragOn(g3.handles.se.x, g3.handles.se.y, g3.handles.se.x + RESIZE_DX, g3.handles.se.y + RESIZE_DY)
+
+  const afterResize = (await annots()).find((a) => a.id === ft?.id)
+  const w0 = afterMove.rect[2] - afterMove.rect[0]
+  const w1 = afterResize.rect[2] - afterResize.rect[0]
+  const h1 = afterResize.rect[3] - afterResize.rect[1]
+  check(
+    '宽度真的变大了',
+    w1 > w0 + 3,
+    `${w0.toFixed(1)}pt → ${w1.toFixed(1)}pt（屏幕 +${RESIZE_DX}px，scale=${s4.scale.toFixed(2)}）`,
+  )
+  check('高度也跟着变大了（se 手柄同时改两边）', h1 > afterMove.rect[3] - afterMove.rect[1] + 2, `h=${h1.toFixed(1)}pt`)
+  await shot('05-freetext-resized')
+
+  // ---------------------------------------------------------------- 7. 撤销 / 重做
+
+  console.log('\n[7] 撤销 → 重做')
+  const s7 = await snap()
+  check('有可撤销的历史', s7.canUndo === true)
+
+  await UNDO()
+  const u1 = (await annots()).find((a) => a.id === ft?.id)
+  check(
+    '撤销一次 = 退回到改大小之前',
+    !!u1 && near(u1.rect[2] - u1.rect[0], w0, 0.6),
+    u1 ? `宽=${(u1.rect[2] - u1.rect[0]).toFixed(1)}pt（改大小前 ${w0.toFixed(1)}）` : '找不到',
+  )
+  const s7b = await snap()
+  check('撤销之后「重做」可用了', s7b.canRedo === true)
+
+  await UNDO()
+  const u2 = (await annots()).find((a) => a.id === ft?.id)
+  check(
+    '再撤销一次 = 退回到拖动之前',
+    !!u2 && near(u2.rect[0], beforeRect[0], 0.6),
+    u2 ? `x0=${u2.rect[0].toFixed(1)}pt（创建时 ${beforeRect[0].toFixed(1)}）` : '找不到',
+  )
+  await shot('06-undone')
+
+  await REDO()
+  const r1 = (await annots()).find((a) => a.id === ft?.id)
+  check(
+    '重做一次 = 恢复拖动后的位置',
+    !!r1 && near(r1.rect[0], afterMove.rect[0], 0.6),
+    r1 ? `x0=${r1.rect[0].toFixed(1)}pt（期望 ${afterMove.rect[0].toFixed(1)}）` : '找不到',
+  )
+
+  await REDO()
+  const r2 = (await annots()).find((a) => a.id === ft?.id)
+  check(
+    '再重做一次 = 恢复改大小后的尺寸',
+    !!r2 && near(r2.rect[2] - r2.rect[0], w1, 0.6),
+    r2 ? `宽=${(r2.rect[2] - r2.rect[0]).toFixed(1)}pt（期望 ${w1.toFixed(1)}）` : '找不到',
+  )
+  await shot('07-redone')
+
+  // ---------------------------------------------------------------- 8. 改选中项颜色
+
+  console.log('\n[8] 选中后改色')
+  // undo / redo 都会清掉选中态（被撤销的那条可能已经不存在了），所以重新点中它
+  const c8 = await centerOf(ft.id)
+  await tap(c8.x, c8.y)
+  const s8b = await snap()
+  check('重新点中了文本框', s8b.sel?.kind === 'freetext', s8b.sel ? s8b.sel.kind : 'null')
+
+  if (s8b.sel) {
+    await clickSwatch(2) // 红
+    await sleep(300)
+    const rf = (await annots()).find((a) => a.id === ft?.id)
+    check(
+      '选中后点色板 = 改**这一条**的颜色（可撤销）',
+      !!rf && near(rf.color[0], 0.9, 0.02) && near(rf.color[1], 0.19, 0.02),
+      rf ? `color=[${rf.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
+    )
+    await UNDO()
+    const back = (await annots()).find((a) => a.id === ft?.id)
+    check(
+      '改色也能被撤销',
+      !!back && near(back.color[2], 0.92, 0.02),
+      back ? `撤销后 color=[${back.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
+    )
+    await REDO()
+  }
+  await shot('08-recolor')
+
+  // ---------------------------------------------------------------- 9. 三种指针模式
+
+  console.log('\n[9] 指针模式：滚动 / 拖动 / 选择')
+
+  // ---- 滚动模式：点批注不应该选中
+  check('切到「滚动」', await toolbarBtn('滚动'))
+  await sleep(200)
+  const c9 = await centerOf(ft.id)
+  await tap(c9.x, c9.y) // 就点在批注正中间
+  const s9 = await snap()
+  check('滚动模式下点批注**不会**选中（避免翻页误拖）', s9.sel === null, `sel=${s9.sel?.kind ?? 'null'}`)
+
+  // ---- 拖动模式：自动清工具 + 左键平移
+  check('切到「拖动」', await toolbarBtn('拖动'))
+  await sleep(250)
+  const s9b = await snap()
+  check('切到拖动模式会自动退出批注工具', s9b.tool === 'none', `tool=${s9b.tool}`)
+
+  const countBeforePan = (await annots()).length
+  const scrollBefore = await evaluate(`document.querySelector('.viewport').scrollTop`)
+  const panY = box.y + 200
+  await dragOn(box.x + box.w / 2, panY, box.x + box.w / 2, panY - 150, 12)
+  const scrollAfter = await evaluate(`document.querySelector('.viewport').scrollTop`)
+  check(
+    '拖动模式下左键拖拽平移了视口',
+    scrollAfter > scrollBefore + 80,
+    `scrollTop ${scrollBefore} → ${scrollAfter}`,
+  )
+  check(
+    '平移没有顺手画出任何批注（抓手不该落到画布上）',
+    (await annots()).length === countBeforePan,
+    `${countBeforePan} → ${(await annots()).length}`,
+  )
+  await shot('09-pan')
+
+  // ---- 回到选择模式：能点中并拖动
+  check('切回「选择」', await toolbarBtn('选择'))
+  await sleep(200)
+  await evaluate(`document.querySelector('.viewport').scrollTop = 0; true`)
+  await sleep(600)
+
+  const c10 = await centerOf(ft.id)
+  await tap(c10.x, c10.y)
+  const s10 = await snap()
+  check('选择模式下点批注能选中', s10.sel?.kind === 'freetext', `sel=${s10.sel?.kind ?? 'null'}`)
+
+  // ---------------------------------------------------------------- 10. 删除所选
+
+  console.log('\n[10] 删除所选 + 撤销')
+  const countBefore = (await annots()).length
+  await DEL()
+  const countAfter = (await annots()).length
+  check('Delete 删掉了选中项', countAfter === countBefore - 1, `${countBefore} → ${countAfter}`)
+  const s11 = await snap()
+  check('删除后选中态被清掉（不会指向空气）', s11.sel === null)
+
+  await UNDO()
+  const countBack = (await annots()).length
+  check('撤销把删掉的那条找回来了', countBack === countBefore, `${countAfter} → ${countBack}`)
+  await shot('10-delete-undo')
+
+  // ---------------------------------------------------------------- 11. 高亮拖动 + 不变量
+
+  console.log('\n[11] 拖动高亮（markup）：只能平移，且内容必须待在 /Rect 内')
+  const hl = (await annots()).find((a) => a.kind === 'highlight')
+  check('页面上有高亮批注', !!hl)
+  if (hl) {
+    const hc = await centerOf(hl.id)
+    await tap(hc.x, hc.y)
+    const s11 = await snap()
+    check('markup 类也能被选中', s11.sel?.kind === 'highlight', `sel=${s11.sel?.kind ?? 'null'}`)
+
+    const hg = await selGeometry()
+    check(
+      '高亮**不给**改大小手柄（拉伸高亮会脱离原文，没有意义）',
+      !!hg && hg.handleCount === 0,
+      hg ? `手柄=${hg.handleCount}` : 'null',
+    )
+
+    const hlBefore = [...hl.rect]
+    await dragOn(hc.x, hc.y, hc.x - 60, hc.y + 26)
+    const hlAfter = (await annots()).find((a) => a.id === hl.id)
+    check(
+      '高亮的 rect 跟着平移了',
+      !!hlAfter && Math.abs(hlAfter.rect[0] - hlBefore[0]) > 5,
+      hlAfter ? `x0 ${hlBefore[0].toFixed(1)} → ${hlAfter.rect[0].toFixed(1)}pt` : '找不到',
+    )
+    check(
+      '平移后 /Rect 仍然**正好**是 QuadPoints 的包围盒（否则写回 PDF 会被查看器裁掉）',
+      !!hlAfter && hlAfter.contentInsideRect === true,
+      hlAfter ? `inside=${hlAfter.contentInsideRect}` : '',
+    )
+    const allOk = (await annots()).every((a) => a.contentInsideRect)
+    check('所有批注的内容都待在各自 /Rect 内', allOk, allOk ? '全部通过' : '有越界')
+
+    // 页面在同一时刻只能有一个选中框，且 markup 选中时 DOM 里一个手柄都不该有
+    // （截图缩略图上"看着像有手柄"分不清，所以这条用 DOM 数出来）
+    const boxes = await evaluate(`document.querySelectorAll('.sel-box').length`)
+    const handles = await evaluate(`document.querySelectorAll('.sel-handle').length`)
+    check(
+      '全场只有 1 个选中框、且 markup 选中时 0 个手柄',
+      boxes === 1 && handles === 0,
+      `sel-box=${boxes}, sel-handle=${handles}`,
+    )
+    await shot('11-highlight-moved')
+
+    await UNDO()
+    const hlBack = (await annots()).find((a) => a.id === hl.id)
+    check(
+      '拖动高亮也能被撤销',
+      !!hlBack && near(hlBack.rect[0], hlBefore[0], 0.6),
+      hlBack ? `x0 回到 ${hlBack.rect[0].toFixed(1)}pt` : '找不到',
+    )
+  }
+
+  // ---------------------------------------------------------------- 12. 控制台
+
+  console.log('\n[12] 控制台')
+  check(
+    '没有未捕获异常 / error',
+    consoleErrors.length === 0,
+    consoleErrors.slice(0, 3).join(' | ') || '干净',
+  )
+
+  console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)
+} catch (e) {
+  failed++
+  console.error('\n💥 测试崩了：', e)
+} finally {
+  try {
+    if (ws?.readyState === 1) await send('Browser.close')
+  } catch {
+    /* ignore */
+  }
+  try {
+    child?.kill('SIGKILL')
+  } catch {
+    /* ignore */
+  }
+  try {
+    await rm(userDataDir, { recursive: true, force: true })
+  } catch {
+    /* ignore */
+  }
+  process.exit(failed > 0 ? 1 : 0)
+}

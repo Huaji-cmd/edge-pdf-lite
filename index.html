@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      ⚠️ `maximum-scale=1, user-scalable=no` 不能省。
+      Surface 触屏上浏览器的「双击缩放」会跟我们的画笔抢手势 —— 表现为
+      快速点两下页面就缩放了，笔画却没画上。PDF 缩放由我们自己实现
+      （Ctrl+滚轮 / 双指捏合），浏览器那套必须关掉。
+    -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#16181d" />
+    <meta name="description" content="轻量 PDF 阅读 + 批注编辑器" />
+
+    <!-- 可安装为桌面应用（Edge / Chrome：「安装此站点为应用」） -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="edge-pdf-lite" />
+
+    <title>edge-pdf-lite</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

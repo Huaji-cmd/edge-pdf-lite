@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>批注兼容性核对 · edge-pdf-lite</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #16181d;
+        --panel: #1e2128;
+        --line: #2e333d;
+        --fg: #e6e8ec;
+        --dim: #9aa3b2;
+        --ok: #4ade80;
+        --warn: #fbbf24;
+        --err: #f87171;
+        --accent: #60a5fa;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--fg);
+        font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      h2 { font-size: 16px; margin: 26px 0 8px; }
+      .sub { color: var(--dim); margin: 0 0 18px; font-size: 13px; max-width: 900px; }
+      .row {
+        display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+        background: var(--panel); border: 1px solid var(--line);
+        border-radius: 8px; padding: 14px 16px; margin-bottom: 16px;
+      }
+      button {
+        padding: 7px 18px; background: var(--accent); color: #0b1220; border: 0;
+        border-radius: 6px; font: inherit; font-weight: 600; cursor: pointer;
+      }
+      button:disabled { opacity: .5; cursor: default; }
+      a.btn {
+        display: inline-block; background: #2a2f38; color: var(--fg);
+        padding: 7px 16px; border-radius: 6px; text-decoration: none; font-size: 13px;
+      }
+      a.btn.pri { background: #2b5fd9; color: #fff; }
+      #status { font-size: 13px; }
+      #status.ok { color: var(--ok); }
+      #status.warn { color: var(--warn); }
+      #status.err { color: var(--err); }
+      .ok { color: var(--ok); }
+      .warn { color: var(--warn); }
+      .err { color: var(--err); }
+      .dim { color: var(--dim); }
+      table { border-collapse: collapse; width: 100%; max-width: 1000px; font-size: 13px; margin-top: 8px; }
+      th, td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; vertical-align: top; }
+      th { background: var(--panel); color: var(--dim); font-weight: 600; }
+      .note {
+        max-width: 1000px; margin-top: 14px; padding: 12px 14px;
+        background: var(--panel); border: 1px solid var(--line);
+        border-left: 3px solid var(--accent); border-radius: 6px;
+        font-size: 13px; color: var(--dim);
+      }
+      .note.alert { border-left-color: var(--warn); }
+      .grid { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 10px; }
+      .col { display: flex; flex-direction: column; gap: 6px; }
+      .cap { color: var(--dim); font-size: 12px; }
+      canvas { background: #fff; border: 1px solid var(--line); max-width: 100%; height: auto; }
+      pre.stack {
+        background: #14161a; border: 1px solid var(--err); border-left-width: 3px;
+        border-radius: 6px; padding: 12px 14px; overflow: auto; font-size: 12px;
+        color: var(--dim); max-width: 1000px; white-space: pre-wrap;
+      }
+      code { background: #22262e; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+      hr.sep { border: 0; border-top: 1px solid var(--line); margin: 32px 0 20px; }
+    </style>
+  </head>
+  <body>
+    <h1>批注兼容性核对</h1>
+    <p class="sub">
+      样本 <code>testdata/annot-fixture.pdf</code> · 7 页 · 每条注释的 <code>/NM</code> 前缀为
+      <code>epl:</code>。上半部分是 <b>pdf.js 自动自检</b>；下半部分是
+      <b>拿去 Edge / Acrobat 里人工核对</b>的清单 —— 两部分都要看，<b>pdf.js 能画不代表 Acrobat 能画</b>。
+    </p>
+
+    <div class="row">
+      <button id="runCheck">跑自动自检</button>
+      <span id="status"></span>
+      <a class="btn pri" href="/testdata/annot-fixture.pdf" target="_blank">直接打开样本 PDF</a>
+      <a class="btn" href="/">← 回阅读器</a>
+    </div>
+
+    <div id="report"></div>
+    <div id="preview"></div>
+
+    <hr class="sep" />
+
+    <h1>人工核对清单（在各查看器里逐项打勾）</h1>
+    <p class="sub">
+      在<b>每个查看器</b>里各打开一次样本 PDF。每一项都要看两处：
+      ① <b>页面上有没有画出来</b>（外观）② <b>注释面板里有没有列出来</b>（结构）。
+      有些查看器不画但会列出，有些反过来 —— 两处都看才知道是哪种。
+    </p>
+
+    <table>
+      <tr>
+        <th>页</th><th>内容</th><th>页面上应该看到</th><th>注释面板应该列出</th><th>关注点</th>
+      </tr>
+      <tr>
+        <td><b>P1</b></td>
+        <td>Highlight + <code>/AP</code> + Z 序</td>
+        <td>黄色高亮压在 Line 2 / Line 3 上</td>
+        <td>1 条 Highlight</td>
+        <td class="ok">基准：正确做法</td>
+      </tr>
+      <tr>
+        <td><b>P2</b></td>
+        <td>Highlight <b>无</b> <code>/AP</code> + Z 序</td>
+        <td>还能画出高亮吗？</td>
+        <td>1 条 Highlight</td>
+        <td>与 P1 对比</td>
+      </tr>
+      <tr>
+        <td><b>P3</b></td>
+        <td>Highlight <b>无</b> <code>/AP</code> + 逆时针序</td>
+        <td>与 P2 相比有没有错位 / 翻转</td>
+        <td>1 条 Highlight</td>
+        <td>与 P2 对比</td>
+      </tr>
+      <tr>
+        <td><b>P4</b></td>
+        <td>Ink 手写 + <code>/AP</code></td>
+        <td>一条红色波浪线</td>
+        <td>1 条 Ink</td>
+        <td class="warn">扫描件唯一可用的工具</td>
+      </tr>
+      <tr>
+        <td><b>P5</b></td>
+        <td>FreeText 文本框 + <code>/AP</code></td>
+        <td>蓝框 + 蓝字</td>
+        <td>1 条 FreeText</td>
+        <td>字体资源是否被认到</td>
+      </tr>
+      <tr>
+        <td><b>P6</b></td>
+        <td>Square + StrikeOut + Underline</td>
+        <td>红框 / 删除线 / 下划线</td>
+        <td>3 条</td>
+        <td>三种不同的 QuadPoints 外观</td>
+      </tr>
+      <tr>
+        <td><b>P7</b></td>
+        <td>Highlight + <code>/AP</code> + 逆时针序</td>
+        <td>应当与 P1 <b>完全一样</b></td>
+        <td>1 条 Highlight</td>
+        <td class="ok">验证「有 /AP 时顺序不重要」</td>
+      </tr>
+    </table>
+
+    <div class="note alert">
+      <b>最要紧的三条结论（看完请告诉我）：</b><br />
+      1. <b>P2 如果是空白</b> → <code>/AP</code> 是<b>必须</b>生成的，写回方案必须强制带上它。<br />
+      2. <b>P3 如果错位或翻转</b>（而 P2 正常）→ QuadPoints 顺序真的有影响，一律用 Z 序。<br />
+      3. <b>P7 如果和 P1 一样</b> → 有 <code>/AP</code> 时顺序无所谓，<code>/AP</code> 是最终兜底。
+    </div>
+
+    <div class="note">
+      建议逐个试：<b>Edge</b>（你的日常）、<b>Chrome</b>、<b>Adobe Acrobat</b>（如果装了）、<b>Firefox</b>。
+      在每个里面截一张 P1~P7 的图；如果那个查看器有注释面板，再展开截一张。
+    </div>
+
+    <script type="module" src="/src/spike/annot-check.ts"></script>
+  </body>
+</html>

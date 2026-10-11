@@ -1,0 +1,39 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# 由 scripts/copy-pdfjs-assets.mjs 生成，不入库
+public/cmaps/
+public/standard_fonts/
+
+# 由 scripts/make-testdata.mjs 生成，不入库
+public/testdata/
+
+# Tauri
+src-tauri/target/
+
+# 本地私密文件：绝不要提交
+*.bak
+*.epl.json
+.env
+.env.*
+!.env.example
+spike-out/
+*.log
+*.tsbuildinfo
+
+# 各套端到端测试的截图产物，不入库
+viewer-shots/
+annot-shots/
+writer-shots/
+interact-shots/
+touch-shots/
+
+# WorkBuddy 工作区数据：含会话记忆与**本机内网 IP**等隐私，不入库
+# ⚠️ 这个目录本身不要删，只是不让它进版本库
+.workbuddy/
