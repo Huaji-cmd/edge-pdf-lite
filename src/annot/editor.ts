@@ -19,6 +19,7 @@ import type {
   Annotation,
   AnnotKind,
   TextMarkupAnnot,
+  AreaAnnot,
   InkAnnot,
   RectAnnot,
   FreeTextAnnot,
@@ -85,13 +86,13 @@ export interface EditorHost {
   onToolAutoExit(): void
 }
 
-/** 一次"正在画"的会话（手写 / 矩形） */
+/** 一次"正在画"的会话（手写 / 矩形 / 区域高亮） */
 interface Session {
   pageNumber: number
   slotEl: HTMLElement
   tf: PageTransform
-  kind: 'ink' | 'rect'
-  /** ink：[x,y,x,y,...]；rect：[x0,y0,x1,y1] */
+  kind: 'ink' | 'rect' | 'area'
+  /** ink：[x,y,x,y,...]；rect / area：[x0,y0,x1,y1] */
   points: number[]
   moved: boolean
 }
@@ -307,17 +308,30 @@ export class AnnotEditor {
         void this.host.layer.render(s.pageNumber, this.host.scale())
         return
       }
-      annot = {
-        kind: 'rect',
-        id: newAnnotId(),
-        pageNumber: s.pageNumber,
-        rect: r,
-        color: this.host.colorFor('rect'),
-        opacity: 1,
-        lineWidth: DEFAULT_LINE_WIDTH.rect,
-        created: nowIso(),
-        modified: nowIso(),
-      } satisfies RectAnnot
+      annot =
+        s.kind === 'area'
+          ? ({
+              kind: 'area',
+              id: newAnnotId(),
+              pageNumber: s.pageNumber,
+              rect: r,
+              color: this.host.colorFor('area'),
+              // ⚠️ 必须 1：区域高亮靠 multiply 染背景，alpha<1 会把内容冲淡
+              opacity: 1,
+              created: nowIso(),
+              modified: nowIso(),
+            } satisfies AreaAnnot)
+          : ({
+              kind: 'rect',
+              id: newAnnotId(),
+              pageNumber: s.pageNumber,
+              rect: r,
+              color: this.host.colorFor('rect'),
+              opacity: 1,
+              lineWidth: DEFAULT_LINE_WIDTH.rect,
+              created: nowIso(),
+              modified: nowIso(),
+            } satisfies RectAnnot)
     }
 
     this.host.store.add(annot)
@@ -436,7 +450,7 @@ export class AnnotEditor {
       pageNumber: loc.pageNumber,
       slotEl: loc.slotEl,
       tf,
-      kind: this.tool === 'ink' ? 'ink' : 'rect',
+      kind: this.tool === 'ink' ? 'ink' : this.tool === 'area' ? 'area' : 'rect',
       points: [px, py],
       moved: false,
     }
@@ -624,17 +638,29 @@ export class AnnotEditor {
       }
     } else {
       const r = normalizeRect([s.points[0]!, s.points[1]!, s.points[2]!, s.points[3]!])
-      draft = {
-        kind: 'rect',
-        id: '__draft__',
-        pageNumber: s.pageNumber,
-        rect: r,
-        color: this.host.colorFor('rect'),
-        opacity: 1,
-        lineWidth: DEFAULT_LINE_WIDTH.rect,
-        created: nowIso(),
-        modified: nowIso(),
-      }
+      draft =
+        s.kind === 'area'
+          ? {
+              kind: 'area',
+              id: '__draft__',
+              pageNumber: s.pageNumber,
+              rect: r,
+              color: this.host.colorFor('area'),
+              opacity: 1,
+              created: nowIso(),
+              modified: nowIso(),
+            }
+          : {
+              kind: 'rect',
+              id: '__draft__',
+              pageNumber: s.pageNumber,
+              rect: r,
+              color: this.host.colorFor('rect'),
+              opacity: 1,
+              lineWidth: DEFAULT_LINE_WIDTH.rect,
+              created: nowIso(),
+              modified: nowIso(),
+            }
     }
     this.host.layer.setDraft(s.pageNumber, draft)
     // draft 每次都在变，必须强制重绘（render 内部按 scale 去重，所以要先 invalidate）

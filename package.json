@@ -9,6 +9,7 @@
     "pdfjs-assets": "node scripts/copy-pdfjs-assets.mjs",
     "testdata": "node scripts/make-testdata.mjs",
     "testdata:annot": "node scripts/make-annot-fixture.mjs",
+    "testdata:scan": "node scripts/make-scan-sample.mjs",
     "dev": "vite",
     "dev:host": "vite --host",
     "icons": "node scripts/make-icons.mjs",

@@ -94,7 +94,7 @@ export function mapAnnotToRect(a: Annotation, from: Rect, to: Rect): Annotation 
     return { ...a, strokes, rect: bboxOfPoints(all, a.lineWidth / 2 + 0.5) }
   }
 
-  // rect / freetext：本体就是 rect，直接换（字号/线宽保持不变 —— PDF 的 FreeText
+  // area / rect / freetext：本体就是 rect，直接换（字号/线宽保持不变 —— PDF 的 FreeText
   // 也不会因为框变大就把字撑大，保持与写回后一致）
   return { ...a, rect: normalizeRect(to) }
 }

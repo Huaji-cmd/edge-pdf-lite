@@ -292,7 +292,7 @@ export class AnnotationStore {
       }
       return false
     }
-    // rect / freetext：落在框内即算命中（橡皮擦是显式工具，点到就删最直观）
+    // area / rect / freetext：落在框内即算命中（橡皮擦是显式工具，点到就删最直观）
     return pointInRect(x, y, a.rect, tol)
   }
 

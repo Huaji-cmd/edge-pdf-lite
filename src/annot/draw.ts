@@ -74,7 +74,8 @@ function strokeAcrossQuad(
 export type BlendGroup = 'under' | 'over'
 
 export function blendGroupOf(a: Annotation): BlendGroup {
-  return a.kind === 'highlight' ? 'under' : 'over'
+  // 区域高亮同样是"背景"语义：它染的是底色，不是压在内容上
+  return a.kind === 'highlight' || a.kind === 'area' ? 'under' : 'over'
 }
 
 /**
@@ -90,8 +91,8 @@ export function drawAnnotation(
 ): void {
   const scale = tf.scale
   ctx.save()
-  // 高亮那层靠 CSS 的 multiply 达成"只染背景"，alpha 必须满格
-  ctx.globalAlpha = a.kind === 'highlight' ? 1 : a.opacity
+  // 走 multiply 那层（文本高亮 / 区域高亮）靠 CSS 混合达成"只染背景"，alpha 必须满格
+  ctx.globalAlpha = a.kind === 'highlight' || a.kind === 'area' ? 1 : a.opacity
   ctx.lineCap = 'round'
   ctx.lineJoin = 'round'
 
@@ -131,6 +132,10 @@ export function drawAnnotation(
       for (let i = 2; i < v.length; i += 2) ctx.lineTo(v[i]!, v[i + 1]!)
       ctx.stroke()
     }
+  } else if (a.kind === 'area') {
+    const [l, t, w, h] = tf.rectToView(a.rect)
+    ctx.fillStyle = rgbCss(a.color)
+    ctx.fillRect(l, t, w, h)
   } else if (a.kind === 'rect') {
     const [l, t, w, h] = tf.rectToView(a.rect)
     ctx.strokeStyle = rgbCss(a.color)

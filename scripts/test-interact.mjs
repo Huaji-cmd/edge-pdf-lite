@@ -25,6 +25,8 @@ await mkdir(SHOTS, { recursive: true })
 
 const URL_TARGET = process.argv[2] ?? 'http://localhost:4173/'
 const PDF = resolve(ROOT, 'public/testdata/real-1706.03762.pdf')
+/** 扫描件风格样本：整页矢量图形，**没有文本层**（由 make-scan-sample.mjs 生成） */
+const SCAN = resolve(ROOT, 'public/testdata/scan-like.pdf')
 const PORT = Number(process.env.EPL_PORT ?? 9511)
 
 const EDGE = [
@@ -39,6 +41,10 @@ if (!EDGE) {
 }
 if (!existsSync(PDF)) {
   console.error(`找不到测试 PDF：${PDF}\n先跑 node scripts/make-testdata.mjs`)
+  process.exit(1)
+}
+if (!existsSync(SCAN)) {
+  console.error(`找不到扫描件样本：${SCAN}\n先跑 node scripts/make-scan-sample.mjs`)
   process.exit(1)
 }
 
@@ -99,6 +105,14 @@ try {
   let id = 0
   const pending = new Map()
   const consoleErrors = []
+  /**
+   * 页面弹过的原生对话框（confirm / alert）。
+   *
+   * ⚠️ 必须主动处理：CDP 下对话框会**一直挂着把页面卡死**，
+   * 而且默认行为是 dismiss（等于用户点"取消"）—— 于是"换文档"永远不发生，
+   * 看起来像功能坏了，其实是对话框没处理。
+   */
+  const dialogs = []
   ws.addEventListener('message', (ev) => {
     const m = JSON.parse(ev.data)
     if (m.id !== undefined && pending.has(m.id)) {
@@ -106,6 +120,10 @@ try {
       pending.delete(m.id)
       m.error ? reject(new Error(JSON.stringify(m.error))) : res(m.result)
       return
+    }
+    if (m.method === 'Page.javascriptDialogOpening') {
+      dialogs.push(String(m.params.message ?? '').slice(0, 240))
+      void send('Page.handleJavaScriptDialog', { accept: true })
     }
     if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') {
       consoleErrors.push(
@@ -825,7 +843,159 @@ try {
 
   // ---------------------------------------------------------------- 12. 控制台
 
-  console.log('\n[12] 控制台')
+  console.log('\n[12] 区域高亮 + 换文档时的「未保存」提醒')
+  /*
+   * 这一节一次验证两件事，因为它们共用"换文档"这一个动作：
+   *
+   * ① **退出提醒**：有未保存批注时打开新文件，必须先弹确认。
+   *    这条 beforeunload 管不到（页面压根没卸载），只能靠应用内 confirm。
+   *
+   * ② **区域高亮不依赖文本层**：在**真正没有文本层**的样本上，
+   *    文字高亮一条都画不出来，区域高亮照样能画 —— 这就是 B1 要补的缺口。
+   *
+   * ⚠️ ②的对照必须在扫描件样本上做。曾经想在文字版 PDF 上找"空白处"做对照，
+   *    结果失败：拖动经过空白区时浏览器照样会把附近的字选进选区，对照不成立。
+   */
+  {
+    check(
+      '换文档前确实有未保存的批注（提醒的前提）',
+      (await annots()).length > 0,
+      `${(await annots()).length} 条`,
+    )
+
+    const dlgBefore = dialogs.length
+    const r2 = await send('DOM.getDocument', { depth: 1 })
+    const f2 = await send('DOM.querySelector', {
+      nodeId: r2.root.nodeId,
+      selector: 'input[type=file]',
+    })
+    await send('DOM.setFileInputFiles', { files: [SCAN], nodeId: f2.nodeId })
+
+    let swapped = false
+    for (let i = 0; i < 80; i++) {
+      await sleep(300)
+      const c = await evaluate(`document.querySelectorAll('.pdf-page-canvas').length`)
+      const loading = await evaluate(`!!document.querySelector('.loading')`)
+      const fname = await evaluate(`(document.querySelector('.toolbar .file')||{}).textContent||''`)
+      if (!loading && c > 0 && String(fname).includes('scan-like')) {
+        swapped = true
+        break
+      }
+    }
+    check(
+      '有未保存批注时打开新文件 → **弹了确认框**',
+      dialogs.length > dlgBefore,
+      dialogs.slice(dlgBefore).join(' | ').slice(0, 130) || '没弹（批注会被静默丢掉）',
+    )
+    check('接受确认后换成了扫描件样本', swapped)
+    if (!swapped) throw new Error('没换成扫描件样本，后面的对照做不了')
+
+    check('换文档后批注清空了', (await annots()).length === 0, `${(await annots()).length} 条`)
+
+    const spanCount = Number(
+      await evaluate(`document.querySelectorAll('.page-slot .text-layer span').length`),
+    )
+    check('样本确实**没有文本层**（对照的前提）', spanCount === 0, `span=${spanCount}`)
+
+    const slot = JSON.parse(
+      await evaluate(`
+        (() => {
+          const s = document.querySelector('.page-slot[data-page="1"]');
+          const r = s.getBoundingClientRect();
+          return JSON.stringify({ x: r.left, y: r.top, w: r.width, h: r.height });
+        })()
+      `),
+    )
+    const bx = Math.round(slot.x + slot.w * 0.2)
+    const by = Math.round(slot.y + slot.h * 0.3)
+    const bw = Math.round(slot.w * 0.5)
+    const bh = Math.round(slot.h * 0.08)
+
+    // ① 文字高亮：没有文本层 → 选不出东西 → 一条都生成不了
+    await toolbarBtn('高亮')
+    await sleep(220)
+    await dragOn(bx, by, bx + bw, by + bh)
+    await sleep(280)
+    check(
+      '扫描件上文字高亮**画不出来**（没有文本层可依附）',
+      (await annots()).length === 0,
+      `count=${(await annots()).length}`,
+    )
+    await toolbarBtn('高亮') // 退出工具
+
+    // ② 区域高亮：同样这块地方照样能画
+    check('切到「区域高亮」', await toolbarBtn('区域高亮'))
+    await sleep(220)
+    check('工具状态已切到 area', (await snap()).tool === 'area', `tool=${(await snap()).tool}`)
+    await dragOn(bx, by, bx + bw, by + bh)
+    await sleep(300)
+    const area = (await annots()).find((a) => a.kind === 'area')
+    check(
+      '扫描件上区域高亮**能画出来**（B1 要补的缺口）',
+      !!area,
+      area ? `rect=${area.rect.map((n) => n.toFixed(0)).join(',')}pt` : '没生成',
+    )
+    await shot('12-area-on-scan')
+
+    if (area) {
+      const rgb255 = area.color.map((c) => Math.round(c * 255))
+      const px = await colorPixels(rgb255, 40)
+      check('画布上真的有色块（不是只有数据）', px > 400, `${px} px，色 rgb(${rgb255.join(',')})`)
+
+      const underPx = Number(
+        await evaluate(`
+          (() => {
+            const u = document.querySelector('.page-slot .annot-layer-under');
+            if (!u) return 0;
+            const d = u.getContext('2d').getImageData(0, 0, u.width, u.height).data;
+            let n = 0;
+            for (let i = 0; i < d.length; i += 4) if (d[i+3] > 200) n++;
+            return n;
+          })()
+        `),
+      )
+      check(
+        '区域高亮画在 under 层且 alpha 满格（跟文字高亮同一条渲染路径）',
+        underPx > 400,
+        `under 层不透明像素 ${underPx}`,
+      )
+
+      /*
+       * 选中前**必须先退出工具** —— 这不是测试怪癖，是真实用户路径：
+       * 区域高亮跟手写/方框一样**画完不自动退出**（连续盖好几块是常态），
+       * 所以工具还开着时点下去是"再画一块"，不会变成选中。
+       */
+      await hotkey('Escape', 27)
+      await sleep(180)
+      check('Esc 退出了区域高亮工具', (await snap()).tool === 'none', `tool=${(await snap()).tool}`)
+
+      const ac = await centerOf(area.id)
+      await tap(ac.x, ac.y)
+      const g = await selGeometry()
+      check(
+        '区域高亮**给**改大小手柄（它没有依附的文字，框本身就是内容）',
+        !!g && g.handleCount === 8,
+        g ? `手柄=${g.handleCount}` : 'null',
+      )
+
+      if (g?.handles?.se) {
+        const r0 = [...area.rect]
+        await dragOn(g.handles.se.x, g.handles.se.y, g.handles.se.x + 80, g.handles.se.y + 50)
+        await sleep(280)
+        const r1 = (await annots()).find((a) => a.id === area.id)
+        check(
+          '拉手柄能把区域高亮改大',
+          !!r1 && r1.rect[2] - r1.rect[0] > r0[2] - r0[0] + 20,
+          r1 ? `宽 ${(r0[2] - r0[0]).toFixed(0)} → ${(r1.rect[2] - r1.rect[0]).toFixed(0)}pt` : '找不到',
+        )
+        await shot('12-area-resized')
+      }
+    }
+
+    await hotkey('Escape', 27)
+    await sleep(150)
+  }
+  console.log('\n[13] 控制台')
   check(
     '没有未捕获异常 / error',
     consoleErrors.length === 0,

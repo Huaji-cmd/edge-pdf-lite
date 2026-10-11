@@ -878,6 +878,19 @@ defineExpose({
   canUndo,
   canRedo,
   selId,
+  /**
+   * 有没有**还没写回文件**的批注 —— 退出拦截的唯一依据。
+   *
+   * 两个条件都要：
+   *   · `count() > 0` 排掉"画了一条又撤销掉"的情况（那种时候页已被标脏，
+   *     但一条批注都没有，拦下来纯属骚扰）
+   *   · `dirty` 排掉"已经导出过"的情况
+   */
+  hasUnsaved: () => annotStore.count() > 0 && annotStore.dirtyPages().size > 0,
+  /** 导出成功后调用：清脏标记，之后退出不再拦截 */
+  markSaved: () => {
+    annotStore.markSaved()
+  },
   /** 供导出用：取出全部批注（普通数组，非响应式） */
   getAnnotations: () => annotStore.all(),
   /** 清空批注（换文档/导出后可调） */

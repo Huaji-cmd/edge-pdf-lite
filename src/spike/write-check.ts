@@ -117,9 +117,22 @@ const NEW: Annotation[] = [
     lineWidth: 2,
   },
   {
-    ...base('new-rect', 5, [80, 600, 300, 700], 'square box'),
+    // 挪到页面下半部，把 Line 2/3 让给区域高亮（它要盖在文字上验证"透字"）
+    ...base('new-rect', 5, [80, 420, 300, 520], 'square box'),
     kind: 'rect',
     lineWidth: 2,
+  },
+  {
+    /*
+     * 区域高亮：**故意盖在文字行上**，这样在 Edge / Acrobat 里能一眼看出
+     * 它是"染背景"还是"盖色板" —— 文字若还清晰可读，就是对的。
+     * 放在第 5 页、盖住 Line 2 / Line 3（那两行正是 HIGHLIGHT TARGET）。
+     */
+    ...base('new-area', 5, [46, 645, 300, 680], 'area highlight (no text layer needed)'),
+    kind: 'area',
+    color: [1, 0.92, 0.23],
+    // ⚠️ 必须 1：区域高亮靠 Multiply 染背景，alpha<1 会把内容冲淡
+    opacity: 1,
   },
   {
     ...base('new-freetext', 6, [60, 150, 280, 210], 'free text ascii'),
@@ -343,8 +356,9 @@ const run = async (): Promise<void> => {
     const byType: Record<string, number> = {}
     for (const r of rows) byType[String(r.subtype)] = (byType[String(r.subtype)] ?? 0) + 1
     check(
-      '子类型全部正确（Highlight/Underline/StrikeOut/Ink/Square/FreeText×2）',
-      byType.Highlight === 1 &&
+      // Highlight 是 2 条：文本高亮 + **区域高亮**（后者也落成标准 Highlight）
+      '子类型全部正确（Highlight×2 / Underline / StrikeOut / Ink / Square / FreeText×2）',
+      byType.Highlight === 2 &&
         byType.Underline === 1 &&
         byType.StrikeOut === 1 &&
         byType.Ink === 1 &&
@@ -383,6 +397,23 @@ const run = async (): Promise<void> => {
       'Highlight 的 QuadPoints 原样写回（值 + Z 序）',
       hlOk,
       hl ? `读回 ${(hl.quadPoints as number[])?.join(',')} / 写入 ${q4.join(',')}` : '没找到',
+    )
+
+    /*
+     * 区域高亮 → 必须是**标准 `/Highlight`** 子类型，QuadPoints 是矩形四角。
+     *
+     * 这条判据守的是"跨查看器"：扫描件上没有文本层，但写回后落在标准类型上，
+     * 任何查看器（PDFium / Acrobat / pdf.js）都能画。
+     * 哪天有人图省事自造一个 Subtype，这条会立刻变红。
+     */
+    const areaRow = rows.find((r) => String(r.contents ?? '').includes('area highlight'))
+    const areaQuads = areaRow?.quadPoints as number[] | undefined
+    check(
+      '区域高亮落成标准 /Highlight，且 QuadPoints 是矩形四角',
+      !!areaRow && areaRow.subtype === 'Highlight' && Array.isArray(areaQuads) && areaQuads.length === 8,
+      areaRow
+        ? `subtype=${String(areaRow.subtype).replace('/', '')} / QuadPoints=${areaQuads?.map((n) => n.toFixed(0)).join(',')}`
+        : '没找到 area 批注',
     )
 
     // 中文 /Contents

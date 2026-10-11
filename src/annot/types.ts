@@ -12,6 +12,8 @@
 export type AnnotKind =
   /** 文本高亮（选中文字） */
   | 'highlight'
+  /** **区域高亮**：拖一个框直接盖住一块，**不依赖文本层** */
+  | 'area'
   /** 下划线 */
   | 'underline'
   /** 删除线 */
@@ -58,6 +60,20 @@ export interface TextMarkupAnnot extends AnnotBase {
   overlaidText?: string
 }
 
+/**
+ * 区域高亮。
+ *
+ * **存在的理由**：扫描件（《现代操作系统教程》就是整页图片）**没有文本层**，
+ * TextMarkup 类批注无处依附 —— 在这类书上高亮/下划线/删除线一条都画不出来。
+ * 而这类书的标注需求本来就只是"把这一段盖住"，压根不需要知道文字在哪。
+ *
+ * ⚠️ 写回时落成**标准 `/Highlight` 子类型**（QuadPoints = 矩形四角），
+ * 而不是发明一个新的注释类型 —— 任何查看器都能正常显示，这是跨查看器兼容的前提。
+ */
+export interface AreaAnnot extends AnnotBase {
+  kind: 'area'
+}
+
 export interface InkAnnot extends AnnotBase {
   kind: 'ink'
   /**
@@ -81,11 +97,12 @@ export interface FreeTextAnnot extends AnnotBase {
   fontSize: number
 }
 
-export type Annotation = TextMarkupAnnot | InkAnnot | RectAnnot | FreeTextAnnot
+export type Annotation = TextMarkupAnnot | AreaAnnot | InkAnnot | RectAnnot | FreeTextAnnot
 
 /** 各工具默认外观 —— 改这里就能换配色 */
 export const PALETTE: Record<AnnotKind, Rgb> = {
   highlight: [1, 0.92, 0.23],
+  area: [1, 0.92, 0.23],
   underline: [0.13, 0.4, 0.92],
   strikeout: [0.9, 0.19, 0.19],
   ink: [0.9, 0.19, 0.19],
@@ -131,9 +148,19 @@ function usableAsHighlight(c: Rgb): boolean {
 /** 高亮工具可选的色板（就是 SWATCHES 去掉黑/白） */
 export const HIGHLIGHT_SWATCHES: readonly Rgb[] = SWATCHES.filter(usableAsHighlight)
 
+/**
+ * 哪些工具走"Multiply 染背景"（高亮 + 区域高亮）。
+ *
+ * 两者是同一个渲染路径：alpha=1 的 Multiply，所以受同一条颜色约束
+ * （不能用黑/白，理由见 `usableAsHighlight`）。
+ */
+function blendsIntoBackground(kind: ToolKind): boolean {
+  return kind === 'highlight' || kind === 'area'
+}
+
 /** 某个工具该显示哪套色板 */
 export function swatchesFor(kind: ToolKind): readonly Rgb[] {
-  return kind === 'highlight' ? HIGHLIGHT_SWATCHES : SWATCHES
+  return blendsIntoBackground(kind) ? HIGHLIGHT_SWATCHES : SWATCHES
 }
 
 /**
@@ -143,7 +170,9 @@ export function swatchesFor(kind: ToolKind): readonly Rgb[] {
  * 不兜的话，用户换了版本会莫名其妙画出一行黑条，还不知道怎么恢复。
  */
 export function sanitizeToolColor(kind: ToolKind, c: Rgb): Rgb {
-  return kind === 'highlight' && !usableAsHighlight(c) ? [...PALETTE.highlight] : c
+  if (!blendsIntoBackground(kind) || usableAsHighlight(c)) return c
+  const fallback = kind === 'area' ? PALETTE.area : PALETTE.highlight
+  return [...fallback] as Rgb
 }
 
 /**
@@ -172,6 +201,7 @@ export type ColorTool = Exclude<ToolKind, 'none' | 'eraser'>
 
 export const COLOR_TOOLS: readonly ColorTool[] = [
   'highlight',
+  'area',
   'underline',
   'strikeout',
   'ink',
@@ -189,6 +219,7 @@ export type ToolColors = Record<ColorTool, Rgb>
 export function defaultToolColors(): ToolColors {
   return {
     highlight: [...PALETTE.highlight] as Rgb,
+    area: [...PALETTE.area] as Rgb,
     underline: [...PALETTE.underline] as Rgb,
     strikeout: [...PALETTE.strikeout] as Rgb,
     ink: [...PALETTE.ink] as Rgb,
@@ -210,9 +241,14 @@ export interface SelectedInfo {
   color: Rgb
 }
 
-/** 哪些批注能被"改大小"（高亮类跟着文字走，拉伸会脱离原文，所以只允许平移） */
+/**
+ * 哪些批注能被"改大小"。
+ *
+ * 文本高亮类（highlight/underline/strikeout）**只能平移** —— 它们跟着文字走，
+ * 拉伸会让高亮脱离原文。但**区域高亮可以拉伸**：它没有依附的文字，框本身就是内容。
+ */
 export function isResizable(a: Annotation): boolean {
-  return a.kind === 'ink' || a.kind === 'rect' || a.kind === 'freetext'
+  return a.kind === 'area' || a.kind === 'ink' || a.kind === 'rect' || a.kind === 'freetext'
 }
 
 export const MARKUP_KINDS: readonly AnnotKind[] = ['highlight', 'underline', 'strikeout']
@@ -279,6 +315,7 @@ export type ToolKind =
   /** 不拦截任何指针事件 —— 正常阅读/选中/滚动 */
   | 'none'
   | 'highlight'
+  | 'area'
   | 'underline'
   | 'strikeout'
   | 'ink'

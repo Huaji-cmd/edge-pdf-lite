@@ -121,10 +121,17 @@ try {
     await sleep(page ? 4500 : 6000)
   }
 
+  /*
+   * 缩放可调：默认 150% 够看清细节，但整页高 842pt 时 150% 就是 1263px ——
+   * 比 1050px 的窗口还高，**页面下半部会被裁掉**（"批注没显示"的假象）。
+   * 要看全页就把 EPL_ZOOM 调小（如 90）。
+   */
+  const ZOOM = Number(process.env.EPL_ZOOM ?? 150)
+
   const wanted = PAGES.length ? PAGES : [1]
   for (const p of wanted) {
-    console.log(`→ Edge 内置查看器打开 ${URL_TARGET}#page=${p}&zoom=150`)
-    await open(p, 150)
+    console.log(`→ Edge 内置查看器打开 ${URL_TARGET}#page=${p}&zoom=${ZOOM}`)
+    await open(p, ZOOM)
     await shot(`edge-${base}-p${p}`)
   }
 

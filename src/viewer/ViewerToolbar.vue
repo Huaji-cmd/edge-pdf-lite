@@ -17,6 +17,14 @@ const props = defineProps<{
   stats: RendererStats | null
   tool: ToolKind
   annotCount: number
+  /**
+   * 有没有还没写回文件的批注。
+   *
+   * ⚠️ 这个标记**不能省**。浏览器在 beforeunload 时只会显示它自己那句
+   * "你确定要离开吗"，不会显示我们给的任何文字 —— 所以"还有东西没存"
+   * 这件事只能靠页面内的可见标记提前传达，等拦截弹窗出来已经晚了。
+   */
+  unsaved: boolean
   /** 指针模式：选择 / 滚动 / 拖动 */
   pointerMode: PointerMode
   /** 各工具的当前配色 */
@@ -69,6 +77,7 @@ function onPageInput(e: Event): void {
 
 const KIND_LABEL: Record<SelectedInfo['kind'], string> = {
   highlight: '高亮',
+  area: '区域高亮',
   underline: '下划线',
   strikeout: '删除线',
   ink: '手写',
@@ -223,6 +232,18 @@ function isOn(c: Rgb): boolean {
       >
         手写
       </button>
+      <!--
+        区域高亮：**不依赖文本层**。
+        扫描件（《现代操作系统教程》就是整页图片）上文字类高亮一条都画不出来，
+        而这个工具只认"拖出来的这块区域"，正好补上那个缺口。
+      -->
+      <button
+        :class="['btn', 'seg-btn', tool === 'area' ? 'on' : '']"
+        title="区域高亮：拖一个框直接盖住一块，不需要文字层（扫描件用这个）"
+        @click="pickTool('area')"
+      >
+        区域高亮
+      </button>
       <button
         :class="['btn', 'seg-btn', tool === 'rect' ? 'on' : '']"
         title="矩形框：拖出一个框"
@@ -277,8 +298,16 @@ function isOn(c: Rgb): boolean {
       删除所选
     </button>
     <span v-if="annotCount" class="badge">{{ annotCount }}</span>
+    <span
+      v-if="unsaved"
+      class="badge unsaved"
+      title="这些批注还没写回文件。关掉页面 / 刷新 / 打开别的 PDF 之前记得先保存 —— 否则会丢"
+    >
+      ● 未保存
+    </span>
     <button
       class="btn save"
+      :class="{ attention: unsaved }"
       title="把批注写回 PDF，另存为一份新文件（不会改动原文件）"
       @click="emit('export-annot')"
     >
@@ -350,6 +379,12 @@ function isOn(c: Rgb): boolean {
 }
 .btn.save:hover {
   background: #366b4d;
+}
+/* 有未保存的批注时让保存按钮更显眼一点 —— 它是此时唯一能留住批注的出口 */
+.btn.save.attention {
+  background: #3d7a55;
+  border-color: #4d9a6c;
+  box-shadow: 0 0 0 1px rgba(120, 220, 160, 0.35);
 }
 .btn.danger {
   background: #6b2b30;
@@ -445,6 +480,12 @@ function isOn(c: Rgb): boolean {
   padding: 1px 8px;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+/* 未保存标记：琥珀色，跟"计数"的蓝区分开 —— 这两件事性质不同，
+   一个是"有多少"，一个是"还没落盘" */
+.badge.unsaved {
+  background: #8a5a12;
+  color: #ffd88a;
 }
 .dim {
   color: #8b93a1;

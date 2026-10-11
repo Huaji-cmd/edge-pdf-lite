@@ -29,6 +29,29 @@ const toast = ref('')
 const tool = ref<ToolKind>('none')
 const annotCount = ref(0)
 
+/**
+ * 有没有**还没写回文件**的批注。
+ *
+ * ⚠️ 刻意**不**做后台自动暂存（不做 IndexedDB 悄悄存一份）。
+ * 那会把"用户还没决定要不要留"的东西留下来，跟 Word 的语义不符：
+ * Word 也不会替你存一个"未保存版本"。这里学 Word ——
+ * **只在他真要离开的时候拦一下，决定权留给他**。
+ *
+ * 拦截点有两处，缺一不可：
+ *   ① `beforeunload`：刷新 / 关标签 / 关窗口 / 浏览器后退
+ *   ② `openBytes`：应用内换文档（这条 beforeunload 管不到，因为页面没卸载）
+ */
+const unsaved = ref(false)
+
+function refreshUnsaved(): void {
+  unsaved.value = viewerRef.value?.hasUnsaved() ?? false
+}
+
+function onAnnotCount(n: number): void {
+  annotCount.value = n
+  refreshUnsaved()
+}
+
 /** 指针模式：选择 / 滚动 / 拖动。与「工具」正交，互斥在下面的 setTool / setPointerMode 里保证 */
 const pointerMode = ref<PointerMode>('select')
 
@@ -222,6 +245,23 @@ function onBeforeInstallPrompt(e: Event): void {
   installPrompt.value = e as InstallPromptEvent
 }
 
+/**
+ * 离开页面前的拦截。
+ *
+ * ⚠️ 两件事必须说清楚，否则很容易白写：
+ *  1. **现代浏览器不会显示我们给的文字**。`returnValue` / `preventDefault()`
+ *     只是一个开关，浏览器永远显示它自己那句（"你确定要离开此页面吗？"）。
+ *     所以别费劲写提示文案 —— 真正的信息要靠**页面内的可见标记**传达。
+ *  2. **要求页面发生过用户交互**才真的弹（防滥用）。我们的场景天然满足：
+ *     有未保存批注就一定点过或画过。
+ */
+function onBeforeUnload(e: BeforeUnloadEvent): void {
+  flushSave()
+  if (!unsaved.value) return
+  e.preventDefault()
+  e.returnValue = ''
+}
+
 function onInstalled(): void {
   installPrompt.value = null
   standalone.value = true
@@ -245,6 +285,21 @@ watch([page, scale, mode, spreadOffset], scheduleSave)
 // ---------------------------------------------------------------- 打开文件
 
 async function openBytes(bytes: Uint8Array, name: string): Promise<void> {
+  /*
+   * 换文档会**清空整个批注 store**（批注按文档归属，不能跨文件漂）。
+   * 这一步浏览器不会卸载页面，所以 `beforeunload` 拦不到 —— 必须自己问一句。
+   */
+  if (
+    unsaved.value &&
+    !window.confirm(
+      `《${fileName.value}》上还有 ${annotCount.value} 条批注没有保存。\n\n` +
+        `打开新文件会丢掉它们，确定继续吗？\n\n` +
+        `（想留住就先取消，点工具栏的「保存批注」）`,
+    )
+  ) {
+    return
+  }
+
   errorText.value = ''
   busy.value = true
   try {
@@ -344,6 +399,9 @@ async function exportAnnotated(): Promise<void> {
     const bytes = await buildAnnotatedPdf(d.originalBytes, list)
     const name = annotatedFileName(fileName.value)
     downloadBytes(bytes, name)
+    // 已经落到文件里了 —— 之后退出不再拦截
+    viewerRef.value?.markSaved()
+    refreshUnsaved()
     showToast(`已导出 ${name}`)
   } catch (e) {
     console.error('[export] 失败', e)
@@ -428,8 +486,9 @@ onMounted(() => {
   window.addEventListener('dragover', onDragOver)
   window.addEventListener('dragleave', onDragLeave)
   window.addEventListener('drop', onDrop)
-  // 关页面前把阅读位置落盘（防抖可能还没到点）
-  window.addEventListener('beforeunload', flushSave)
+  // 关页面前把阅读位置落盘（防抖可能还没到点）；顺带拦住未保存的批注
+  window.addEventListener('beforeunload', onBeforeUnload)
+  // pagehide 覆盖"切到后台/移动设备被杀"这类不触发 beforeunload 的情况
   window.addEventListener('pagehide', flushSave)
   // 应用形态判断 + 安装事件（见上面 installPrompt 的注释：只能在这儿挂）
   standalone.value = window.matchMedia?.('(display-mode: standalone)').matches ?? false
@@ -442,7 +501,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('dragover', onDragOver)
   window.removeEventListener('dragleave', onDragLeave)
   window.removeEventListener('drop', onDrop)
-  window.removeEventListener('beforeunload', flushSave)
+  window.removeEventListener('beforeunload', onBeforeUnload)
   window.removeEventListener('pagehide', flushSave)
   window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt)
   window.removeEventListener('appinstalled', onInstalled)
@@ -463,6 +522,7 @@ onBeforeUnmount(() => {
       :stats="stats"
       :tool="tool"
       :annot-count="annotCount"
+      :unsaved="unsaved"
       :pointer-mode="pointerMode"
       :colors="colors"
       :selected="selected"
@@ -497,7 +557,7 @@ onBeforeUnmount(() => {
       @page-change="(p) => (page = p)"
       @stats="(s) => (stats = s)"
       @ready="onViewerReady"
-      @annot-count="(n) => (annotCount = n)"
+      @annot-count="onAnnotCount"
       @sel-change="(s) => (selected = s)"
       @history-change="onHistoryChange"
       @tool-auto-exit="tool = 'none'"
@@ -522,6 +582,15 @@ onBeforeUnmount(() => {
           <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> 重做 ·
           <kbd>Delete</kbd> 删除所选 ·
           <kbd>Esc</kbd> 退出工具
+        </p>
+        <!--
+          B3 的说明。文件里已有的注释不进 store（符合"只改自己画的"这个设计），
+          但对用户来说那批批注是"看得见却点不动" —— 不说明就会被当成工具坏了。
+        -->
+        <p class="hint caveat">
+          ⚠️ 只改自己画的：PDF 里<b>原有的</b>批注看得见，但擦不掉、也拖不动<br />
+          ⚠️ <b>中文</b>文本框在别的查看器里只显示占位框（标准字体没有中文字形）——
+          文字没丢，在应用内和注释面板里都能看全
         </p>
       </div>
     </div>
@@ -610,6 +679,15 @@ onBeforeUnmount(() => {
 .hint {
   margin-top: 22px !important;
   font-size: 12px !important;
+}
+/* 这条是"限制说明"，不能跟普通快捷键提示一个观感 —— 它要能被当成警示 */
+.hint.caveat {
+  margin-top: 8px !important;
+  color: #b9954f !important;
+}
+.hint.caveat b {
+  color: #e0c07a;
+  font-weight: 600;
 }
 kbd {
   background: #262b33;

@@ -198,6 +198,26 @@ function textString(s: string): PDFString | PDFHexString {
   return isAscii(s) ? PDFString.of(s) : PDFHexString.fromText(s)
 }
 
+/**
+ * 中文批注的"占位横线"。
+ *
+ * 画不了字，但也不能什么都不画 —— 详见 `freeTextAppearance` 里那段说明。
+ * 每行长度递减，看起来像一段文字，一眼能认出"这里是个文本批注"。
+ */
+function placeholderLines(w: number, h: number): string {
+  const pad = 3
+  const lh = 12
+  const rows = Math.max(1, Math.min(5, Math.floor((h - pad * 2) / lh)))
+  let s = 'q\n0.74 0.74 0.78 rg\n'
+  for (let i = 0; i < rows; i++) {
+    const y = h - pad - lh * (i + 0.72)
+    // 末行短一截，看起来才像一段自然结束的文字
+    const lw = Math.max(12, (w - pad * 2) * (i === rows - 1 ? 0.52 : 1))
+    s += `${num(pad)} ${num(y)} ${num(lw)} ${num(lh * 0.42)} re\nf\n`
+  }
+  return s + 'Q\n'
+}
+
 function freeTextAppearance(a: FreeTextAnnot, rect: [number, number, number, number]): string | null {
   const [r, g, b] = a.color
   const w = rect[2] - rect[0]
@@ -206,8 +226,22 @@ function freeTextAppearance(a: FreeTextAnnot, rect: [number, number, number, num
     `q\n0.55 0.55 0.55 RG\n0.8 w\n0 0 ${num(w)} ${num(h)} re\nS\n` +
     `1 1 1 rg\n0.5 0.5 ${num(Math.max(0, w - 1))} ${num(Math.max(0, h - 1))} re\nf\nQ\n`
   if (!isAscii(a.text)) {
-    // 交给查看器用系统字体渲染（各查看器表现略有差异，但比画成问号好）
-    return box
+    /*
+     * 中文：标准 14 字体里没有 CJK 字形，硬画会变成一串 "????"。
+     *
+     * ⚠️ 曾经这里只 `return box`，注释写的是"交给查看器用系统字体渲染" ——
+     *    **这个想法是错的**：只要给了 /AP，查看器就用 /AP，不会自己再补文字。
+     *    实际结果是用户在 Edge / Acrobat 里看到一个**莫名其妙的白色空框**，
+     *    根本不知道那里有个批注。
+     *
+     * 现在改成画"占位横线"：看得出是一个文本批注、有多少内容，
+     * 文字本身在 /Contents 里一个字节都没丢（注释面板 / 应用内都能看全）。
+     *
+     * 要真把中文画出来，只能**子集化嵌入一份 CJK 字体**（需 fontkit +
+     * 一个几 MB 的字体文件）。那跟 lite 的定位冲突，见
+     * `docs/待办与验收清单.md` 里 B2 的说明。
+     */
+    return box + placeholderLines(w, h)
   }
   const fs = a.fontSize
   const lines = a.text.split('\n')
@@ -228,6 +262,26 @@ function safeRect(a: Annotation): [number, number, number, number] {
   if (isMarkup(a)) return bboxOfQuads(a.quads)
   if (a.kind === 'ink') return bboxOfPoints(a.strokes.flat(), a.lineWidth / 2)
   return normalizeRect(a.rect)
+}
+
+/**
+ * Multiply 混合用的 ExtGState 资源（文本高亮与区域高亮共用）。
+ *
+ * 底色乘上页面内容：白底 (1,1,1) × 黄 = 黄（背景上色），
+ * 黑字 (0,0,0) × 黄 = 黑（字一个像素都不变）。
+ * 不加这条，高亮就是一块盖住文字的色块（实测）。
+ *
+ * ⚠️ **ca 必须是 1，不能用 `a.opacity`。** alpha<1 时混合结果在"原色"和
+ * "乘积"之间插值 → 黑字被冲成灰橄榄色。这是"高亮影响字本身颜色"的根因，
+ * 应用内渲染那边同理（draw.ts 对这两个种类强制 `globalAlpha = 1`）。
+ * **高亮的浓淡由颜色本身决定，不由 alpha 决定。**
+ */
+function multiplyGs(pdf: PDFDocument): LitDict {
+  return {
+    ExtGState: {
+      GS_HL: pdf.context.register(pdf.context.obj({ BM: 'Multiply', ca: 1, CA: 1 })),
+    },
+  }
 }
 
 /** 把一条批注转成 PDF 注释字典 */
@@ -265,21 +319,26 @@ function annotDict(pdf: PDFDocument, a: Annotation, fontRef: PDFRef | null): Lit
     }
     if (a.kind === 'highlight') {
       apContent = fillQuads(a.quads, a.color, x0, y0, 'GS_HL')
-      // Multiply 混合：底色乘上页面内容，文字保持可读。
-      // 不加这条，高亮就是一块盖住文字的色块（实测）。
-      //
-      // ⚠️ **ca 必须是 1，不能用 a.opacity。** alpha<1 时混合结果在"原色"和
-      // "乘积"之间插值 → 黑字被冲成灰橄榄色。这是"高亮影响字本身颜色"的根因，
-      // 应用内渲染那边同理（draw.ts 强制 globalAlpha=1）。
-      // 高亮的"浓淡"由颜色本身决定，不由 alpha 决定。
-      resources = {
-        ExtGState: {
-          GS_HL: pdf.context.register(pdf.context.obj({ BM: 'Multiply', ca: 1, CA: 1 })),
-        },
-      }
+      resources = multiplyGs(pdf)
     } else {
       apContent = strokeAcrossQuads(a.quads, a.color, x0, y0, a.kind === 'underline' ? 0.94 : 0.5, 1.2)
     }
+  } else if (a.kind === 'area') {
+    /*
+     * 区域高亮 → **标准 `/Highlight`**，QuadPoints = 矩形四角。
+     *
+     * ⚠️ 刻意不发明新的注释类型。扫描件上没有文本层，但"把这块盖住"这个语义
+     * 用 Highlight 表达完全够 —— 换来的是**任何查看器都能正常画**
+     * （PDFium / Acrobat / pdf.js 都认 Highlight + QuadPoints）。
+     *
+     * ⚠️ QuadPoints 必须 **Z 序**（左上→右上→左下→右下）。实测用逆时针序会错位。
+     */
+    const [ax0, ay0, ax1, ay1] = normalizeRect(a.rect)
+    const quads = [ax0, ay1, ax1, ay1, ax0, ay0, ax1, ay0]
+    subtype = 'Highlight'
+    extra = { QuadPoints: quads, C: a.color, CA: 1 }
+    apContent = fillQuads(quads, a.color, x0, y0, 'GS_HL')
+    resources = multiplyGs(pdf)
   } else if (a.kind === 'ink') {
     subtype = 'Ink'
     extra = {
