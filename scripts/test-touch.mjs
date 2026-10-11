@@ -29,6 +29,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { clickByTidExpr } from './testids.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const SHOTS = resolve(ROOT, 'touch-shots')
@@ -225,16 +226,7 @@ try {
   const snap = () => evaluate(`JSON.stringify(window.__eplViewer.snapshot())`).then(JSON.parse)
   const annots = () => evaluate(`JSON.stringify(window.__eplViewer.annots())`).then(JSON.parse)
 
-  const toolbarBtn = (label) =>
-    evaluate(`
-      (() => {
-        const b = [...document.querySelectorAll('.toolbar .btn')]
-          .find(x => x.textContent.trim() === ${JSON.stringify(label)});
-        if (!b) return false;
-        b.click();
-        return true;
-      })()
-    `)
+  const toolbarBtn = (label) => evaluate(clickByTidExpr(label))
 
   const scrollTop = () => evaluate(`document.querySelector('.viewport').scrollTop`)
   const setScrollTop = (v) =>

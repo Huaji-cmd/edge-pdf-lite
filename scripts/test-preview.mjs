@@ -21,6 +21,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { clickByTidExpr } from './testids.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const SHOTS = resolve(ROOT, 'preview-shots')
@@ -143,33 +144,16 @@ try {
   }
 
   /** 点工具栏上某个按钮（按文字精确匹配） */
-  const toolbarBtn = (label) =>
-    evaluate(`
-      (() => {
-        const b = [...document.querySelectorAll('.toolbar .btn')]
-          .find(x => x.textContent.trim() === ${JSON.stringify(label)});
-        if (!b) return false;
-        b.click();
-        return true;
-      })()
-    `)
+  const toolbarBtn = (label) => evaluate(clickByTidExpr(label))
 
   /**
-   * 点侧边栏里的 tab（目录 / 缩略图）。
+   * 点顶栏的面板图标（文件 / 搜索 / 目录 / 缩略图）。
    *
-   * ⚠️ 它们在 `.side` 里、class 是 `.tab`，**不在** `.toolbar .btn` 里 ——
-   *    第一版测试拿 toolbarBtn 去找，点了个寂寞。
+   * ⚠️ 这些入口在 `.titlebar` 里、**不在** `.toolbar` 里 ——
+   *    早期版本拿 `.toolbar .btn` 去找，点了个寂寞。
+   *    现在统一走 data-tid，位置变了也不会失效。
    */
-  const sideTab = (label) =>
-    evaluate(`
-      (() => {
-        const b = [...document.querySelectorAll('.side .tab')]
-          .find(x => x.textContent.trim() === ${JSON.stringify(label)});
-        if (!b) return false;
-        b.click();
-        return true;
-      })()
-    `)
+  const sideTab = (label) => evaluate(clickByTidExpr(label))
 
   const pageNow = async () => Number(await evaluate(`document.querySelector('.page-input').value`))
   const scrollNow = async () => Number(await evaluate(`document.querySelector('.viewport').scrollTop`))
@@ -186,7 +170,7 @@ try {
       await sleep(400)
       const c = await evaluate(`document.querySelectorAll('.pdf-page-canvas').length`)
       const loading = await evaluate(`!!document.querySelector('.loading')`)
-      const fname = await evaluate(`(document.querySelector('.toolbar .file')||{}).textContent||''`)
+      const fname = await evaluate(`(document.querySelector('[data-tid="file-name"]')||{}).textContent||''`)
       if (!loading && c > 0 && String(fname).includes(expectName)) return true
     }
     return false
@@ -364,10 +348,128 @@ try {
     check(`点第 ${target} 张缩略图跳过去了`, after === target, `${before} → ${after}（期望 ${target}）`)
   }
 
+  // ---------------------------------------------------------------- 3c. 文件列表 + 搜索
+
+  console.log('\n[3c] 文件列表 + 搜索')
+  check('切到「文件」面板', await toolbarBtn('文件'))
+  await sleep(320)
+  check('出现文件面板', await evaluate(`!!document.querySelector('[data-tid="files-panel"]')`))
+  check(
+    '空列表时给出明确提示（而不是一片空白）',
+    await evaluate(
+      `/添加文件/.test(document.querySelector('[data-tid="files-panel"]')?.textContent || '')`,
+    ),
+  )
+  await shot('03c-files-empty')
+
+  // 右键空白处 → 菜单（这是用户指定的入口）
+  await evaluate(`
+    (() => {
+      const p = document.querySelector('[data-tid="files-panel"]');
+      const r = p.getBoundingClientRect();
+      p.dispatchEvent(new MouseEvent('contextmenu', {
+        bubbles: true, cancelable: true,
+        clientX: Math.round(r.left + 70), clientY: Math.round(r.top + 140),
+      }));
+    })()
+  `)
+  await sleep(260)
+  check(
+    '右键弹出「添加文件 / 添加文件夹」菜单',
+    await evaluate(
+      `!!document.querySelector('[data-tid="add-files"]') && !!document.querySelector('[data-tid="add-folder"]')`,
+    ),
+  )
+  await shot('03c-ctx-menu')
+
+  // 点空白处收起菜单（真实流程里点完菜单项它也会收）——
+  // ⚠️ 不能在这里点「添加文件…」：那会调 input.click() 去开系统文件对话框，
+  //    headless 下要么没反应要么把测试挂住，所以后面直接用 CDP 塞文件
+  await evaluate(`document.querySelector('[data-tid="files-panel"]').click()`)
+  await sleep(220)
+  check(
+    '点空白处菜单收起',
+    !(await evaluate(`!!document.querySelector('[data-tid="add-files"]')`)),
+  )
+
+  // 把样本塞进隐藏的 file input（等价于用户在菜单里选了文件）
+  const fdoc = await send('DOM.getDocument', { depth: -1 })
+  const finp = await send('DOM.querySelector', {
+    nodeId: fdoc.root.nodeId,
+    selector: '[data-tid="files-panel"] input[type=file]',
+  })
+  await send('DOM.setFileInputFiles', { files: [PDF, SCAN], nodeId: finp.nodeId })
+  await sleep(700)
+
+  const rowCount = await evaluate(
+    `document.querySelectorAll('[data-tid="files-panel"] [data-node-id][data-kind="file"]').length`,
+  )
+  check('选中的文件进了列表', rowCount === 2, `条目数=${rowCount}`)
+  await shot('03c-files-added')
+
+  // 点列表里的条目 → 应该真的把那份打开
+  await evaluate(`
+    (() => {
+      const rows = [...document.querySelectorAll('[data-tid="files-panel"] [data-kind="file"]')];
+      rows.find(r => /1706/.test(r.textContent))?.click();
+    })()
+  `)
+  let openedFromList = false
+  for (let i = 0; i < 60; i++) {
+    await sleep(400)
+    const nm = await evaluate(
+      `(document.querySelector('[data-tid="file-name"]')||{}).textContent||''`,
+    )
+    if (String(nm).includes('1706')) {
+      openedFromList = true
+      break
+    }
+  }
+  check('点列表里的文件真的把它打开了', openedFromList)
+  check(
+    '被打开的那一行有高亮（看得出当前是哪份）',
+    await evaluate(`!!document.querySelector('[data-tid="files-panel"] [data-node-id].cur')`),
+  )
+  await shot('03c-files-opened')
+
+  // ---- 搜索（只匹配文件名）
+  check('切到「搜索」面板', await toolbarBtn('搜索'))
+  await sleep(320)
+  check('出现搜索面板', await evaluate(`!!document.querySelector('[data-tid="search-panel"]')`))
+
+  await evaluate(`
+    (() => {
+      const i = document.querySelector('[data-tid="search-input"]');
+      i.value = 'scan';
+      i.dispatchEvent(new Event('input', { bubbles: true }));
+    })()
+  `)
+  await sleep(320)
+  const hits = await evaluate(
+    `document.querySelectorAll('[data-tid="search-panel"] [data-node-id]').length`,
+  )
+  check('按文件名匹配到了唯一一个', hits === 1, `结果数=${hits}`)
+  await shot('03c-search')
+
+  await evaluate(`
+    (() => {
+      const i = document.querySelector('[data-tid="search-input"]');
+      i.value = 'zzz-not-exist';
+      i.dispatchEvent(new Event('input', { bubbles: true }));
+    })()
+  `)
+  await sleep(300)
+  check(
+    '搜不到时给出「没有匹配的文件」',
+    await evaluate(`/没有匹配/.test(document.querySelector('[data-tid="search-panel"]').textContent)`),
+  )
+
   // ---------------------------------------------------------------- 4. 收起
 
   console.log('\n[4] 收起侧边栏')
-  await toolbarBtn('目录')
+  // ⚠️ 收起要点顶栏最左边的**开关**图标。顶栏的「目录」现在只是切换面板，
+  //    点它不会收起侧边栏（旧界面里那个按钮兼任 toggle，新界面分开了）。
+  await toolbarBtn('侧边栏')
   await sleep(400)
   check('侧边栏收起了', !(await evaluate(`!!document.querySelector('.side')`)))
   // 收起后主阅读区不能坏

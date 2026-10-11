@@ -21,6 +21,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { clickByTidExpr } from './testids.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const SHOTS = resolve(ROOT, 'writer-shots')
@@ -224,16 +225,7 @@ try {
   const fixture = resolve(ROOT, 'public', 'testdata', 'annot-fixture.pdf')
   await send('DOM.setFileInputFiles', { nodeId: fileInput.nodeId, files: [fixture] })
 
-  const toolbarBtn = (label) =>
-    evaluate(`
-      (() => {
-        const b = [...document.querySelectorAll('.toolbar button')]
-          .find((x) => x.textContent.trim() === ${JSON.stringify(label)});
-        if (!b) return false;
-        b.click();
-        return true;
-      })()
-    `)
+  const toolbarBtn = (label) => evaluate(clickByTidExpr(label))
 
   let opened = false
   for (let i = 0; i < 40 && !opened; i++) {
@@ -276,7 +268,7 @@ try {
   await sleep(400)
 
   const count = await evaluate(
-    `Number(document.querySelector('.toolbar .badge')?.textContent.trim() ?? 0)`,
+    `Number(document.querySelector('[data-tid="annot-count"]')?.textContent.trim() ?? 0)`,
   )
   check('画完之后批注计数 = 1', count === 1, `count=${count}`)
   await shot('02-app-after-draw')

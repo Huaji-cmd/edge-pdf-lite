@@ -18,6 +18,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { clickByTidExpr } from './testids.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const SHOTS = resolve(ROOT, 'interact-shots')
@@ -223,30 +224,61 @@ try {
   // ---------------------------------------------------------------- 探针
 
   /** 点工具栏上某个按钮（按文字精确匹配） */
-  const toolbarBtn = (label) =>
-    evaluate(`
-      (() => {
-        const b = [...document.querySelectorAll('.toolbar .btn')]
-          .find(x => x.textContent.trim() === ${JSON.stringify(label)});
-        if (!b) return false;
-        b.click();
-        return true;
-      })()
-    `)
+  const toolbarBtn = (label) => evaluate(clickByTidExpr(label))
+
+  /**
+   * 确保颜色菜单是打开的（色板在「批注」按钮的 ▼ 里，默认不显示）。
+   *
+   * ⚠️ 早期版本色板常驻在工具栏上，直接 `querySelectorAll('.sw')` 就行；
+   *    改版后不先展开的话拿到的是**空数组** —— 测试会静默失败（返回 null），
+   *    看起来像"颜色没生效"，其实是根本没点到色块。
+   *    点 ▼ 会顺带展开批注工具，所以不用先点「批注」。
+   */
+  const ensureColorMenu = `
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    if (!document.getElementById('epl-color-menu')) {
+      document.querySelector('[data-tid="color-caret"]')?.click();
+      await sleep(260);
+    }
+  `
 
   /** 点第 i 个色块（0 起）。返回它的背景色，便于确认点对了 */
   const clickSwatch = (i) =>
     evaluate(`
-      (() => {
-        const sw = document.querySelectorAll('.toolbar .sw');
+      (async () => {
+        ${ensureColorMenu}
+        const sw = document.querySelectorAll('#epl-color-menu .sw');
         if (!sw[${i}]) return null;
         const bg = getComputedStyle(sw[${i}]).backgroundColor;
         sw[${i}].click();
+        await sleep(80);
         return bg;
       })()
     `)
 
-  const swatchCount = () => evaluate(`document.querySelectorAll('.toolbar .sw').length`)
+  /**
+   * 数一下当前有几个可用色。
+   *
+   * ⚠️ 自己开的菜单要**自己关掉** —— 留着这个浮层会挡住后续的鼠标操作
+   *    （它是 fixed + z-index 200，下一次点击会先落到它上面）。
+   */
+  const swatchCount = () =>
+    evaluate(`
+      (async () => {
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        const had = !!document.getElementById('epl-color-menu');
+        if (!had) {
+          document.querySelector('[data-tid="color-caret"]')?.click();
+          await sleep(260);
+        }
+        const n = document.querySelectorAll('#epl-color-menu .sw').length;
+        if (!had) {
+          document.querySelector('[data-tid="color-caret"]')?.click();
+          await sleep(80);
+        }
+        return n;
+      })()
+    `)
 
   const snap = async () => JSON.parse(await evaluate(`JSON.stringify(globalThis.__eplViewer.snapshot())`))
   const annots = async () => JSON.parse(await evaluate(`JSON.stringify(globalThis.__eplViewer.annots())`))
@@ -876,7 +908,7 @@ try {
       await sleep(300)
       const c = await evaluate(`document.querySelectorAll('.pdf-page-canvas').length`)
       const loading = await evaluate(`!!document.querySelector('.loading')`)
-      const fname = await evaluate(`(document.querySelector('.toolbar .file')||{}).textContent||''`)
+      const fname = await evaluate(`(document.querySelector('[data-tid="file-name"]')||{}).textContent||''`)
       if (!loading && c > 0 && String(fname).includes('scan-like')) {
         swapped = true
         break

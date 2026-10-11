@@ -1,14 +1,25 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+/**
+ * 功能区（图标工具栏）。
+ *
+ * 布局（用户定的）：左半是**阅读相关**，右边缘从右到左是
+ * `保存 · 未保存标记 · 撤销 · 重做 · 批注`。
+ *
+ * ⚠️ 批注工具组默认**收起**：阅读是主要场景，8 个批注工具一直占着地方没意义。
+ *    点「批注」向左展开，展开时把左边的「视图组」「模式组」收起来腾地方 ——
+ *    实测功能区总宽需要约 1290px，而侧边栏占掉 260px 后只剩约 1150px，
+ *    不腾地方一行放不下（放不下就会压扁「未保存」标记、冒横向滚动条）。
+ */
+import { computed, ref, onMounted, onBeforeUnmount } from 'vue'
+import Icon from './Icon.vue'
 import type { ViewMode } from './types'
 import type { RendererStats } from './pageRenderer'
 import type { ToolKind, ToolColors, PointerMode, Rgb } from '@/annot/types'
-import { swatchesFor, POINTER_MODES, POINTER_MODE_LABEL, isColorTool } from '@/annot/types'
+import { swatchesFor, POINTER_MODES, isColorTool } from '@/annot/types'
 import type { SelectedInfo } from '@/annot/types'
 import { rgbCss } from '@/annot/draw'
 
 const props = defineProps<{
-  fileName: string
   numPages: number
   page: number
   scale: number
@@ -17,8 +28,6 @@ const props = defineProps<{
   stats: RendererStats | null
   tool: ToolKind
   annotCount: number
-  /** 侧边栏（目录 / 缩略图）是否展开 */
-  sideOpen: boolean
   /**
    * 有没有还没写回文件的批注。
    *
@@ -39,8 +48,6 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   open: []
-  /** 展开 / 收起侧边栏（目录 / 缩略图） */
-  'toggle-side': []
   'go-to': [pageNumber: number]
   /** 按行翻页（双页模式一次翻一屏） */
   'step-page': [dir: -1 | 1]
@@ -59,10 +66,16 @@ const emit = defineEmits<{
   'export-annot': []
 }>()
 
+// ---------------------------------------------------------------- 批注面板开合
+
+const annotOpen = ref(false)
+
 /** 点同一个工具就退回阅读模式 —— 省掉"忘了关工具导致误画" */
 function pickTool(t: ToolKind): void {
   emit('set-tool', props.tool === t ? 'none' : t)
 }
+
+// ---------------------------------------------------------------- 缩放
 
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 6, 8]
 
@@ -79,7 +92,7 @@ function onPageInput(e: Event): void {
   if (Number.isFinite(v)) emit('go-to', Math.min(Math.max(1, Math.round(v)), props.numPages || 1))
 }
 
-// ---------------------------------------------------------------- 色板
+// ---------------------------------------------------------------- 颜色
 
 const KIND_LABEL: Record<SelectedInfo['kind'], string> = {
   highlight: '高亮',
@@ -89,12 +102,6 @@ const KIND_LABEL: Record<SelectedInfo['kind'], string> = {
   ink: '手写',
   rect: '方框',
   freetext: '文本框',
-}
-
-const POINTER_MODE_TIP: Record<PointerMode, string> = {
-  select: '选择：点批注可选中并拖动、改大小（高亮类只能平移）',
-  scroll: '滚动：纯阅读，批注点不动，避免翻页时误拖',
-  pan: '拖动：按住左键抓手平移，放大后最好用（会自动退出批注工具）',
 }
 
 /** 当前"色板正在表示"的颜色：有选中项就显示选中项的，否则显示当前工具的默认色 */
@@ -119,402 +126,546 @@ const swatches = computed<readonly Rgb[]>(() => {
 
 function isOn(c: Rgb): boolean {
   const cur = currentColor.value
-  return !!cur && Math.abs(cur[0] - c[0]) < 1e-3 && Math.abs(cur[1] - c[1]) < 1e-3 && Math.abs(cur[2] - c[2]) < 1e-3
+  return (
+    !!cur &&
+    Math.abs(cur[0] - c[0]) < 1e-3 &&
+    Math.abs(cur[1] - c[1]) < 1e-3 &&
+    Math.abs(cur[2] - c[2]) < 1e-3
+  )
+}
+
+/** 批注按钮上那个小圆点：一眼看出"现在会画什么颜色" */
+const dotStyle = computed(() => ({
+  background: currentColor.value ? rgbCss(currentColor.value) : 'transparent',
+}))
+
+// ---------------------------------------------------------------- 颜色菜单
+
+const colorMenuOpen = ref(false)
+const annotBtnRef = ref<HTMLElement | null>(null)
+const menuPos = ref<{ top: number; left: number }>({ top: 0, left: 0 })
+
+/**
+ * 菜单位置用 fixed 算 —— 不能让它呆在功能区里做绝对定位：
+ * 功能区为了容纳图标开了横向溢出，绝对定位的子元素会被裁掉。
+ */
+function openColorMenu(): void {
+  if (!annotOpen.value) annotOpen.value = true
+  if (colorMenuOpen.value) {
+    colorMenuOpen.value = false
+    return
+  }
+  const el = annotBtnRef.value
+  if (el) {
+    const r = el.getBoundingClientRect()
+    menuPos.value = { top: r.bottom + 6, left: Math.max(8, r.right - 168) }
+  }
+  colorMenuOpen.value = true
+}
+
+function pickColor(c: Rgb): void {
+  emit('pick-color', c)
+  colorMenuOpen.value = false
+}
+
+function onDocClick(e: MouseEvent): void {
+  if (!colorMenuOpen.value) return
+  const t = e.target as Node
+  if (annotBtnRef.value?.contains(t)) return
+  const menu = document.getElementById('epl-color-menu')
+  if (menu?.contains(t)) return
+  colorMenuOpen.value = false
+}
+
+onMounted(() => document.addEventListener('click', onDocClick))
+onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
+
+// ---------------------------------------------------------------- 图标名
+
+const POINTER_ICON = { select: 'cursor', scroll: 'hand', pan: 'grab' } as const
+const POINTER_MODE_TIP: Record<PointerMode, string> = {
+  select: '选择：点批注可选中并拖动、改大小（高亮类只能平移）',
+  scroll: '滚动：纯阅读，批注点不动，避免翻页时误拖',
+  pan: '拖动：按住左键抓手平移，放大后最好用（会自动退出批注工具）',
 }
 </script>
 
 <template>
-  <div class="toolbar">
-    <button class="btn primary" @click="emit('open')">打开 PDF</button>
+  <div class="ribbon" :class="{ 'annot-open': annotOpen }">
+    <!-- ============================================ 左半：阅读 -->
+    <button class="rb" data-tid="open" title="打开 PDF" @click="emit('open')">
+      <Icon name="folder" />
+    </button>
+    <span class="sep" />
+
+    <template v-if="numPages">
+      <button class="rb" data-tid="prev" title="上一页 (PageUp)" @click="emit('step-page', -1)">
+        <Icon name="prev" />
+      </button>
+      <span class="pager">
+        <input
+          class="page-input"
+          data-tid="page-input"
+          type="number"
+          min="1"
+          :max="numPages"
+          :value="page"
+          title="输入页码后回车跳转"
+          @change="onPageInput"
+          @keydown.enter="onPageInput"
+        />
+        <span class="total">/ {{ numPages }}</span>
+      </span>
+      <button class="rb" data-tid="next" title="下一页 (PageDown)" @click="emit('step-page', 1)">
+        <Icon name="next" />
+      </button>
+      <span class="sep" />
+    </template>
+
+    <button class="rb" data-tid="zoom-out" title="缩小 (Ctrl+-)" @click="stepZoom(-1)">
+      <Icon name="minus" />
+    </button>
+    <button class="rb" data-tid="zoom-in" title="放大 (Ctrl++)" @click="stepZoom(1)">
+      <Icon name="plus" />
+    </button>
+    <button class="rb" data-tid="fit-width" title="适应宽度" @click="emit('fit-width')">
+      <Icon name="fitw" />
+    </button>
+    <button class="rb" data-tid="fit-page" title="适应整页" @click="emit('fit-page')">
+      <Icon name="fitp" />
+    </button>
     <button
-      class="btn"
-      :class="{ on: sideOpen }"
-      title="目录 / 缩略图（PDF 没书签时这边是空的，用缩略图翻页）"
-      @click="emit('toggle-side')"
+      class="rb pct"
+      data-tid="zoom"
+      title="当前缩放，点一下回到 100%"
+      @click="emit('set-scale', 1)"
     >
-      目录
+      {{ Math.round(scale * 100) }}%
     </button>
 
-    <span class="sep" />
-
-    <div class="pager" v-if="numPages">
-      <!-- ⚠️ 走 `step-page`（按行翻），不是 `go-to`(page±1)。
-           双页模式下 page+1 停在同一行，会变成"点两次才翻一屏" -->
-      <button class="btn icon" title="上一页 (PageUp)" @click="emit('step-page', -1)">‹</button>
-      <input
-        class="page-input"
-        type="number"
-        :value="page"
-        min="1"
-        :max="numPages"
-        @change="onPageInput"
-      />
-      <span class="dim">/ {{ numPages }}</span>
-      <button class="btn icon" title="下一页 (PageDown)" @click="emit('step-page', 1)">
-        ›
-      </button>
-    </div>
-
-    <span class="sep" />
-
-    <button class="btn icon" title="缩小 (Ctrl+-)" @click="stepZoom(-1)">−</button>
-    <span class="zoom-label">{{ Math.round(scale * 100) }}%</span>
-    <button class="btn icon" title="放大 (Ctrl++)" @click="stepZoom(1)">+</button>
-    <button class="btn" title="适应宽度" @click="emit('fit-width')">适宽</button>
-    <button class="btn" title="适应页面" @click="emit('fit-page')">整页</button>
-    <button class="btn" @click="emit('set-scale', 1)">100%</button>
-
-    <span class="sep" />
-
-    <div class="seg">
+    <!-- 展开批注时收起这两组，给批注工具腾地方 -->
+    <span class="sep grp-optional" />
+    <span class="grp grp-optional">
       <button
-        :class="['btn', 'seg-btn', mode === 'single' ? 'on' : '']"
+        class="rb"
+        :class="{ on: mode === 'single' }"
+        data-tid="mode-single"
+        title="单页"
         @click="emit('set-mode', 'single')"
       >
-        单页
+        <Icon name="single" />
       </button>
       <button
-        :class="['btn', 'seg-btn', mode === 'dual' ? 'on' : '']"
+        class="rb"
+        :class="{ on: mode === 'dual' }"
+        data-tid="mode-dual"
+        title="双页并排"
         @click="emit('set-mode', 'dual')"
       >
-        双页
+        <Icon name="dual" />
       </button>
-    </div>
-    <button
-      v-if="mode === 'dual'"
-      class="btn"
-      :title="spreadOffset === 1 ? '当前：封面单独占一页' : '当前：直接两两配对'"
-      @click="emit('set-spread-offset', spreadOffset === 1 ? 0 : 1)"
-    >
-      {{ spreadOffset === 1 ? '封面对齐' : '直接配对' }}
-    </button>
+      <button
+        class="rb"
+        data-tid="spread-offset"
+        :title="spreadOffset === 1 ? '当前：封面单独占一页' : '当前：直接两两配对'"
+        @click="emit('set-spread-offset', spreadOffset === 1 ? 0 : 1)"
+      >
+        <Icon name="file" />
+      </button>
+    </span>
 
-    <span class="sep" />
-
-    <!--
-      指针模式。这是"左键在页面上做什么"的总开关，与下面的批注工具是两套状态：
-        · 选择 —— 点批注可选中、拖动、改大小
-        · 滚动 —— 纯阅读，批注点不动（避免翻页时把批注拖走）
-        · 拖动 —— 抓手平移，放大之后最好用
-      互斥由 App.vue 保证：选工具自动回「选择」，切「拖动」自动清工具。
-    -->
-    <div class="seg">
+    <span class="sep grp-optional" />
+    <span class="grp grp-optional">
       <button
         v-for="m in POINTER_MODES"
         :key="m"
-        :class="['btn', 'seg-btn', pointerMode === m ? 'on' : '']"
+        class="rb"
+        :class="{ on: pointerMode === m }"
+        :data-tid="`pm-${m}`"
         :title="POINTER_MODE_TIP[m]"
         @click="emit('set-pointer-mode', m)"
       >
-        {{ POINTER_MODE_LABEL[m] }}
+        <Icon :name="POINTER_ICON[m]" />
       </button>
-    </div>
+    </span>
 
+    <!-- ============================================ 右边缘（从右到左：保存·未保存·撤销·重做·批注） -->
+    <span class="spacer" />
     <span class="sep" />
 
-    <!-- 批注工具。标记类（先选文字）和绘制类分两组，视觉上区分开 -->
-    <div class="seg">
+    <!-- 批注工具组：默认收起，点「批注」向左展开 -->
+    <span class="grp annot-group" :class="{ open: annotOpen }">
       <button
-        :class="['btn', 'seg-btn', tool === 'highlight' ? 'on' : '']"
+        class="rb"
+        :class="{ on: tool === 'highlight' }"
+        data-tid="tool-highlight"
         title="高亮：先在页面上选中文字，再松开鼠标"
         @click="pickTool('highlight')"
       >
-        高亮
+        <Icon name="highlight" />
       </button>
       <button
-        :class="['btn', 'seg-btn', tool === 'underline' ? 'on' : '']"
+        class="rb"
+        :class="{ on: tool === 'underline' }"
+        data-tid="tool-underline"
         title="下划线：先选中文字"
         @click="pickTool('underline')"
       >
-        下划线
+        <Icon name="underline" />
       </button>
       <button
-        :class="['btn', 'seg-btn', tool === 'strikeout' ? 'on' : '']"
+        class="rb"
+        :class="{ on: tool === 'strikeout' }"
+        data-tid="tool-strikeout"
         title="删除线：先选中文字"
         @click="pickTool('strikeout')"
       >
-        删除线
+        <Icon name="strike" />
       </button>
-    </div>
-    <div class="seg">
       <button
-        :class="['btn', 'seg-btn', tool === 'ink' ? 'on' : '']"
-        title="自由手写（扫描件上没有文字层，这个最实用）"
+        class="rb"
+        :class="{ on: tool === 'ink' }"
+        data-tid="tool-ink"
+        title="自由手写（扫描件没有文字层，这个最实用）"
         @click="pickTool('ink')"
       >
-        手写
+        <Icon name="pen" />
       </button>
-      <!--
-        区域高亮：**不依赖文本层**。
-        扫描件（《现代操作系统教程》就是整页图片）上文字类高亮一条都画不出来，
-        而这个工具只认"拖出来的这块区域"，正好补上那个缺口。
-      -->
       <button
-        :class="['btn', 'seg-btn', tool === 'area' ? 'on' : '']"
+        class="rb"
+        :class="{ on: tool === 'area' }"
+        data-tid="tool-area"
         title="区域高亮：拖一个框直接盖住一块，不需要文字层（扫描件用这个）"
         @click="pickTool('area')"
       >
-        区域高亮
+        <Icon name="area" />
       </button>
       <button
-        :class="['btn', 'seg-btn', tool === 'rect' ? 'on' : '']"
+        class="rb"
+        :class="{ on: tool === 'rect' }"
+        data-tid="tool-rect"
         title="矩形框：拖出一个框"
         @click="pickTool('rect')"
       >
-        方框
+        <Icon name="rect" />
       </button>
       <button
-        :class="['btn', 'seg-btn', tool === 'freetext' ? 'on' : '']"
+        class="rb"
+        :class="{ on: tool === 'freetext' }"
+        data-tid="tool-freetext"
         title="浮动文本框（画完可以拖动、拉大；双击可改文字）"
         @click="pickTool('freetext')"
       >
-        文字
+        <Icon name="text" />
       </button>
       <button
-        :class="['btn', 'seg-btn', tool === 'eraser' ? 'on' : '']"
+        class="rb"
+        :class="{ on: tool === 'eraser' }"
+        data-tid="tool-eraser"
         title="擦除：点中哪条就删哪条，可用 Ctrl+Z 撤销"
         @click="pickTool('eraser')"
       >
-        擦除
+        <Icon name="eraser" />
       </button>
-    </div>
-
-    <!-- 色板：工具需要颜色，或者有选中项要改色时才出现 -->
-    <div v-if="currentColor" class="swatches" :title="colorHint">
       <button
-        v-for="c in swatches"
-        :key="c.join()"
-        class="sw"
-        :class="{ on: isOn(c) }"
-        :style="{ background: rgbCss(c) }"
-        :title="colorHint"
-        @click="emit('pick-color', c)"
-      />
-    </div>
+        class="rb"
+        data-tid="delete-selected"
+        :disabled="!selected"
+        title="删除选中的批注 (Delete)"
+        @click="emit('delete-selected')"
+      >
+        <Icon name="trash" />
+      </button>
+    </span>
 
-    <button class="btn" :disabled="!canUndo" title="撤销 (Ctrl+Z)" @click="emit('undo')">撤销</button>
     <button
-      class="btn"
+      ref="annotBtnRef"
+      class="rb annot-btn"
+      :class="{ on: annotOpen }"
+      data-tid="annot-toggle"
+      :title="annotOpen ? '收起批注工具' : '展开批注工具'"
+      @click="annotOpen = !annotOpen"
+    >
+      <!--
+        箭头指向**动作方向**（用户定的）：收起时 `<` 表示"点我从左边展开"，
+        展开时 `>` 表示"点我收回去"。不要改成 ∨/∧ —— 那会丢掉方向暗示。
+      -->
+      <Icon :name="annotOpen ? 'chevron-right' : 'chevron-left'" class="caret" />
+      <span class="annot-label">批注</span>
+      <!-- 批注总数。0 条时不显示 —— 一个"0"占地方还容易误读成禁用 -->
+      <span v-if="annotCount" class="badge" data-tid="annot-count" title="已有批注数">
+        {{ annotCount }}
+      </span>
+      <span class="dot" :style="dotStyle" />
+      <span
+        class="color-caret"
+        data-tid="color-caret"
+        :title="colorHint"
+        @click.stop="openColorMenu"
+      >
+        <Icon name="chevron-down" />
+      </span>
+    </button>
+
+    <button
+      class="rb"
+      data-tid="redo"
       :disabled="!canRedo"
       title="重做：把刚撤销的收回来 (Ctrl+Shift+Z / Ctrl+Y)"
       @click="emit('redo')"
     >
-      重做
+      <Icon name="redo" />
     </button>
-    <button
-      v-if="selected"
-      class="btn danger"
-      title="删除选中的批注 (Delete)"
-      @click="emit('delete-selected')"
-    >
-      删除所选
+    <button class="rb" data-tid="undo" :disabled="!canUndo" title="撤销 (Ctrl+Z)" @click="emit('undo')">
+      <Icon name="undo" />
     </button>
-    <span v-if="annotCount" class="badge">{{ annotCount }}</span>
+
     <span
       v-if="unsaved"
-      class="badge unsaved"
+      class="unsaved"
+      data-tid="unsaved"
       title="这些批注还没写回文件。关掉页面 / 刷新 / 打开别的 PDF 之前记得先保存 —— 否则会丢"
     >
       ● 未保存
     </span>
+
     <button
-      class="btn save"
-      :class="{ attention: unsaved }"
+      class="rb"
+      data-tid="save"
       title="把批注写回 PDF，另存为一份新文件（不会改动原文件）"
       @click="emit('export-annot')"
     >
-      保存批注
+      <Icon name="save" />
     </button>
 
-    <span class="grow" />
-
-    <span class="status dim" v-if="stats">
+    <span v-if="stats" class="stats">
       <template v-if="stats.running > 0 || stats.queued > 0">
         渲染中 {{ stats.running }} · 排队 {{ stats.queued }}
       </template>
-      <template v-else-if="stats.lastRenderMs > 0">
-        单页 {{ stats.lastRenderMs.toFixed(0) }} ms
-      </template>
+      <template v-else-if="stats.lastRenderMs > 0">单页 {{ stats.lastRenderMs.toFixed(0) }} ms</template>
       <template v-else>就绪</template>
     </span>
-    <span class="file dim" :title="fileName">{{ fileName }}</span>
+  </div>
+
+  <!-- 颜色菜单：fixed 定位，避免被功能区的横向溢出裁掉 -->
+  <div
+    v-if="colorMenuOpen"
+    id="epl-color-menu"
+    class="color-menu"
+    :style="{ top: `${menuPos.top}px`, left: `${menuPos.left}px` }"
+  >
+    <div class="menu-label">{{ colorHint }}</div>
+    <button
+      v-for="c in swatches"
+      :key="c.join()"
+      class="sw"
+      :class="{ on: isOn(c) }"
+      :style="{ background: rgbCss(c) }"
+      :title="colorHint"
+      @click="pickColor(c)"
+    />
   </div>
 </template>
 
 <style scoped>
-.toolbar {
+.ribbon {
+  flex: 0 0 44px;
+  height: 44px;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 8px 12px;
+  gap: 2px;
+  padding: 0 8px;
   background: #1b1e24;
-  border-bottom: 1px solid #2b313a;
-  flex-wrap: wrap;
-  font-size: 13px;
-  flex: 0 0 auto;
+  border-bottom: 1px solid #2e333d;
+  /* 放不下时兜底可滚；正常窗口下不该出现滚动条 */
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
-.btn {
-  background: #262b33;
-  color: #dfe4ec;
-  border: 1px solid #333a45;
+/* ⚠️ 所有子项不许被压扁 —— 否则「● 未保存」会被挤成竖排文字 */
+.ribbon > * {
+  flex-shrink: 0;
+}
+
+.grp {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.sep {
+  width: 1px;
+  height: 22px;
+  background: #2e333d;
+  margin: 0 6px;
+}
+.spacer {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 展开批注时收起这两个可选组（腾出约 200px，理由见文件头） */
+.ribbon.annot-open .grp-optional {
+  display: none;
+}
+
+.rb {
+  height: 40px;
+  min-width: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 6px;
+  background: transparent;
+  color: #9aa3b2;
+  border: 1px solid transparent;
   border-radius: 6px;
-  padding: 5px 10px;
   font: inherit;
+  font-size: 12px;
   cursor: pointer;
-  white-space: nowrap;
 }
-.btn:hover:not(:disabled) {
+.rb:hover {
   background: #2f353f;
+  color: #e6e8ec;
 }
-.btn:active:not(:disabled) {
-  background: #262b33;
+.rb.on {
+  background: #2b3d57;
+  color: #9ecbff;
 }
-.btn:disabled {
-  opacity: 0.42;
+.rb:disabled {
+  opacity: 0.35;
   cursor: default;
 }
-.btn.primary {
-  background: #2b6cb0;
-  border-color: #2b6cb0;
-}
-/* 侧边栏开着时，"目录"按钮要亮着 —— 否则用户不知道去哪儿关 */
-.btn.on {
-  background: #2b3d57;
-  border-color: #4aa3ff;
-  color: #cfe4ff;
-}
-.btn.primary:hover {
-  background: #3478c0;
-}
-.btn.icon {
-  padding: 5px 9px;
-  min-width: 30px;
-}
-.btn.save {
-  background: #2f5d43;
-  border-color: #2f5d43;
-}
-.btn.save:hover {
-  background: #366b4d;
-}
-/* 有未保存的批注时让保存按钮更显眼一点 —— 它是此时唯一能留住批注的出口 */
-.btn.save.attention {
-  background: #3d7a55;
-  border-color: #4d9a6c;
-  box-shadow: 0 0 0 1px rgba(120, 220, 160, 0.35);
-}
-.btn.danger {
-  background: #6b2b30;
-  border-color: #6b2b30;
-}
-.btn.danger:hover {
-  background: #7d343a;
+.rb:disabled:hover {
+  background: transparent;
 }
 
-.seg {
-  display: flex;
-}
-.seg-btn {
-  border-radius: 0;
-}
-.seg-btn:first-child {
-  border-radius: 6px 0 0 6px;
-}
-.seg-btn:last-child {
-  border-radius: 0 6px 6px 0;
-  border-left: none;
-}
-.seg-btn.on {
-  background: #2b6cb0;
-  border-color: #2b6cb0;
-}
-
-/* ---- 色板 ---- */
-
-.swatches {
-  display: flex;
-  gap: 3px;
-  padding: 3px 5px;
-  background: #14161a;
-  border: 1px solid #333a45;
-  border-radius: 7px;
-}
-.sw {
-  width: 17px;
-  height: 17px;
-  padding: 0;
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-radius: 4px;
-  cursor: pointer;
-  box-sizing: border-box;
-}
-.sw:hover {
-  border-color: #fff;
-}
-.sw.on {
-  /* 选中态用外描边，不占用色块本身 —— 白色/浅色块上也看得见 */
-  outline: 2px solid #4aa3ff;
-  outline-offset: 1px;
-  border-color: #fff;
+.pct {
+  min-width: 52px;
+  font-variant-numeric: tabular-nums;
+  color: #7d8695;
 }
 
 .pager {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
+  white-space: nowrap;
 }
 .page-input {
-  width: 56px;
+  width: 46px;
+  height: 26px;
+  background: #14161b;
+  color: #e6e8ec;
+  border: 1px solid #2e333d;
+  border-radius: 4px;
   text-align: center;
-  background: #14161a;
-  color: #dfe4ec;
-  border: 1px solid #333a45;
-  border-radius: 6px;
-  padding: 4px 6px;
   font: inherit;
+  font-size: 12px;
+}
+.page-input:focus {
+  outline: none;
+  border-color: #60a5fa;
+}
+.total {
+  color: #7d8695;
+  font-size: 11px;
 }
 
-.zoom-label {
-  min-width: 46px;
-  text-align: center;
-  color: #8b93a1;
-  font-variant-numeric: tabular-nums;
+.annot-group {
+  display: none;
+}
+.annot-group.open {
+  display: flex;
 }
 
-.sep {
-  width: 1px;
-  height: 18px;
-  background: #2b313a;
-  margin: 0 2px;
+.annot-btn {
+  min-width: 0;
+  padding: 0 8px;
+  font-size: 12.5px;
 }
-.grow {
-  flex: 1;
+.annot-btn .caret {
+  width: 13px;
+  height: 13px;
 }
-.badge {
+.annot-btn .badge {
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
   background: #2b6cb0;
   color: #fff;
-  border-radius: 10px;
-  padding: 1px 8px;
+  font-size: 10.5px;
+  line-height: 15px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.annot-btn .dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+}
+.annot-btn .color-caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 20px;
+  border-radius: 3px;
+}
+.annot-btn .color-caret:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+.annot-btn .color-caret :deep(.ic) {
+  width: 11px;
+  height: 11px;
+}
+
+.unsaved {
+  display: inline-flex;
+  align-items: center;
+  color: #fbbf24;
   font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-/* 未保存标记：琥珀色，跟"计数"的蓝区分开 —— 这两件事性质不同，
-   一个是"有多少"，一个是"还没落盘" */
-.badge.unsaved {
-  background: #8a5a12;
-  color: #ffd88a;
-}
-.dim {
-  color: #8b93a1;
-}
-.status {
-  font-variant-numeric: tabular-nums;
-}
-.file {
-  max-width: 260px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  padding: 0 6px;
   white-space: nowrap;
+}
+
+.stats {
+  color: #6b7480;
+  font-size: 11px;
+  padding-left: 8px;
+  white-space: nowrap;
+}
+
+/* 颜色菜单 */
+.color-menu {
+  position: fixed;
+  z-index: 200;
+  background: #0d0f13;
+  border: 1px solid #2e333d;
+  border-radius: 8px;
+  padding: 8px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.6);
+  display: grid;
+  grid-template-columns: repeat(5, 22px);
+  gap: 6px;
+}
+.menu-label {
+  grid-column: 1 / -1;
+  font-size: 10.5px;
+  color: #8b93a1;
+  padding: 0 2px 3px;
+  white-space: nowrap;
+}
+.sw {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+}
+.sw.on {
+  border-color: #fff;
 }
 </style>

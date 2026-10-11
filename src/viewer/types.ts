@@ -23,6 +23,12 @@ export interface DocumentLayout {
 
 export type ViewMode = 'single' | 'dual'
 
+/**
+ * 左侧边栏能显示的面板。
+ * `null` = 整个侧边栏收起。
+ */
+export type SidePanelKind = 'files' | 'search' | 'outline' | 'thumbs'
+
 export interface LayoutOptions {
   mode: ViewMode
   /** 页间距（CSS px，scale=1 基准） */

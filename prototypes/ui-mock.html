@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>edge-pdf-lite · 界面原型（可交互）</title>
+<style>
+  :root {
+    --bg: #16181d;
+    --panel: #1e2128;
+    --line: #2e333d;
+    --fg: #e6e8ec;
+    --dim: #9aa3b2;
+    --accent: #60a5fa;
+    --warn: #fbbf24;
+    --ok: #4ade80;
+    --titlebar: #14161b;
+    --ribbon: #1b1e24;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    overflow: hidden;
+  }
+
+  /* ---------------------------------------------------------- 图标 */
+  .ic { width: 18px; height: 18px; stroke: currentColor; fill: none;
+        stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .ic.fill { fill: currentColor; }
+
+  /* ---------------------------------------------------------- 标题栏 */
+  .titlebar {
+    height: 38px;
+    display: flex;
+    align-items: center;
+    background: var(--titlebar);
+    border-bottom: 1px solid var(--line);
+    -webkit-app-region: drag;   /* Tauri 下这一整条可拖动窗口 */
+    user-select: none;
+  }
+  .tb-group { display: flex; align-items: center; -webkit-app-region: no-drag; }
+  .tb-group.left { padding-left: 4px; gap: 2px; }
+  .tb-group.right { margin-left: auto; }
+  .tb-title {
+    flex: 1;
+    text-align: center;
+    font-size: 12px;
+    color: var(--dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    padding: 0 12px;
+  }
+
+  button.tb, button.tb-win {
+    height: 30px; min-width: 34px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; color: var(--dim);
+    border: 0; border-radius: 5px; cursor: pointer;
+    padding: 0 7px;
+  }
+  button.tb:hover { background: #262b33; color: var(--fg); }
+  button.tb.on { background: #2b3d57; color: #9ecbff; }
+  button.tb-win { min-width: 44px; border-radius: 0; height: 38px; }
+  button.tb-win:hover { background: #262b33; }
+  button.tb-win.close:hover { background: #c0392b; color: #fff; }
+
+  /* ---------------------------------------------------------- 主体 */
+  .body { display: flex; height: calc(100% - 38px); }
+
+  /* ---------------------------------------------------------- 侧边栏 */
+  .side {
+    width: 260px; flex: 0 0 260px;
+    background: var(--panel);
+    border-right: 1px solid var(--line);
+    display: flex; flex-direction: column;
+    transition: margin-left .18s ease;
+  }
+  .side.collapsed { margin-left: -260px; }
+  .side-head {
+    height: 34px; display: flex; align-items: center;
+    padding: 0 10px; font-size: 11px; color: var(--dim);
+    border-bottom: 1px solid var(--line);
+    letter-spacing: .04em;
+  }
+  .side-body { flex: 1; overflow: auto; padding: 6px 4px; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* 文件树 */
+  .tree-item {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 8px; border-radius: 5px; cursor: pointer;
+    color: var(--fg); font-size: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .tree-item:hover { background: #262b33; }
+  .tree-item.current { background: #2b3d57; color: #9ecbff; }
+  .tree-twisty {
+    width: 14px; flex: 0 0 14px; text-align: center;
+    color: var(--dim); font-size: 9px; transition: transform .12s;
+  }
+  .tree-twisty.open { transform: rotate(90deg); }
+  .tree-children { display: none; padding-left: 14px; }
+  .tree-children.open { display: block; }
+  .tree-item .leaf-icon { flex: 0 0 14px; color: var(--dim); }
+
+  .side-empty { padding: 14px 12px; color: var(--dim); font-size: 12px; line-height: 1.8; }
+
+  /* 搜索 */
+  .search-box { padding: 8px; }
+  .search-box input {
+    width: 100%; height: 28px; background: #14161b;
+    border: 1px solid var(--line); border-radius: 5px;
+    color: var(--fg); padding: 0 8px; font-size: 12px;
+  }
+  .search-box input:focus { outline: none; border-color: var(--accent); }
+
+  /* 目录 */
+  .ol-item { padding: 4px 10px; cursor: pointer; border-radius: 5px;
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12.5px; }
+  .ol-item:hover { background: #262b33; }
+  .ol-item.d1 { padding-left: 22px; color: var(--dim); }
+  .ol-item.group { color: var(--dim); cursor: default; }
+
+  /* 缩略图 */
+  .thumbs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 6px; }
+  .thumb { background: #2a2f38; border: 2px solid transparent; border-radius: 3px;
+           aspect-ratio: .72; display: flex; align-items: flex-end; justify-content: center;
+           padding-bottom: 4px; font-size: 10px; color: var(--dim); cursor: pointer; }
+  .thumb.current { border-color: var(--accent); }
+
+  /* ---------------------------------------------------------- 主区 */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  /* 功能区（图标工具栏） */
+  .ribbon {
+    height: 44px; flex: 0 0 44px;
+    background: var(--ribbon);
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 2px;
+    padding: 0 8px; overflow-x: auto;
+  }
+  .rbn-sep { width: 1px; height: 22px; background: var(--line); margin: 0 6px; flex: 0 0 1px; }
+  button.rb {
+    /* 触屏：最小触控目标 40×40 —— Surface 上手指点的就是这个尺寸 */
+    width: 40px; height: 40px; flex: 0 0 40px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; color: var(--dim);
+    border: 0; border-radius: 6px; cursor: pointer;
+  }
+  button.rb:hover { background: #2f353f; color: var(--fg); }
+  button.rb.on { background: #2b3d57; color: #9ecbff; }
+  button.rb.wide { width: auto; flex: 0 0 auto; padding: 0 10px; gap: 5px; font-size: 12px; }
+  button.rb:disabled { opacity: .35; cursor: default; }
+  button.rb:disabled:hover { background: transparent; }
+
+  /* 页码 */
+  .pager { display: flex; align-items: center; gap: 3px; }
+  .pager input {
+    width: 44px; height: 26px; background: #14161b; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 4px;
+    text-align: center; font-size: 12px;
+  }
+  .pager .total { color: var(--dim); font-size: 11px; }
+
+  /* 色板 */
+  .swatches { display: flex; align-items: center; gap: 3px; padding: 0 4px; }
+  .sw { width: 18px; height: 18px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; }
+  .sw.on { border-color: var(--fg); }
+
+  .unsaved { display: inline-flex; align-items: center; gap: 4px;
+             color: var(--warn); font-size: 11px; padding: 0 6px; }
+
+  /* ------------------------------------------------- 右侧边缘分组 */
+  /* 所有子项都不许被压扁 —— 否则「● 未保存」会被挤成竖排文字 */
+  .ribbon > * { flex-shrink: 0; }
+  .rbn-group { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+  /* 展开批注工具时，把左侧两组次要控件收起来腾地方（见 JS 里的取舍说明） */
+  .ribbon.annot-open .rbn-group.optional { display: none; }
+  .pager, .unsaved, .swatches { flex: 0 0 auto; white-space: nowrap; }
+
+  .rbn-spacer { flex: 1 1 auto; min-width: 0; }
+  .annot-group { display: none; align-items: center; gap: 2px; }
+  .annot-group.open { display: flex; }
+
+  button.rb.rb-annot {
+    width: auto; flex: 0 0 auto; padding: 0 10px;
+    gap: 6px; font-size: 12.5px;
+  }
+  button.rb.rb-annot.on { background: #2b3d57; color: #9ecbff; }
+  .rb-annot .caret { font-size: 11px; color: var(--dim); line-height: 1; }
+  .rb-annot.on .caret { color: #9ecbff; }
+  .rb-annot .sw-dot {
+    width: 11px; height: 11px; border-radius: 50%;
+    border: 1px solid rgba(255,255,255,.25);
+  }
+  .rb-annot .color-caret { font-size: 8px; color: var(--dim); line-height: 1; }
+  .rb-annot .color-caret:hover { color: var(--fg); }
+
+  /* 颜色菜单：fixed 定位，避免被功能区的横向滚动裁掉 */
+  .color-menu {
+    position: fixed; display: none;
+    background: #0d0f13; border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px; z-index: 200;
+    box-shadow: 0 8px 26px rgba(0,0,0,.6);
+    grid-template-columns: repeat(5, 22px); gap: 6px;
+  }
+  .color-menu.open { display: grid; }
+  .color-menu .sw { width: 22px; height: 22px; }
+  .color-menu .sw.on { border-color: #fff; }
+  .color-menu .lbl {
+    grid-column: 1 / -1; font-size: 10.5px; color: var(--dim);
+    padding: 0 2px 3px;
+  }
+
+  /* ---------------------------------------------------------- tooltip */
+  [data-tip] { position: relative; }
+  [data-tip]:hover::after {
+    content: attr(data-tip);
+    position: absolute; top: calc(100% + 6px); left: 50%;
+    transform: translateX(-50%);
+    background: #0d0f13; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 5px;
+    padding: 4px 8px; font-size: 11.5px; white-space: nowrap;
+    z-index: 50; pointer-events: none;
+    box-shadow: 0 4px 14px rgba(0,0,0,.5);
+  }
+  .titlebar [data-tip]:hover::after { top: calc(100% + 4px); }
+
+  /* ---------------------------------------------------------- 视口 */
+  .viewport { flex: 1; overflow: auto; background: #14161a; padding: 24px;
+              display: flex; flex-direction: column; align-items: center; gap: 18px; }
+  .page { background: #f4f4f0; color: #222; width: 420px; height: 560px;
+          border-radius: 2px; padding: 34px 40px; box-shadow: 0 2px 12px rgba(0,0,0,.4); }
+  .page h3 { margin: 0 0 10px; font-size: 15px; }
+  .page p { margin: 0 0 8px; font-size: 11px; line-height: 1.9; color: #444; text-align: justify; }
+  .page .hl { background: rgba(255,235,59,.55); }
+
+  /* ---------------------------------------------------------- 原型说明条 */
+  .note {
+    position: fixed; right: 12px; bottom: 12px;
+    background: #0d0f13; border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 12px; font-size: 11.5px;
+    color: var(--dim); max-width: 320px; z-index: 100;
+    box-shadow: 0 6px 20px rgba(0,0,0,.55);
+  }
+  .note b { color: var(--fg); }
+  .note button {
+    margin-top: 6px; background: #262b33; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 5px;
+    padding: 3px 9px; font-size: 11px; cursor: pointer;
+  }
+
+  /* 浏览器降级模式：窗口控制按钮消失 */
+  body.browser-mode .tb-win { display: none; }
+  body.browser-mode .browser-hint { display: block; }
+  .browser-hint { display: none; padding: 8px 10px; margin: 6px;
+                  background: #2a2419; border: 1px solid #4a3f24; border-radius: 6px;
+                  color: var(--warn); font-size: 11px; line-height: 1.7; }
+</style>
+</head>
+<body>
+
+<!-- 图标定义 -->
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h7l5 5v13H6z"/><path d="M13 3v5h5"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M16 16l5 5"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7"/><rect x="13" y="4" width="7" height="7"/><rect x="4" y="13" width="7" height="7"/><rect x="13" y="13" width="7" height="7"/></symbol>
+  <symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+  <symbol id="i-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-open" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v10H3z"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></symbol>
+  <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-fitw" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="12" rx="1"/><path d="M3 12h18"/></symbol>
+  <symbol id="i-fitp" viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="1"/><path d="M12 3v18"/></symbol>
+  <symbol id="i-single" viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="1"/></symbol>
+  <symbol id="i-dual" viewBox="0 0 24 24"><rect x="2" y="3" width="9" height="18" rx="1"/><rect x="13" y="3" width="9" height="18" rx="1"/></symbol>
+  <symbol id="i-cursor" viewBox="0 0 24 24"><path d="M5 3l13 7-6 1.5 2.5 6-2.2 1-2.6-6L5 16z"/></symbol>
+  <symbol id="i-hand" viewBox="0 0 24 24"><path d="M8 13V6a1.5 1.5 0 013 0v6V4.5a1.5 1.5 0 013 0V12V6a1.5 1.5 0 013 0v7a6 6 0 01-6 6h-1a5 5 0 01-5-5v-4z"/></symbol>
+  <symbol id="i-grab" viewBox="0 0 24 24"><path d="M9 11V5.5a1.5 1.5 0 013 0V11m0-1V4.5a1.5 1.5 0 013 0V11m0-1V6.5a1.5 1.5 0 013 0V13a6 6 0 01-6 6h-1a5 5 0 01-5-5v-3z"/></symbol>
+  <symbol id="i-highlight" viewBox="0 0 24 24"><path d="M4 20h16"/><path d="M8 16l3-8 3 8z"/></symbol>
+  <symbol id="i-underline" viewBox="0 0 24 24"><path d="M7 4v7a5 5 0 0010 0V4"/><path d="M5 20h14"/></symbol>
+  <symbol id="i-strike" viewBox="0 0 24 24"><path d="M8 7a4 4 0 018 0 3 3 0 01-3 4"/><path d="M16 17a4 4 0 01-8 0"/><path d="M4 12h16"/></symbol>
+  <symbol id="i-pen" viewBox="0 0 24 24"><path d="M4 20l4-1L19 8l-3-3L5 16z"/><path d="M14 6l3 3"/></symbol>
+  <symbol id="i-area" viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" fill="currentColor" opacity=".3" stroke="none"/><rect x="4" y="6" width="16" height="12"/></symbol>
+  <symbol id="i-rect" viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12"/></symbol>
+  <symbol id="i-text" viewBox="0 0 24 24"><path d="M5 6h14M12 6v13"/></symbol>
+  <symbol id="i-eraser" viewBox="0 0 24 24"><path d="M8 20h11"/><path d="M15.5 4.5l5 5-9.5 9.5H6l-2.5-2.5z"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 10H5V6"/><path d="M5 10a8 8 0 1114 4"/></symbol>
+  <symbol id="i-redo" viewBox="0 0 24 24"><path d="M15 10h4V6"/><path d="M19 10a8 8 0 10-14 4"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="8" y="4" width="8" height="6"/><circle cx="12" cy="15" r="2"/></symbol>
+</svg>
+
+<div class="app">
+
+  <!-- ======================================================== 标题栏 -->
+  <div class="titlebar">
+    <div class="tb-group left">
+      <button class="tb on" data-tip="打开 / 收起左侧边栏" id="btnToggleSide">
+        <svg class="ic"><use href="#i-sidebar"/></svg>
+      </button>
+      <button class="tb on" data-tip="文件列表" data-panel="files">
+        <svg class="ic"><use href="#i-file"/></svg>
+      </button>
+      <button class="tb" data-tip="搜索文件（只匹配文件名）" data-panel="search">
+        <svg class="ic"><use href="#i-search"/></svg>
+      </button>
+      <button class="tb" data-tip="目录（PDF 书签）" data-panel="outline">
+        <svg class="ic"><use href="#i-list"/></svg>
+      </button>
+      <button class="tb" data-tip="缩略图（每页小图）" data-panel="thumbs">
+        <svg class="ic"><use href="#i-grid"/></svg>
+      </button>
+    </div>
+
+    <div class="tb-title">现代操作系统教程.pdf — edge-pdf-lite</div>
+
+    <div class="tb-group right">
+      <button class="tb tb-win" data-tip="最小化"><svg class="ic"><use href="#i-min"/></svg></button>
+      <button class="tb tb-win" data-tip="最大化"><svg class="ic"><use href="#i-max"/></svg></button>
+      <button class="tb tb-win close" data-tip="关闭"><svg class="ic"><use href="#i-close"/></svg></button>
+    </div>
+  </div>
+
+  <div class="body">
+
+    <!-- ==================================================== 侧边栏 -->
+    <aside class="side" id="side">
+      <div class="side-head" id="sideHead">文件列表</div>
+
+      <!-- 文件面板 -->
+      <div class="side-body">
+        <div class="panel active" id="p-files">
+          <div class="browser-hint">
+            浏览器版：这里的条目只在本次会话有效，刷新后需要重新添加
+            （浏览器拿不到文件的真实路径）。
+          </div>
+
+          <div class="tree-item" data-dir>
+            <span class="tree-twisty open">▶</span>
+            <svg class="ic leaf-icon" style="width:14px;height:14px"><use href="#i-open"/></svg>
+            <span>教材</span>
+          </div>
+          <div class="tree-children open">
+            <div class="tree-item current">
+              <span class="tree-twisty"></span>
+              <svg class="ic leaf-icon" style="width:14px;height:14px"><use href="#i-file"/></svg>
+              <span>现代操作系统教程.pdf</span>
+            </div>
+            <div class="tree-item">
+              <span class="tree-twisty"></span>
+              <svg class="ic leaf-icon" style="width:14px;height:14px"><use href="#i-file"/></svg>
+              <span>Computer Science.pdf</span>
+            </div>
+          </div>
+
+          <div class="tree-item" data-dir>
+            <span class="tree-twisty">▶</span>
+            <svg class="ic leaf-icon" style="width:14px;height:14px"><use href="#i-open"/></svg>
+            <span>论文</span>
+          </div>
+          <div class="tree-children">
+            <div class="tree-item">
+              <span class="tree-twisty"></span>
+              <svg class="ic leaf-icon" style="width:14px;height:14px"><use href="#i-file"/></svg>
+              <span>attention-is-all-you-need.pdf</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 搜索面板 -->
+        <div class="panel" id="p-search">
+          <div class="search-box">
+            <input placeholder="搜索文件名…" id="searchInput">
+          </div>
+          <div class="side-empty" id="searchResult">
+            输入关键词，在文件列表里匹配文件名。
+          </div>
+        </div>
+
+        <!-- 目录面板 -->
+        <div class="panel" id="p-outline">
+          <div class="side-empty">
+            ⚠️ 这份 PDF 没有书签（扫描件通常都没有）。<br>
+            翻页可以用「缩略图」。
+          </div>
+          <div class="ol-item group">（下面是有书签时的样子）</div>
+          <div class="ol-item">第 1 章 操作系统概述</div>
+          <div class="ol-item d1">1.1 什么是操作系统</div>
+          <div class="ol-item d1">1.2 操作系统的发展</div>
+          <div class="ol-item">第 2 章 进程管理</div>
+        </div>
+
+        <!-- 缩略图面板 -->
+        <div class="panel" id="p-thumbs">
+          <div class="thumbs" id="thumbGrid"></div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ==================================================== 主区 -->
+    <div class="main">
+
+      <!-- 功能区：图标 + hover 说明 -->
+      <div class="ribbon">
+        <!-- ============ 左侧：常驻（阅读相关） ============ -->
+        <button class="rb wide" data-tip="打开 PDF">
+          <svg class="ic"><use href="#i-open"/></svg>
+        </button>
+        <span class="rbn-sep"></span>
+
+        <button class="rb" data-tip="上一页 (PageUp)"><svg class="ic"><use href="#i-prev"/></svg></button>
+        <span class="pager">
+          <input value="7"> <span class="total">/ 624</span>
+        </span>
+        <button class="rb" data-tip="下一页 (PageDown)"><svg class="ic"><use href="#i-next"/></svg></button>
+        <span class="rbn-sep"></span>
+
+        <button class="rb" data-tip="缩小 (Ctrl+-)"><svg class="ic"><use href="#i-minus"/></svg></button>
+        <button class="rb" data-tip="放大 (Ctrl++)"><svg class="ic"><use href="#i-plus"/></svg></button>
+        <button class="rb" data-tip="适应宽度"><svg class="ic"><use href="#i-fitw"/></svg></button>
+        <button class="rb" data-tip="适应整页"><svg class="ic"><use href="#i-fitp"/></svg></button>
+        <span class="rbn-sep"></span>
+
+        <!-- 这两组在展开批注时收起（腾出约 200px，否则一行放不下） -->
+        <span class="rbn-group optional">
+          <button class="rb on" data-tip="单页"><svg class="ic"><use href="#i-single"/></svg></button>
+          <button class="rb" data-tip="双页并排"><svg class="ic"><use href="#i-dual"/></svg></button>
+          <span class="rbn-sep"></span>
+        </span>
+
+        <span class="rbn-group optional">
+          <button class="rb on" data-tip="选择：点批注可选中并拖动"><svg class="ic"><use href="#i-cursor"/></svg></button>
+          <button class="rb" data-tip="滚动：纯阅读，批注点不动"><svg class="ic"><use href="#i-hand"/></svg></button>
+          <button class="rb" data-tip="拖动：按住左键平移，放大后好用"><svg class="ic"><use href="#i-grab"/></svg></button>
+        </span>
+
+        <!-- ============ 右侧：从右到左 = 保存 · 撤销 · 重做 · 批注 ============ -->
+        <span class="rbn-spacer"></span>
+        <span class="rbn-sep"></span>
+
+        <!-- 批注工具组：默认收起，点「批注」向左展开 -->
+        <span class="annot-group" id="annotGroup">
+          <button class="rb" data-tip="高亮：先选中文字"><svg class="ic"><use href="#i-highlight"/></svg></button>
+          <button class="rb" data-tip="下划线：先选中文字"><svg class="ic"><use href="#i-underline"/></svg></button>
+          <button class="rb" data-tip="删除线：先选中文字"><svg class="ic"><use href="#i-strike"/></svg></button>
+          <button class="rb on" data-tip="手写：扫描件没有文字层，这个最实用"><svg class="ic"><use href="#i-pen"/></svg></button>
+          <button class="rb" data-tip="区域高亮：拖框盖一块，不需要文字层"><svg class="ic"><use href="#i-area"/></svg></button>
+          <button class="rb" data-tip="方框：拖出一个矩形框"><svg class="ic"><use href="#i-rect"/></svg></button>
+          <button class="rb" data-tip="文本框：画完可拖动，双击改文字"><svg class="ic"><use href="#i-text"/></svg></button>
+          <button class="rb" data-tip="擦除：点中哪条删哪条"><svg class="ic"><use href="#i-eraser"/></svg></button>
+          <button class="rb" data-tip="删除选中的批注 (Delete)"><svg class="ic"><use href="#i-trash"/></svg></button>
+        </span>
+
+        <button class="rb rb-annot" id="btnAnnot" data-tip="展开批注工具">
+          <span class="caret" id="annotCaret">&lt;</span>
+          <span>批注</span>
+          <span class="sw-dot" id="annotSwatch" style="background:rgb(230,48,48)"></span>
+          <span class="color-caret" id="btnColor" data-tip="选择批注颜色（默认红）">▼</span>
+        </button>
+
+        <button class="rb" data-tip="重做 (Ctrl+Shift+Z)"><svg class="ic"><use href="#i-redo"/></svg></button>
+        <button class="rb" data-tip="撤销 (Ctrl+Z)"><svg class="ic"><use href="#i-undo"/></svg></button>
+        <span class="unsaved" data-tip="有 3 条批注还没写回文件">● 未保存</span>
+        <button class="rb" data-tip="把批注写回 PDF，另存为新文件"><svg class="ic"><use href="#i-save"/></svg></button>
+      </div>
+
+      <!-- 颜色菜单（fixed 定位，避免被功能区裁掉） -->
+      <div class="color-menu" id="colorMenu">
+        <span class="lbl">批注颜色 · 默认红（高亮不含黑/白）</span>
+      </div>
+
+      <!-- 视口 -->
+      <div class="viewport">
+        <div class="page">
+          <h3>1.2 操作系统的发展</h3>
+          <p>操作系统的发展经历了从无到有、从简单到复杂的漫长过程。早期的计算机并没有操作系统，程序员需要通过手工操作来控制计算机的运行。</p>
+          <p><span class="hl">批处理系统的出现标志着操作系统进入了新的阶段</span>，它能够自动地、顺序地执行一批作业，减少了人工干预。</p>
+          <p>随着分时系统的出现，多个用户可以同时使用一台计算机，每个用户都感觉自己独占着整台机器。</p>
+          <p style="margin-top:16px;color:#888">（这里还有一段手写批注的红线）</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="note">
+  <b>这是界面原型，不是真实实现。</b><br>
+  可交互：点顶栏图标切换侧边栏面板 · 点文件夹展开 · 鼠标悬停看功能说明 ·
+  点右侧「&lt; 批注」向左展开工具栏、点「▼」选颜色。
+  <br>
+  <button id="btnMode">切换：exe 模式 / 浏览器模式</button>
+</div>
+
+<script>
+  // ---- 顶栏面板切换
+  const panelNames = { files: '文件列表', search: '搜索文件', outline: '目录', thumbs: '缩略图' }
+  document.querySelectorAll('[data-panel]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('[data-panel]').forEach((b) => b.classList.remove('on'))
+      btn.classList.add('on')
+      const key = btn.dataset.panel
+      document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'))
+      document.getElementById('p-' + key).classList.add('active')
+      document.getElementById('sideHead').textContent = panelNames[key]
+      document.getElementById('side').classList.remove('collapsed')
+      btnToggleSide.classList.add('on')
+      if (key === 'search') setTimeout(() => document.getElementById('searchInput').focus(), 60)
+    })
+  })
+
+  // ---- 侧边栏开关
+  const btnToggleSide = document.getElementById('btnToggleSide')
+  btnToggleSide.addEventListener('click', () => {
+    const side = document.getElementById('side')
+    side.classList.toggle('collapsed')
+    btnToggleSide.classList.toggle('on', !side.classList.contains('collapsed'))
+  })
+
+  // ---- 文件夹懒加载：点箭头才展开（原型里内容已内联，真实实现是这时才去扫盘）
+  document.querySelectorAll('[data-dir]').forEach((row) => {
+    row.addEventListener('click', () => {
+      const tw = row.querySelector('.tree-twisty')
+      const kids = row.nextElementSibling
+      const open = tw.classList.toggle('open')
+      if (kids && kids.classList.contains('tree-children')) kids.classList.toggle('open', open)
+    })
+  })
+
+  // ---- 文件点击
+  document.querySelectorAll('#p-files .tree-item:not([data-dir])').forEach((it) => {
+    it.addEventListener('click', () => {
+      document.querySelectorAll('#p-files .tree-item').forEach((x) => x.classList.remove('current'))
+      it.classList.add('current')
+      const name = it.textContent.trim()
+      document.querySelector('.tb-title').textContent = name + ' — edge-pdf-lite'
+    })
+  })
+
+  // ---- 缩略图
+  const grid = document.getElementById('thumbGrid')
+  for (let i = 1; i <= 12; i++) {
+    const d = document.createElement('div')
+    d.className = 'thumb' + (i === 7 ? ' current' : '')
+    d.textContent = i
+    grid.appendChild(d)
+  }
+
+  // ---- 搜索（只匹配文件名）
+  const names = ['现代操作系统教程.pdf', 'Computer Science.pdf', 'attention-is-all-you-need.pdf']
+  document.getElementById('searchInput').addEventListener('input', (e) => {
+    const q = e.target.value.trim().toLowerCase()
+    const box = document.getElementById('searchResult')
+    if (!q) { box.textContent = '输入关键词，在文件列表里匹配文件名。'; return }
+    const hits = names.filter((n) => n.toLowerCase().includes(q))
+    box.textContent = hits.length ? hits.join('\n') : '没有匹配的文件'
+  })
+
+  // ---- 颜色菜单（默认红；高亮工具下不含黑/白）
+  const COLORS = [
+    ['黄', 'rgb(255,235,59)'], ['橙', 'rgb(255,153,38)'], ['红', 'rgb(230,48,48)'],
+    ['粉', 'rgb(235,77,158)'], ['紫', 'rgb(140,92,245)'], ['蓝', 'rgb(33,102,235)'],
+    ['绿', 'rgb(26,184,139)'], ['灰', 'rgb(89,89,102)'], ['黑', 'rgb(18,18,23)'],
+    ['白', 'rgb(255,255,255)'],
+  ]
+  const colorMenu = document.getElementById('colorMenu')
+  const annotSwatch = document.getElementById('annotSwatch')
+  let curColor = 'rgb(230,48,48)'
+  COLORS.forEach(([name, css]) => {
+    const s = document.createElement('span')
+    s.className = 'sw' + (css === curColor ? ' on' : '')
+    s.style.background = css
+    s.dataset.tip = name
+    s.addEventListener('click', (e) => {
+      e.stopPropagation()
+      curColor = css
+      annotSwatch.style.background = css
+      colorMenu.querySelectorAll('.sw').forEach((x) => x.classList.remove('on'))
+      s.classList.add('on')
+      colorMenu.classList.remove('open')
+    })
+    colorMenu.appendChild(s)
+  })
+
+  // ---- 批注按钮：收起 "< 批注" / 展开 "> 批注 ▼"（工具组向左展开）
+  const btnAnnot = document.getElementById('btnAnnot')
+  const annotGroup = document.getElementById('annotGroup')
+  const annotCaret = document.getElementById('annotCaret')
+
+  const ribbonEl = document.querySelector('.ribbon')
+
+  function setAnnot(open) {
+    annotGroup.classList.toggle('open', open)
+    // 展开时收起左侧「视图」「模式」两组，避免一行放不下
+    ribbonEl.classList.toggle('annot-open', open)
+    btnAnnot.classList.toggle('on', open)
+    annotCaret.textContent = open ? '>' : '<'
+    btnAnnot.setAttribute('data-tip', open ? '收起批注工具' : '展开批注工具')
+    if (!open) colorMenu.classList.remove('open')
+  }
+  btnAnnot.addEventListener('click', (e) => {
+    if (e.target.id === 'btnColor') return   // 点颜色箭头不算折叠
+    setAnnot(!annotGroup.classList.contains('open'))
+  })
+
+  const btnColor = document.getElementById('btnColor')
+  btnColor.addEventListener('click', (e) => {
+    e.stopPropagation()
+    if (!annotGroup.classList.contains('open')) setAnnot(true)
+    if (colorMenu.classList.contains('open')) { colorMenu.classList.remove('open'); return }
+    const r = btnAnnot.getBoundingClientRect()
+    colorMenu.style.top = (r.bottom + 6) + 'px'
+    colorMenu.style.left = Math.max(8, r.right - 150) + 'px'
+    colorMenu.classList.add('open')
+  })
+
+  document.addEventListener('click', (e) => {
+    if (!colorMenu.contains(e.target) && e.target !== btnColor) colorMenu.classList.remove('open')
+  })
+
+  // ---- 模式切换（演示浏览器降级）
+  document.getElementById('btnMode').addEventListener('click', () => {
+    const b = document.body.classList.toggle('browser-mode')
+    document.getElementById('btnMode').textContent = b ? '切换：浏览器模式 / exe 模式' : '切换：exe 模式 / 浏览器模式'
+  })
+</script>
+</body>
+</html>

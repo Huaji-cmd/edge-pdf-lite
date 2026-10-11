@@ -12,6 +12,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { clickByTidExpr } from './testids.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const SHOTS = resolve(ROOT, 'viewer-shots')
@@ -144,7 +145,7 @@ try {
     return JSON.stringify({
       total: vis.length,
       withCanvas: vis.filter(s => s.querySelector('canvas')).length,
-      zoom: document.querySelector('.zoom-label')?.innerText ?? '',
+      zoom: document.querySelector('[data-tid="zoom"]')?.innerText ?? '',
       totalCanvases: document.querySelectorAll('.pdf-page-canvas').length,
     });
   })()`
@@ -223,7 +224,7 @@ try {
   console.log('\n[3] Ctrl+滚轮缩放')
   const before = JSON.parse(
     await evaluate(`JSON.stringify({
-      zoom: document.querySelector('.zoom-label').innerText,
+      zoom: document.querySelector('[data-tid="zoom"]').innerText,
       firstLeft: document.querySelector('.page-slot').getBoundingClientRect().left,
       firstWidth: document.querySelector('.page-slot').getBoundingClientRect().width,
     })`),
@@ -246,7 +247,7 @@ try {
   await sleep(1500)
   const after = JSON.parse(
     await evaluate(`JSON.stringify({
-      zoom: document.querySelector('.zoom-label').innerText,
+      zoom: document.querySelector('[data-tid="zoom"]').innerText,
       firstWidth: document.querySelector('.page-slot').getBoundingClientRect().width,
       canvases: document.querySelectorAll('.pdf-page-canvas').length,
     })`),
@@ -367,16 +368,14 @@ try {
   const fit = JSON.parse(
     await evaluate(`
       (async () => {
-        const btns = [...document.querySelectorAll('.toolbar .btn')];
-        const w = btns.find(b => b.textContent.trim() === '适宽');
-        w?.click();
+        document.querySelector('[data-tid="fit-width"]')?.click();
         await new Promise(r => setTimeout(r, 900));
         const vp = document.querySelector('.viewport');
         const slot = document.querySelector('.page-slot');
         const sr = slot.getBoundingClientRect();
         const vr = vp.getBoundingClientRect();
         return JSON.stringify({
-          zoom: document.querySelector('.zoom-label').innerText,
+          zoom: document.querySelector('[data-tid="zoom"]').innerText,
           slotWidth: Math.round(sr.width),
           viewportWidth: Math.round(vr.width),
           overflow: sr.width > vr.width + 2,
@@ -399,11 +398,10 @@ try {
         pin.dispatchEvent(new Event('change', { bubbles: true }));
         await new Promise(r => setTimeout(r, 1200));
 
-        const btns = [...document.querySelectorAll('.toolbar .btn')];
-        btns.find(b => b.textContent.trim() === '双页')?.click();
+        document.querySelector('[data-tid="mode-dual"]')?.click();
         await new Promise(r => setTimeout(r, 300));
         // 双页下先"适宽"，两页才会同时进视口（否则 195% 下单页就占满了）
-        btns.find(b => b.textContent.trim() === '适宽')?.click();
+        document.querySelector('[data-tid="fit-width"]')?.click();
 
         // 关键：等"视口内每一页都画出画布"再断言。
         // 这里正是踩过的坑 —— 版面变化后 IO 不再回调，
@@ -426,7 +424,7 @@ try {
         const slots = [...document.querySelectorAll('.page-slot')].slice(0, 6);
         const tops = slots.map(s => Math.round(s.getBoundingClientRect().top));
         const lefts = slots.map(s => Math.round(s.getBoundingClientRect().left));
-        const w = document.querySelector('.zoom-label').innerText;
+        const w = document.querySelector('[data-tid="zoom"]').innerText;
         return JSON.stringify({
           tops, lefts, zoom: w,
           visibleTotal: visibleInfo.total,
@@ -637,13 +635,12 @@ try {
         pin.value = '9';
         pin.dispatchEvent(new Event('change', { bubbles: true }));
         await new Promise(r => setTimeout(r, 800));
-        const btns = [...document.querySelectorAll('.toolbar .btn')];
-        btns.find(b => b.textContent.trim() === '双页')?.click();
+        document.querySelector('[data-tid="mode-dual"]')?.click();
         await new Promise(r => setTimeout(r, 1800));
         return JSON.stringify({
           page: document.querySelector('.page-input')?.value ?? '',
-          zoom: document.querySelector('.zoom-label')?.innerText ?? '',
-          dualOn: [...document.querySelectorAll('.toolbar .seg-btn')].some(b => b.textContent.trim() === '双页' && b.classList.contains('on')),
+          zoom: document.querySelector('[data-tid="zoom"]')?.innerText ?? '',
+          dualOn: document.querySelector('[data-tid="mode-dual"]')?.classList.contains('on') ?? false,
         });
       })()
     `),
@@ -665,8 +662,8 @@ try {
     const st = JSON.parse(
       await evaluate(`JSON.stringify({
         page: document.querySelector('.page-input')?.value ?? '',
-        zoom: document.querySelector('.zoom-label')?.innerText ?? '',
-        dualOn: [...document.querySelectorAll('.toolbar .seg-btn')].some(b => b.textContent.trim() === '双页' && b.classList.contains('on')),
+        zoom: document.querySelector('[data-tid="zoom"]')?.innerText ?? '',
+        dualOn: document.querySelector('[data-tid="mode-dual"]')?.classList.contains('on') ?? false,
       })`),
     )
     afterReload = st
@@ -681,23 +678,14 @@ try {
   console.log('\n[10] 批注（手写 → 高亮 → 擦除 → 撤销 → 缩放对齐）')
 
   /** 点工具栏上某个按钮 */
-  const toolbarBtn = (label) =>
-    evaluate(`
-      (() => {
-        const b = [...document.querySelectorAll('.toolbar .btn')]
-          .find(x => x.textContent.trim() === ${JSON.stringify(label)});
-        if (!b) return false;
-        b.click();
-        return true;
-      })()
-    `)
+  const toolbarBtn = (label) => evaluate(clickByTidExpr(label))
 
   /** 读批注层状态：数量、位图尺寸、各类颜色像素数 */
   const annotState = async () =>
     JSON.parse(
       await evaluate(`
         (() => {
-          const badge = document.querySelector('.toolbar .badge');
+          const badge = document.querySelector('[data-tid="annot-count"]');
           // ⚠️ 每页现在是**两层** canvas：under(multiply, 只有高亮) / over(其余)。
           // 只查第一层会漏掉另一半 —— 按层号统计后相加。
           const layers = [...document.querySelectorAll('.page-slot .annot-layer')];
@@ -881,7 +869,7 @@ try {
     const clickNext = async () => {
       await evaluate(`
         (() => {
-          const b = [...document.querySelectorAll('.toolbar .btn')].find(x => x.textContent.trim() === '›');
+          const b = document.querySelector('[data-tid="next"]');
           if (!b) return false;
           b.click();
           return true;

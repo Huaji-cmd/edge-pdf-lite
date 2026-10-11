@@ -1,25 +1,33 @@
 <script setup lang="ts">
 /**
- * 侧边栏：目录 / 缩略图。
+ * 左侧边栏：文件 / 搜索 / 目录 / 缩略图 四个面板，由顶栏的图标切换。
  *
- * ⚠️ 两个面板**各自滚动**（`.body` 不滚）—— 缩略图要用 IntersectionObserver
- *    做懒渲染，而 IO 的 `root` 必须是真正的滚动容器；如果 root 是外层不滚动的
- *    div，可见性判定就会退化成"相对视口"，滚出面板的项仍会被判成可见，
- *    等于没做懒渲染。
+ * ⚠️ 两个"重量级"面板（目录、缩略图）**各自滚动**，外层 `.body` 不滚。
+ *    缩略图要靠 IntersectionObserver 做懒渲染，而 IO 的 `root` 必须是真正的
+ *    滚动容器；如果 root 是外层不滚动的 div，可见性判定就退化成"相对视口"，
+ *    滚出面板的项仍会被判成可见 —— 等于没做懒渲染。
  */
-import { ref } from 'vue'
 import type { PdfDocument } from './pdfDocument'
 import type { OutlineNode } from './outline'
-import type { PageSize } from './types'
+import type { PageSize, SidePanelKind } from './types'
+import type { FileNode } from './fileList'
+import FilesPanel from './FilesPanel.vue'
+import SearchPanel from './SearchPanel.vue'
 import OutlinePanel from './OutlinePanel.vue'
 import Thumbnails from './Thumbnails.vue'
 
 defineProps<{
+  /** 当前显示哪个面板 */
+  panel: SidePanelKind
   doc: PdfDocument | null
   outline: readonly OutlineNode[]
   outlineLoading: boolean
   sizes: PageSize[] | null
   currentPage: number
+  /** 文件列表（文件 / 搜索两个面板共用） */
+  fileNodes: readonly FileNode[]
+  currentFileId: string | null
+  busy: boolean
 }>()
 
 const emit = defineEmits<{
@@ -27,41 +35,40 @@ const emit = defineEmits<{
   'go-dest': [pageNumber: number, destTop: number | null]
   /** 跳到某一页 */
   'go-page': [pageNumber: number]
+  /** 点文件列表 / 搜索结果里的一个文件 */
+  'open-file': [file: File, nodeId: string]
+  /** 文件列表内容变了 */
+  'files-change': []
 }>()
-
-type Tab = 'outline' | 'thumbs'
-const tab = ref<Tab>('outline')
 </script>
 
 <template>
   <aside class="side">
-    <div class="tabs">
-      <button
-        :class="['tab', tab === 'outline' ? 'on' : '']"
-        title="PDF 自带的书签目录"
-        @click="tab = 'outline'"
-      >
-        目录
-      </button>
-      <button
-        :class="['tab', tab === 'thumbs' ? 'on' : '']"
-        title="每页的缩略图"
-        @click="tab = 'thumbs'"
-      >
-        缩略图
-      </button>
-    </div>
-
     <div class="body">
+      <FilesPanel
+        v-if="panel === 'files'"
+        :nodes="fileNodes"
+        :current-id="currentFileId"
+        :busy="busy"
+        @open="(f, id) => emit('open-file', f, id)"
+        @change="emit('files-change')"
+      />
+      <SearchPanel
+        v-else-if="panel === 'search'"
+        :nodes="fileNodes"
+        :current-id="currentFileId"
+        @open="(f, id) => emit('open-file', f, id)"
+      />
+
       <OutlinePanel
-        v-if="tab === 'outline'"
+        v-else-if="panel === 'outline'"
         :nodes="outline"
         :current-page="currentPage"
         :loading="outlineLoading"
         @go="(p, t) => emit('go-dest', p, t)"
       />
       <Thumbnails
-        v-else-if="doc"
+        v-else-if="panel === 'thumbs' && doc"
         :doc="doc"
         :sizes="sizes"
         :current-page="currentPage"
@@ -74,41 +81,12 @@ const tab = ref<Tab>('outline')
 <style scoped>
 .side {
   flex: 0 0 auto;
-  width: 200px;
+  width: 260px;
   display: flex;
   flex-direction: column;
   min-height: 0;
   background: #171a20;
   border-right: 1px solid #2b313a;
-}
-
-.tabs {
-  flex: 0 0 auto;
-  display: flex;
-  gap: 2px;
-  padding: 6px 6px 0;
-}
-
-.tab {
-  flex: 1 1 0;
-  padding: 4px 0;
-  border: 1px solid transparent;
-  border-radius: 5px 5px 0 0;
-  background: none;
-  color: #8b93a1;
-  font: inherit;
-  font-size: 12.5px;
-  cursor: pointer;
-}
-.tab:hover {
-  color: #d7dce4;
-}
-.tab.on {
-  background: #1f242c;
-  border-color: #2b313a;
-  border-bottom-color: transparent;
-  color: #cfe4ff;
-  font-weight: 600;
 }
 
 /* ⚠️ 这里**不滚动** —— 滚动交给里面的面板自己，理由见文件头 */
@@ -122,4 +100,5 @@ const tab = ref<Tab>('outline')
   flex: 1 1 auto;
   min-width: 0;
 }
+
 </style>

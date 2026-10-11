@@ -4,7 +4,9 @@ import { PdfDocument } from './viewer/pdfDocument'
 import PdfViewer from './viewer/PdfViewer.vue'
 import ViewerToolbar from './viewer/ViewerToolbar.vue'
 import SidePanel from './viewer/SidePanel.vue'
-import type { PageSize } from './viewer/types'
+import TitleBar from './viewer/TitleBar.vue'
+import { useFileList } from './viewer/fileList'
+import type { PageSize, SidePanelKind } from './viewer/types'
 import type { OutlineNode } from './viewer/outline'
 import { loadReadingState, saveReadingState } from './viewer/readingState'
 import type { RendererStats } from './viewer/pageRenderer'
@@ -22,9 +24,11 @@ const mode = ref<ViewMode>('single')
 const spreadOffset = ref<0 | 1>(0)
 const page = ref(1)
 
-// ---------------------------------------------------------------- 侧边栏：目录 / 缩略图
+// ---------------------------------------------------------------- 侧边栏：文件 / 搜索 / 目录 / 缩略图
 
 const sideOpen = ref(false)
+/** 侧边栏当前显示哪个面板。默认「文件列表」—— 跟 Obsidian 一样，先从列表挑书 */
+const panel = ref<SidePanelKind>('files')
 const outline = ref<OutlineNode[]>([])
 const outlineLoading = ref(false)
 /** 各页基准尺寸 —— 缩略图靠它算宽高比和占位高度（没渲染出来之前也要占位） */
@@ -322,7 +326,12 @@ watch([page, scale, mode, spreadOffset], scheduleSave)
 
 // ---------------------------------------------------------------- 打开文件
 
-async function openBytes(bytes: Uint8Array, name: string): Promise<void> {
+/**
+ * 打开一份 PDF。
+ * @returns 真的打开了返回 true；用户取消（未保存确认框点了取消）或失败返回 false
+ *          —— 文件列表要靠这个决定要不要把高亮切过去，不然"点了取消但列表已跳走"
+ */
+async function openBytes(bytes: Uint8Array, name: string): Promise<boolean> {
   /*
    * 换文档会**清空整个批注 store**（批注按文档归属，不能跨文件漂）。
    * 这一步浏览器不会卸载页面，所以 `beforeunload` 拦不到 —— 必须自己问一句。
@@ -335,7 +344,7 @@ async function openBytes(bytes: Uint8Array, name: string): Promise<void> {
         `（想留住就先取消，点工具栏的「保存批注」）`,
     )
   ) {
-    return
+    return false
   }
 
   errorText.value = ''
@@ -357,11 +366,30 @@ async function openBytes(bytes: Uint8Array, name: string): Promise<void> {
     stats.value = null
     // 新文档接管之后再关掉旧的，避免中间出现空白
     if (prev) void prev.close()
+    return true
   } catch (e) {
     errorText.value = (e as Error).message
+    return false
   } finally {
     busy.value = false
   }
+}
+
+// ---------------------------------------------------------------- 文件列表
+
+const { nodes: fileNodes } = useFileList()
+/** 当前打开的文件在列表里的 id（用于高亮那一行） */
+const currentFileId = ref<string | null>(null)
+
+/**
+ * 点文件列表 / 搜索结果里的一个文件。
+ *
+ * ⚠️ 高亮**只在真的打开成功之后**才切过去 —— 用户在"未保存批注"的确认框上
+ *    点了取消的话，列表还停在原来那份文件上，不能提前跳走。
+ */
+async function openFromList(file: File, nodeId: string): Promise<void> {
+  const buf = new Uint8Array(await file.arrayBuffer())
+  if (await openBytes(buf, file.name)) currentFileId.value = nodeId
 }
 
 async function onPickFile(e: Event): Promise<void> {
@@ -417,6 +445,23 @@ function stepPage(dir: 1 | -1): void {
 /** 从目录跳转（带页内纵向位置，所以能落到具体段落而不是页顶） */
 function goToDest(p: number, top: number | null): void {
   void viewerRef.value?.goToDestination(p, top)
+}
+
+/** 点顶栏的面板图标：切过去，并顺带把侧边栏打开（关着的时候点它没有意义） */
+function setPanel(p: SidePanelKind): void {
+  panel.value = p
+  sideOpen.value = true
+}
+
+/**
+ * 窗口控制（最小化 / 最大化 / 关闭）。
+ *
+ * ⚠️ 浏览器里这三个按钮**根本不渲染**（TitleBar 里 `v-if="IS_TAURI"`），
+ * 所以这里在网页上永远不会被调用。真正的 Tauri 调用等接打包那一步再写，
+ * 现在留个明确提示，免得留个空函数让人看不出意图。
+ */
+function onWindowAction(action: 'min' | 'max' | 'close'): void {
+  console.debug('[app] 窗口控制只在打包成 exe 后可用：', action)
 }
 
 function setScale(s: number): void {
@@ -570,8 +615,16 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="app">
-    <ViewerToolbar
+    <TitleBar
       :file-name="fileName"
+      :side-open="sideOpen"
+      :panel="panel"
+      @toggle-side="sideOpen = !sideOpen"
+      @set-panel="setPanel"
+      @win="onWindowAction"
+    />
+
+    <ViewerToolbar
       :num-pages="doc?.numPages ?? 0"
       :page="page"
       :scale="scale"
@@ -581,14 +634,12 @@ onBeforeUnmount(() => {
       :tool="tool"
       :annot-count="annotCount"
       :unsaved="unsaved"
-      :side-open="sideOpen"
       :pointer-mode="pointerMode"
       :colors="colors"
       :selected="selected"
       :can-undo="canUndo"
       :can-redo="canRedo"
       @open="fileInputRef?.click()"
-      @toggle-side="sideOpen = !sideOpen"
       @go-to="goTo"
       @step-page="(d) => stepPage(d)"
       @set-scale="setScale"
@@ -605,17 +656,25 @@ onBeforeUnmount(() => {
       @export-annot="exportAnnotated"
     />
 
-    <!-- 侧边栏：目录 / 缩略图。没打开文档时不显示（那时候目录没意义） -->
+    <!--
+      侧边栏：文件 / 搜索 **在没有打开文档时也能用**（先从列表挑书，跟 Obsidian 一样）；
+      目录 / 缩略图 需要文档，SidePanel 内部各自处理空状态。
+    -->
     <div class="main">
       <SidePanel
-        v-if="sideOpen && doc"
+        v-if="sideOpen"
+        :panel="panel"
         :doc="doc"
         :outline="outline"
         :outline-loading="outlineLoading"
         :sizes="pageSizes"
         :current-page="page"
+        :file-nodes="fileNodes"
+        :current-file-id="currentFileId"
+        :busy="busy"
         @go-dest="goToDest"
         @go-page="goTo"
+        @open-file="openFromList"
       />
 
       <PdfViewer
