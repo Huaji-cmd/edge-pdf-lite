@@ -53,6 +53,18 @@ const MIN_SCALE = 0.2
 const MAX_SCALE = 8
 const GAP = 16
 const PADDING = 24
+/**
+ * 翻页定位时，页上方留出的空隙（CSS px）。
+ *
+ * ⚠️ 这个值**成对出现在两处，改一处必须改另一处**：
+ *   · `goToPage`           `scrollTop = rowY · scale − ANCHOR_GAP`
+ *   · `updateCurrentPage`  `y = (scrollTop + ANCHOR_GAP) / scale`
+ *
+ * 不成对的后果（实测）：翻到某页后，由 scrollTop 反算出来的"当前行"会落到
+ * **上一行** —— `page-change` 于是把页码 emit 回去。表现为点「下一页」
+ * 页码反而倒退：单页模式退 1 页、双页模式**每次退 2 页**，一路退到第 1 页。
+ */
+const ANCHOR_GAP = GAP
 /** 缩放落定判定：最后一次滚轮之后多久算"稳了" */
 const COMMIT_DELAY = 180
 
@@ -282,7 +294,9 @@ function updateCurrentPage(): void {
   const l = layout.value
   if (!vp || !l || !l.pages.length) return
 
-  const y = vp.scrollTop / Math.max(scale.value, 1e-6)
+  // ⚠️ 必须 **+ ANCHOR_GAP**，与 `goToPage` 里那个 `− ANCHOR_GAP` 严格配对。
+  //    少了这一项，翻页后反算出的行会落到上一行（详见 ANCHOR_GAP 的注释）。
+  const y = (vp.scrollTop + ANCHOR_GAP) / Math.max(scale.value, 1e-6)
   let rowY = l.pages[0]!.y
   for (const p of l.pages) {
     if (p.y <= y + 1) rowY = p.y
@@ -797,8 +811,38 @@ async function goToPage(pageNumber: number): Promise<void> {
   if (!vp || !l) return
   const target = l.pages.find((p) => p.pageNumber === pageNumber)
   if (!target) return
-  // 页可能在更高的一行里，直接按基准 y 乘 scale 定位
-  vp.scrollTop = target.y * scale.value - GAP
+  // 页可能在更高的一行里，直接按基准 y 乘 scale 定位。
+  // ⚠️ 这里的 `− ANCHOR_GAP` 必须和 `updateCurrentPage` 里的 `+ ANCHOR_GAP` 配对。
+  vp.scrollTop = Math.max(0, target.y * scale.value - ANCHOR_GAP)
+}
+
+/** 所有行的基准 y（去重 + 升序） */
+function rowTops(pages: readonly { y: number }[]): number[] {
+  const set = new Set<number>()
+  for (const p of pages) set.add(p.y)
+  return [...set].sort((a, b) => a - b)
+}
+
+/**
+ * 按**行**翻页（工具栏的 ‹ › 和 PageUp/PageDown 都走这里）。
+ *
+ * ⚠️ 不能简单地 `page ± 1`：双页模式下同一行有左右两页，
+ *    +1 会停在**同一行** —— 视觉上完全没动，用户以为"点了没反应"，
+ *    再点一次才真的翻过去。按行走才是"翻一屏"：
+ *    单页模式一次 1 页，双页模式一次 2 页。
+ */
+async function stepPage(dir: 1 | -1): Promise<void> {
+  const l = layout.value
+  if (!l || !l.pages.length) return
+  const rows = rowTops(l.pages)
+  const cur = l.pages.find((p) => p.pageNumber === currentPage.value) ?? l.pages[0]!
+  const i = rows.indexOf(cur.y)
+  if (i < 0) return
+  const nextY = rows[i + dir]
+  if (nextY === undefined) return // 到头了就不动，别绕回开头
+  const target = l.pages.find((p) => p.y === nextY)
+  if (!target) return
+  await goToPage(target.pageNumber)
 }
 
 /** 首行的行高（fit-page 用） */
@@ -865,6 +909,8 @@ async function restoreTo(nextScale: number, pageNumber: number): Promise<void> {
 defineExpose({
   applyScale,
   goToPage,
+  /** 按行翻页（‹ › / PageUp·PageDown）。双页模式一次翻一屏，见函数注释 */
+  stepPage,
   fitWidth,
   fitPage,
   restoreTo,
@@ -964,6 +1010,11 @@ onMounted(() => {
         visible: [...visiblePages],
         slotEls: slotEls.size,
         pages: renderer?.debugState() ?? [],
+        // ⚠️ 翻页出问题时，光看工具栏页码是不够的：这个值是**组件内部**
+        // 由 scrollTop 反算出来的。它和工具栏页码不一致，就说明反算错了
+        // （曾经因为漏掉 ANCHOR_GAP 补偿，它总是算成上一行）。
+        page: currentPage.value,
+        scrollTop: viewportRef.value?.scrollTop ?? 0,
         // 下面这几个是"选中 / 拖动 / 改大小 / 撤销重做"的观察窗口。
         // 这类交互的 bug（框没动、手柄方向反了、重做没生效）光看截图看不出来，
         // 必须能直接读到数据和可用态。

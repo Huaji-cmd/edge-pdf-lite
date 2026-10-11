@@ -860,7 +860,115 @@ try {
   await shot('13-annot-zoomed')
 
   // ---------------------------------------------------------------- 11. 无报错
-  console.log('\n[11] 控制台')
+  console.log('\n[11] 翻页：单页 / 双页都必须单调前进')
+  /*
+   * 回归背景（用户实测报的 bug）：
+   *   · 单页模式：点「下一页」第一次只改页码不动，要点两次才真的翻
+   *   · 双页模式：前几页正常，之后点「下一页」会**往回跳**，一路退到第 1 页
+   *
+   * 根因：`goToPage` 定位时把 scrollTop 减了一个 `ANCHOR_GAP`（让页上方留点空隙），
+   * 而 `updateCurrentPage` 由 scrollTop 反算行号时**没有加回来** ——
+   * 于是永远算成**上一行**，`page-change` 把页码 emit 回去，
+   * 下一次点击又从这个错值继续，就成了"倒着退"。
+   *
+   * 判据只要一条就够：**连点 N 次「下一页」，页码必须严格单调前进**。
+   * 它同时覆盖上面两个现象，而且不会漏。
+   */
+  {
+    const pageNow = async () => Number(await evaluate(`document.querySelector('.page-input').value`))
+    const innerPage = async () =>
+      Number(await evaluate(`globalThis.__eplViewer.snapshot().page`))
+    const clickNext = async () => {
+      await evaluate(`
+        (() => {
+          const b = [...document.querySelectorAll('.toolbar .btn')].find(x => x.textContent.trim() === '›');
+          if (!b) return false;
+          b.click();
+          return true;
+        })()
+      `)
+      await sleep(420)
+    }
+    const jumpTo = async (n) => {
+      await evaluate(`
+        (() => {
+          const i = document.querySelector('.page-input');
+          i.value = '${n}';
+          i.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        })()
+      `)
+      await sleep(700)
+    }
+
+    // ① 单页模式：每次 +1
+    await toolbarBtn('单页')
+    await sleep(500)
+    await jumpTo(1)
+    const seq1 = []
+    for (let i = 0; i < 4; i++) {
+      await clickNext()
+      seq1.push(await pageNow())
+    }
+    check(
+      '单页模式：连点「下一页」每次前进 1 页',
+      seq1.every((v, i) => v === i + 2),
+      `1 → ${seq1.join(' → ')}`,
+    )
+
+    // ② 双页模式：每次前进一整行（+2），不能停在同行
+    await toolbarBtn('双页')
+    await sleep(700)
+    await jumpTo(1)
+    const seq2 = []
+    for (let i = 0; i < 4; i++) {
+      await clickNext()
+      seq2.push(await pageNow())
+    }
+    check(
+      '双页模式：连点「下一页」每次前进一整行（+2，不是停在同行）',
+      seq2.every((v, i) => v === 3 + i * 2),
+      `1 → ${seq2.join(' → ')}`,
+    )
+
+    // ③ 关键：跳转本身也不能倒退
+    //    （用户最直观的症状："我在 103 页，点下一页回退到 101" —— 其实跳转那一刻
+    //     页码就已经被算错了，点下一页只是把错值往前推了一步）
+    const total = Number(await evaluate(`document.querySelector('.page-input').max`))
+    const target = Math.max(3, total - 3)
+    await jumpTo(target)
+    const landed = await pageNow()
+    check(
+      `跳到第 ${target} 页后页码不能倒退（双页模式允许落到本行左页）`,
+      landed >= target - 1,
+      `请求 ${target} → 实际 ${landed}`,
+    )
+
+    // ④ 深处的页点「下一页」仍然要前进
+    const before = await pageNow()
+    await clickNext()
+    const after = await pageNow()
+    check(
+      `双页模式：在第 ${before} 页点「下一页」必须前进`,
+      after > before,
+      `${before} → ${after}（倒退就是这个 bug 复现了）`,
+    )
+
+    // ④ 组件内部由 scrollTop 反算的页码，必须和工具栏显示的一致
+    //    不一致 = 反算偏行（漏掉 ANCHOR_GAP 补偿的直接症状）
+    const inner = await innerPage()
+    check(
+      '组件内部反算的当前页 == 工具栏显示的页码（反算没偏行）',
+      inner === after,
+      `内部=${inner} / 工具栏=${after}`,
+    )
+
+    await shot('11-paging')
+    await toolbarBtn('单页')
+    await sleep(400)
+  }
+
+  console.log('\n[12] 控制台')
   const realErrors = consoleErrors.filter((e) => !/favicon|DevTools/i.test(e))
   check('没有控制台报错', realErrors.length === 0, realErrors.slice(0, 3).join(' | '))
 

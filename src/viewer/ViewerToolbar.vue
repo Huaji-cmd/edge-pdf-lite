@@ -38,6 +38,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   open: []
   'go-to': [pageNumber: number]
+  /** 按行翻页（双页模式一次翻一屏） */
+  'step-page': [dir: -1 | 1]
   'set-scale': [scale: number]
   'fit-width': []
   'fit-page': []
@@ -124,7 +126,9 @@ function isOn(c: Rgb): boolean {
     <span class="sep" />
 
     <div class="pager" v-if="numPages">
-      <button class="btn icon" title="上一页" @click="emit('go-to', Math.max(1, page - 1))">‹</button>
+      <!-- ⚠️ 走 `step-page`（按行翻），不是 `go-to`(page±1)。
+           双页模式下 page+1 停在同一行，会变成"点两次才翻一屏" -->
+      <button class="btn icon" title="上一页 (PageUp)" @click="emit('step-page', -1)">‹</button>
       <input
         class="page-input"
         type="number"
@@ -134,11 +138,7 @@ function isOn(c: Rgb): boolean {
         @change="onPageInput"
       />
       <span class="dim">/ {{ numPages }}</span>
-      <button
-        class="btn icon"
-        title="下一页"
-        @click="emit('go-to', Math.min(numPages, page + 1))"
-      >
+      <button class="btn icon" title="下一页 (PageDown)" @click="emit('step-page', 1)">
         ›
       </button>
     </div>

@@ -354,11 +354,23 @@ function onDragLeave(e: DragEvent): void {
 
 // ---------------------------------------------------------------- 工具栏动作
 
+/** 跳到指定页（页码输入框用） */
 function goTo(p: number): void {
   const total = doc.value?.numPages ?? 1
   const target = Math.min(Math.max(1, p), total)
   page.value = target
   void viewerRef.value?.goToPage(target)
+}
+
+/**
+ * 按**行**翻页（‹ › / PageUp·PageDown / 左右方向键）。
+ *
+ * 走 `stepPage` 而不是 `goTo(page ± 1)`：双页模式下同一行有左右两页，
+ * `page + 1` 会停在**同一行** —— 视觉上完全没动，用户以为没反应，
+ * 再点一次才真的翻过去。按行走一次翻一屏。
+ */
+function stepPage(dir: 1 | -1): void {
+  void viewerRef.value?.stepPage(dir)
 }
 
 function setScale(s: number): void {
@@ -462,10 +474,10 @@ function onKeydown(e: KeyboardEvent): void {
     viewerRef.value?.clearSelection()
   } else if (e.key === 'PageDown' || (e.key === ' ' && !e.shiftKey)) {
     e.preventDefault()
-    goTo(page.value + 1)
+    stepPage(1)
   } else if (e.key === 'PageUp' || (e.key === ' ' && e.shiftKey)) {
     e.preventDefault()
-    goTo(page.value - 1)
+    stepPage(-1)
   } else if (e.key === 'Home') {
     e.preventDefault()
     goTo(1)
@@ -474,10 +486,10 @@ function onKeydown(e: KeyboardEvent): void {
     goTo(doc.value.numPages)
   } else if (e.key === 'ArrowRight') {
     e.preventDefault()
-    goTo(page.value + 1)
+    stepPage(1)
   } else if (e.key === 'ArrowLeft') {
     e.preventDefault()
-    goTo(page.value - 1)
+    stepPage(-1)
   }
 }
 
@@ -530,6 +542,7 @@ onBeforeUnmount(() => {
       :can-redo="canRedo"
       @open="fileInputRef?.click()"
       @go-to="goTo"
+      @step-page="(d) => stepPage(d)"
       @set-scale="setScale"
       @fit-width="fitWidth"
       @fit-page="fitPage"
