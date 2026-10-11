@@ -32,7 +32,9 @@
     "test": "node scripts/test-viewer.mjs && node scripts/test-annot.mjs && node scripts/test-writer.mjs && node scripts/test-interact.mjs && node scripts/test-touch.mjs && node scripts/test-pwa.mjs && node scripts/test-preview.mjs",
     "variants": "node scripts/make-highlight-variants.mjs",
     "edge:shot": "node scripts/edge-pdf-shot.mjs",
-    "probe:worker": "node scripts/probe-worker.mjs"
+    "probe:worker": "node scripts/probe-worker.mjs",
+    "tauri": "node scripts/tauri.mjs",
+    "exe": "node scripts/tauri.mjs build --no-bundle"
   },
   "dependencies": {
     "@cantoo/pdf-lib": "^2.11.1",
@@ -41,6 +43,8 @@
     "vue": "^3.5.43"
   },
   "devDependencies": {
+    "@tauri-apps/api": "^2.12.3",
+    "@tauri-apps/cli": "^2.12.2",
     "@types/node": "^26.6.5",
     "@vitejs/plugin-vue": "^6.0.10",
     "typescript": "~5.9.3",

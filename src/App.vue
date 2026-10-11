@@ -6,6 +6,7 @@ import ViewerToolbar from './viewer/ViewerToolbar.vue'
 import SidePanel from './viewer/SidePanel.vue'
 import TitleBar from './viewer/TitleBar.vue'
 import { useFileList } from './viewer/fileList'
+import { IS_TAURI } from './platform'
 import type { PageSize, SidePanelKind } from './viewer/types'
 import type { OutlineNode } from './viewer/outline'
 import { loadReadingState, saveReadingState } from './viewer/readingState'
@@ -453,15 +454,36 @@ function setPanel(p: SidePanelKind): void {
   sideOpen.value = true
 }
 
+/** 窗口当前是否最大化（决定标题栏显示「最大化」还是「还原」图标） */
+const maximized = ref(false)
+
 /**
  * 窗口控制（最小化 / 最大化 / 关闭）。
  *
  * ⚠️ 浏览器里这三个按钮**根本不渲染**（TitleBar 里 `v-if="IS_TAURI"`），
- * 所以这里在网页上永远不会被调用。真正的 Tauri 调用等接打包那一步再写，
- * 现在留个明确提示，免得留个空函数让人看不出意图。
+ *    所以这里在网页上永远不会被调用。
+ *
+ * ⚠️ **动态 import**：`@tauri-apps/api` 只有桌面端用得上，
+ *    静态引入会让**浏览器版**也把它打进主包 —— 跟"只在必须付的时候付一次"冲突。
  */
-function onWindowAction(action: 'min' | 'max' | 'close'): void {
-  console.debug('[app] 窗口控制只在打包成 exe 后可用：', action)
+async function onWindowAction(action: 'min' | 'max' | 'close'): Promise<void> {
+  const { getCurrentWindow } = await import('@tauri-apps/api/window')
+  const win = getCurrentWindow()
+  if (action === 'min') await win.minimize()
+  else if (action === 'max') await win.toggleMaximize()
+  else await win.close()
+}
+
+/** 把最大化状态同步进来（切图标用）。只在 Tauri 下有意义 */
+async function syncMaximized(): Promise<void> {
+  if (!IS_TAURI) return
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window')
+    const win = getCurrentWindow()
+    maximized.value = await win.isMaximized()
+  } catch {
+    /* 不是桌面端就无所谓 —— 那三个按钮不会渲染 */
+  }
 }
 
 function setScale(s: number): void {
@@ -597,6 +619,21 @@ onMounted(() => {
   standalone.value = window.matchMedia?.('(display-mode: standalone)').matches ?? false
   window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt)
   window.addEventListener('appinstalled', onInstalled)
+
+  // 桌面端：同步最大化状态，并跟着窗口变化更新（标题栏的图标要靠它切换）
+  if (IS_TAURI) {
+    void syncMaximized()
+    void (async () => {
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window')
+        await getCurrentWindow().onResized(() => {
+          void syncMaximized()
+        })
+      } catch {
+        /* 非桌面端忽略 */
+      }
+    })()
+  }
 })
 
 onBeforeUnmount(() => {
@@ -619,6 +656,7 @@ onBeforeUnmount(() => {
       :file-name="fileName"
       :side-open="sideOpen"
       :panel="panel"
+      :maximized="maximized"
       @toggle-side="sideOpen = !sideOpen"
       @set-panel="setPanel"
       @win="onWindowAction"

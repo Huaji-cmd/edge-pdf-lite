@@ -1,0 +1,47 @@
+[package]
+# ⚠️ 这个名字决定**产出的 exe 叫什么**（默认模板给的 "app" 会生成 app.exe）。
+#    改成产品名，用户拿到的才是 edge-pdf-lite.exe。
+name = "edge-pdf-lite"
+version = "0.1.0"
+description = "轻量 PDF 阅读 + 批注编辑器"
+authors = ["you"]
+license = ""
+repository = ""
+edition = "2024"
+rust-version = "1.90"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "edge_pdf_lite_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.2", features = [] }
+# ⚠️ 同下面 [dependencies] 里那条 indexmap，两边都要有：
+#    schemars 是 **tauri-build 的 build-dependency**，而 Cargo 对
+#    build-dependencies 和 dependencies 是**分开做 feature 解析**的 ——
+#    只加在 [dependencies] 里影响不到构建期的 schemars，编译照样失败。
+indexmap = { version = "1.9", features = ["std"] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.12.3", features = [] }
+tauri-plugin-log = "2"
+
+# ⚠️ 这一行看着像多余（我们自己的 Rust 代码里没用到 indexmap），
+#    但它修的是一个**编译不过去**的依赖 bug，别删：
+#
+#    schemars 0.8.22（tauri-build / tauri-utils 的传递依赖）里写的是
+#        pub type Map<K, V> = indexmap::IndexMap<K, V>;
+#    而 indexmap 1.x 只有在 **std** 开启时 `S` 才有默认值：
+#        #[cfg(has_std)]      struct IndexMap<K, V, S = RandomState>  ← 能用
+#        #[cfg(not(has_std))] struct IndexMap<K, V, S>                ← 少一个泛型就编译失败
+#    依赖树里有别处把它按 no_std 解析了，于是报
+#        error[E0107]: struct takes 3 generic arguments but 2 were supplied
+#
+#    显式在这里依赖 indexmap 并开启 std，靠 Cargo 的 feature 统一
+#    把 has_std 打开，schemars 那行就合法了。
+indexmap = { version = "1.9", features = ["std"] }

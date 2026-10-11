@@ -38,3 +38,7 @@ touch-shots/
 # ⚠️ 这个目录本身不要删，只是不让它进版本库
 .workbuddy/
 preview-shots/
+
+# 一次被中断的构建留下的残骸（等清空护栏允许时再删）
+dist-broken/
+exe-shots/
