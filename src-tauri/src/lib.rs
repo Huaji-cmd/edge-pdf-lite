@@ -1,7 +1,137 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/*
+ * 关于下面这段"自愈"代码的来龙去脉 —— 这是用户实际踩到、且很难自己查的问题。
+ *
+ * **现象**：双击 exe 出来一个 WebView2 的错误页，上面一行乱码，看起来像白屏。
+ *
+ * **那行乱码是什么**：它是 WebView2 自己画的错误页文案，UTF-8 的中文被按 GBK
+ * 显示就成了乱码。还原过来是「域名 tauri.localhost 可能已经被 DNS 污染…」——
+ * 也就是说，**不是我们界面白屏，是 `http://tauri.localhost` 请求压根没被拦下来**。
+ *
+ * **为什么会这样**：Tauri 在 Windows 上把前端资源挂在 `http://tauri.localhost`
+ * 这个虚拟主机上（靠 WebView2 的虚拟主机映射）。这个映射依赖 WebView2 的 profile
+ * 状态正常。profile 一旦损坏/跨版本不兼容，映射就失效，请求会走到**真实网络**去解析
+ * `tauri.localhost` → 必然失败 → 错误页。
+ *
+ * **修复**：把 profile 清掉重建。但 ⚠️ **不能连 `Default\Local Storage` 一起清** ——
+ * 用户的文件列表和设置就存在那里（清掉等于让他重新添加一遍所有书）。
+ *
+ * **为什么以前没发现**：测试脚本每次都把整个数据目录挪走，永远从干净状态开始，
+ * 所以这类"长期存在的 profile 出问题"根本测不到。是用户装了正式版才暴露的。
+ */
+/*
+ * ⚠️ 改动**清理逻辑本身**时要把这个值 +1 —— 老用户（包括用过有 bug 的那一版的人）
+ * 会被重新清一次，否则他们会停在"标记已写、但没真正清干净"的状态里出不来。
+ */
+const PROFILE_STAMP: &str = "2";
+
+/// 删掉一个路径（文件或目录都行）
+fn rm_any(p: &Path) -> std::io::Result<()> {
+    if p.is_dir() {
+        std::fs::remove_dir_all(p)
+    } else {
+        std::fs::remove_file(p)
+    }
+}
+
+/*
+ * 检查并（必要时）重建 WebView2 的 profile。
+ *
+ * 什么时候重建：
+ *   - 标记里的 **WebView2 运行时版本**变了（WebView2 自动升级后跨版本不兼容）
+ *   - **PROFILE_STAMP** 变了（我们自己改了 profile 结构）
+ *   - 以后要加"检测到加载失败"之类，也走这里
+ *
+ * ⚠️ 必须在 **setup 里**调用（窗口创建之前）—— 那时 WebView2 还没起来、目录没被锁；
+ *    等窗口出来再删就会失败。
+ *
+ * ⚠️ **原地删，不动 `Default\Local Storage`** —— 用户的文件列表和设置就存在那儿。
+ *    这里刻意**不做"先备份再整体重建"**：试过 rename 整个目录那套，
+ *    但 profile 目录随时可能被别的进程（索引器 / 杀软）持有句柄，
+ *    rename 一失败就得回滚，逻辑复杂还容易留下半成品。
+ *    原地逐个删的好处是：**用户数据从头到尾没被移动过**，
+ *    而且就算某些文件删不掉，也只是"这次没清干净"，下次启动接着清 —— 没有中间态。
+ */
+fn heal_webview_profile(identifier: &str) {
+    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+        return;
+    };
+    let root: PathBuf = PathBuf::from(&local).join(identifier).join("EBWebView");
+    if !root.is_dir() {
+        // 全新安装：WebView2 还没建这个目录，没什么可修的
+        // （所以"第一次运行不写标记、第二次才写"是正常的）
+        return;
+    }
+
+    let want = format!(
+        "{}|{}",
+        PROFILE_STAMP,
+        tauri::webview_version().unwrap_or_default()
+    );
+    let stamp = root.join(".epl-profile");
+    if std::fs::read_to_string(&stamp)
+        .map(|s| s.trim() == want)
+        .unwrap_or(false)
+    {
+        return; // 常态：什么都没变，直接走
+    }
+
+    let keep = root.join("Default").join("Local Storage");
+    // 删不掉的东西记下来 —— 这一步失败会**直接导致白屏依旧**，
+    // 而它发生在窗口出现之前，界面上完全看不出来，不记日志就没法查。
+    let mut failed: Vec<String> = Vec::new();
+
+    // ① 清 Default 下除 Local Storage 之外的一切
+    match std::fs::read_dir(root.join("Default")) {
+        Ok(rd) => {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p == keep {
+                    continue;
+                }
+                if let Err(err) = rm_any(&p) {
+                    failed.push(format!("{} ({})", p.display(), err));
+                }
+            }
+        }
+        Err(err) => failed.push(format!("读不了 Default/（{}）", err)),
+    }
+
+    // ② 清 root 下除 Default 之外的一切（顺带把旧的标记也清掉）
+    match std::fs::read_dir(&root) {
+        Ok(rd) => {
+            for e in rd.flatten() {
+                if e.file_name() == "Default" {
+                    continue;
+                }
+                let p = e.path();
+                if let Err(err) = rm_any(&p) {
+                    failed.push(format!("{} ({})", p.display(), err));
+                }
+            }
+        }
+        Err(err) => failed.push(format!("读不了 profile 根目录（{}）", err)),
+    }
+
+    // ③ 写下标记：下次启动版本没变就直接跳过
+    let _ = std::fs::create_dir_all(root.join("Default"));
+    let _ = std::fs::write(&stamp, &want);
+
+    let _ = std::fs::write(
+        std::env::temp_dir().join("epl-profile-heal.log"),
+        format!(
+            "webview={}\nstamp={}\nfailed={}\n{}",
+            tauri::webview_version().unwrap_or_default(),
+            want,
+            failed.len(),
+            failed.join("\n")
+        ),
+    );
+}
 
 /// 目录里的一项（前端文件树用）
 #[derive(serde::Serialize)]
@@ -233,6 +363,17 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    /*
+     * ⚠️ 自愈必须在**这里**，不能放进下面的 `setup` 回调里。
+     *
+     * `setup` 跑的时候 Tauri 可能已经初始化过 WebView2 的环境（那一步就会
+     * 占住 profile 目录），于是清理会静默失败 —— 标记照样写进去了，
+     * 但坏文件一个都没删掉，用户看到的还是白屏。
+     * 放到 Builder 之前是**唯一绝对干净**的时机：这时进程里还没有任何 WebView2。
+     */
+    let context = tauri::generate_context!();
+    heal_webview_profile(&context.config().identifier);
+
     tauri::Builder::default()
         // 文件 / 文件夹选择对话框（拿**真实路径**用，浏览器里没有这个能力）
         .plugin(tauri_plugin_dialog::init())
@@ -256,6 +397,6 @@ pub fn run() {
             reveal_in_folder,
             rename_file
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while building tauri application");
 }
