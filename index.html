@@ -30,7 +30,13 @@
       ⚠️ 新增图标要同步加进 src/viewer/Icon.vue 的 ICON_NAMES，
          否则类型检查不会报错、但运行时什么都不显示（最难查的一类 bug）。
     -->
-    <svg style="display: none" aria-hidden="true">
+    <!--
+      ⚠️ 用 class 隐藏，**不要给这个 svg 加内联 style 属性**。
+      内联 style 属性属于 CSP 的 `style-src-attr`，为了让那一行通过就得给整站开
+      `'unsafe-inline'` —— 那等于把 CSP 对样式的防护全关掉，代价远大于收益。
+      （本来也不用太担心闪烁：里面只有 <symbol>，而 symbol 不渲染。）
+    -->
+    <svg class="icon-sprite" aria-hidden="true">
       <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></symbol>
       <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h7l5 5v13H6z" /><path d="M13 3v5h5" /></symbol>
       <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v10H3z" /></symbol>

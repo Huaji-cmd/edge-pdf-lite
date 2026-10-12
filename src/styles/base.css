@@ -170,3 +170,18 @@ a {
 button {
   font: inherit;
 }
+
+/*
+ * 图标 sprite 容器（index.html 里那一段 <symbol>）。
+ *
+ * ⚠️ 这条规则的存在理由是 **CSP**：以前写的是 `<svg style="display: none">`，
+ *    而内联 style 属性归 `style-src-attr` 管 —— 为了让它通过就得开
+ *    `'unsafe-inline'`，整站的样式防护就白设了。挪到这里之后
+ *    `style-src 'self'` 就够了。
+ *
+ *    顺带一提：里面只有 <symbol>，而 symbol 本来就不渲染，所以即使这条
+ *    规则晚一步生效也不会闪。
+ */
+.icon-sprite {
+  display: none;
+}

@@ -57,7 +57,8 @@ npm run tauri -- build      # 含 MSI + NSIS 安装包
 
 ```bash
 npm run dev | build | serve:dist     # 开发 / 构建 / 生产对照
-npm test                             # 七套浏览器端回归（250+ 项）
+npm test                             # 八套浏览器端回归（280+ 项，含 CSP）
+npm run test:csp                     # 只跑 CSP 那条（策略没被放宽 + 0 违规）
 npm run test:exe                     # 打包后 exe 的端到端验证
 npm run test:exe:heal                # 专测 WebView2 profile 自愈
 npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截图做对照
@@ -111,7 +112,21 @@ npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截
 - **判据要求"有牙"**：每条断言都要能抓住对应的失败。
   比如判"批注写进去了"用的是 pdf-lib 直查 `/Annots` 且要求**恰好 +1**
   （测试样本本来就带 113 条批注，写成"大于 0"的话 writer 一行不写也照样绿）
-- `npm test` 七套 250+ 项；`npm run test:exe` 覆盖打包后的桌面端专有能力
+- `npm test` 八套 280+ 项；`npm run test:exe` 覆盖打包后的桌面端专有能力
+
+---
+
+## 安全
+
+- **CSP 锁到 `'self'`**（`src-tauri/tauri.conf.json`）：没有 `'unsafe-inline'`、
+  没有 `unsafe-eval`，`object-src` / `base-uri` / `form-action` / `frame-ancestors` 全为 `'none'`。
+  这是**实测可用**的策略，不是照抄模板 —— 里面 `connect-src` 的 IPC 源、`font-src` 的 `data:`
+  都是踩过才知道必须有的。完整推导见 `docs/M13-打包成exe.md` 第七节。
+- CSP 设错的症状**不是报错**，是"某个功能悄悄没了"（worker 被拦 → pdf.js 静默退回主线程，
+  页面照常显示只是卡）。所以有独立的 `npm run test:csp`：**主动监听 `securitypolicyviolation`**，
+  并断言"0 违规"同时"内容真的画上去了"，避免白屏时的假绿。
+- 前端不引入任何第三方 CDN 资源，全部走本地打包。
+- 本仓库的 Git 历史做过隐私清理（提交元数据与文件内容），未包含个人信息。
 
 ---
 

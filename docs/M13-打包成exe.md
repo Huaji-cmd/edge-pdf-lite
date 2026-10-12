@@ -157,7 +157,64 @@ Info extracting WIX
 
 ---
 
-## 七、还没做的
+## 七、CSP：从 `null` 收紧到实测可用
+
+原先 `app.security.csp` 是 `null` —— 等于不设防。先确认生产构建的入口里
+**没有内联脚本、没有内联样式、没有内联 style 属性**（都验过），
+所以可以直接锁到 `'self'`，不必开 `'unsafe-inline'`。
+
+最终策略写成**对象形式**（比长字符串好读，也好被测试断言）：
+
+| 指令 | 值 | 为什么是这个 |
+|---|---|---|
+| `default-src` | `'self'` | 兜底，全锁自己 |
+| `connect-src` | `'self' ipc: http://ipc.localhost` | 🔴 **Tauri 不会自动注入 IPC 源**，得自己写。少了它，所有 `invoke` 命令（文件列表 / 读文件 / 保存）全部失败；官方 example 里也是手写的 |
+| `script-src` | `'self'` | 打包后只有一个外部 module script；Tauri 编译期还会额外注入 nonce/hash |
+| `style-src` | `'self'` | 见下 —— 为了不用 `'unsafe-inline'`，把唯一那处内联样式挪进了 CSS |
+| `img-src` | `'self' data:` | `data:` 给 pdf.js 的 SVG 图像（它走 FileReader 的 data URL） |
+| `font-src` | `'self' data:` | 🔴 **必需**。pdf.js 内嵌字体是用 `url(data:font/opentype;base64,…)` 喂给 `FontFace` 的，锁掉 `data:` 会让**所有带内嵌字体的 PDF 变空白** |
+| `worker-src` | `'self'` | worker 是 Vite 打出来的同源文件；`workerSrc` 补成绝对 URL 后走直连，不经过 blob 包装 |
+| `object-src` / `base-uri` / `form-action` / `frame-ancestors` | `'none'` | 一样都不需要 |
+
+⚠️ `devCsp` 单独给了宽松版（`'unsafe-inline'` + HMR 用的 `ws://localhost:5173`）：
+dev 下 Vite 是用 JS 动态插 `<style>` 的，跟生产不是一回事，混用会把 `tauri dev` 打坏。
+
+### 为了让 `style-src` 不带 `'unsafe-inline'` 而改的一处
+
+`index.html` 里的图标 sprite 原本是 `<svg style="display: none">`。
+**内联 style 属性归 `style-src-attr` 管** —— 为这一行就得给整站开 `'unsafe-inline'`，
+等于把样式防护全关掉，代价远大于收益。现在改成 `.icon-sprite { display: none }`
+（写在 `base.css`）。顺带一提：里面只有 `<symbol>`，symbol 本来就不渲染，没有闪烁风险。
+
+### 顺手记一条：不要开 `freezePrototype`
+
+`app.security.freezePrototype` 看着很香（防原型污染），但**这个项目不能用**：
+`src/pdfjs/polyfills.ts` 干的就是往 `Uint8Array.prototype` 上补 ES2025 方法，
+原型一冻结，pdf.js 在旧浏览器上直接崩。
+
+### 验证：`npm run test:csp`（25 项，已进 `npm test`）
+
+CSP 设错的症状**不是报错**，而是"某个功能悄悄没了" —— worker 被拦时 pdf.js 会
+**静默退回主线程**（页面照常显示，只是卡几百毫秒）。所以测试**主动监听
+`securitypolicyviolation`**，并把真实配置里的策略当**响应头**喂给 `dist/`
+（Tauri 也是加响应头，不是塞 meta）。
+
+⚠️ 两个"必须有牙"的判据，缺一个就是假绿：
+
+- 只断言"0 违规"不够 —— 页面整个白屏时违规数同样是 0
+  → 必须同时断言**画布上真的有内容**（读像素，非白占比 > 0）。
+- 光点"保存"不够 —— **没有批注时它会直接返回**（"还没有批注"），
+  writer 的动态 import 根本不会发生 → 必须先**真的画一条高亮**，
+  再断言下载出来的东西是 `%PDF-`。
+
+**浏览器侧覆盖不到 IPC**：这个测试跑在 http 上，`connect-src` 里的
+`ipc:` / `http://ipc.localhost` 压根用不到。那一层只有
+**打包后的 exe**（WebView2 + `http://tauri.localhost`）才真正走，
+所以要靠 `npm run test:exe` 兜 —— 两条都要绿才叫验证过。
+
+---
+
+## 八、还没做的
 
 - **文件列表的桌面版能力**：真实路径、跨会话记住列表、目录懒加载（`fs.readDir`）
   —— 目前只有浏览器版（会话内列表 + 界面上的降级提示），
