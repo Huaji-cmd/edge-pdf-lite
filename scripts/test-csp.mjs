@@ -48,7 +48,7 @@ if (!EDGE) {
 }
 for (const [p, hint] of [
   [DIST, '先跑一次：npm run build'],
-  [PDF, '先跑一次：npm run testdata'],
+  [PDF, '先跑一次：npm run testdata:real（这份真实论文语料不入库）'],
 ]) {
   if (!existsSync(p)) {
     console.error(`找不到 ${p}\n${hint}`)

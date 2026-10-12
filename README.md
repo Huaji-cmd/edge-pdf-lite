@@ -37,8 +37,35 @@
 
 ```bash
 npm install          # postinstall 会自动拷 pdf.js 的 cmaps / 标准字体
-npm run testdata     # 生成测试用的 PDF 样本
 npm run dev          # http://localhost:5173
+```
+
+想跑测试的话，先把样本备齐：
+
+```bash
+npm run testdata         # = testdata:local + 取回真实论文语料（一条命令搞定）
+npm run testdata:local   # 只生成合成样本，不联网
+npm run testdata:real    # 只取回真实论文语料（arXiv，约 2.2 MB）
+```
+
+`public/testdata/` 整体**不入库**：
+
+- 合成样本（文字页 / 矢量页 / 对照实验样本）由脚本当场生成；
+- 「真实论文语料」按需取回 —— 它是 arXiv 电子预印本，**没有再分发的授权**，
+  放进仓库等于替别人分发。测试用它是有理由的：合成样本验证不了真实文档的页面构成
+  （内嵌字体 + 整页图片 + 上百条既有注释），好几个决定性结论都只能在它上面测出来。
+
+拿不到 arxiv.org 的时候（公司/校园网常见）：
+
+```bash
+EPL_REAL_PDF_URL=<镜像地址> npm run testdata:real
+```
+
+或者**直接把你手边任意一份真实 PDF 改名放过去** —— 测试不检查它的内容，
+只要"有文字层、有图片"就够：
+
+```
+public/testdata/real-1706.03762.pdf
 ```
 
 ### 打包

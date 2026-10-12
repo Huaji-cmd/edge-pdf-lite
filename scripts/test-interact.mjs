@@ -41,7 +41,11 @@ if (!EDGE) {
   process.exit(1)
 }
 if (!existsSync(PDF)) {
-  console.error(`找不到测试 PDF：${PDF}\n先跑 node scripts/make-testdata.mjs`)
+  console.error(
+    `找不到测试 PDF：${PDF}\n` +
+      '先跑一次：npm run testdata:real\n' +
+      '（这份「真实论文语料」不入库 —— 脚本会告诉你手动放一份也行）',
+  )
   process.exit(1)
 }
 if (!existsSync(SCAN)) {
