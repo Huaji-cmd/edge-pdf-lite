@@ -1,44 +1,68 @@
+# ------------------------------------------------------------------ 依赖 / 构建产物
 node_modules/
 dist/
 dist-ssr/
-*.local
-.DS_Store
-.vscode/*
-!.vscode/extensions.json
-.idea
-
-# 由 scripts/copy-pdfjs-assets.mjs 生成，不入库
-public/cmaps/
-public/standard_fonts/
-
-# 由 scripts/make-testdata.mjs 生成，不入库
-public/testdata/
-
-# Tauri
-src-tauri/target/
-
-# 本地私密文件：绝不要提交
-*.bak
-*.epl.json
-.env
-.env.*
-!.env.example
-spike-out/
-*.log
 *.tsbuildinfo
 
-# 各套端到端测试的截图产物，不入库
+# ------------------------------------------------------------------ 自动生成，别入库
+# 由 scripts/copy-pdfjs-assets.mjs（postinstall）拷进来
+public/cmaps/
+public/standard_fonts/
+# 由 npm run testdata 生成（几 MB 的测试样本，随时可重建）
+public/testdata/
+
+# ------------------------------------------------------------------ Tauri / 打包
+# ⚠️ .gitignore **不支持行尾注释**（`#` 只有顶行首才作注释）——
+#    写成 `foo/  # 说明` 会让规则变成"匹配字面量 foo/  # 说明"，规则静默失效。
+#    所以下面所有说明都单独占一行。
+# target/ 是 Rust 构建缓存（本机 3.8 GB，重建要几分钟）
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# ------------------------------------------------------------------ 测试产物
+# 端到端测试跑出来的截图（含 PDF 页面，量大且每次都变）
 viewer-shots/
 annot-shots/
 writer-shots/
 interact-shots/
 touch-shots/
-
-# WorkBuddy 工作区数据：含会话记忆与**本机内网 IP**等隐私，不入库
-# ⚠️ 这个目录本身不要删，只是不让它进版本库
-.workbuddy/
 preview-shots/
-
-# 一次被中断的构建留下的残骸（等清空护栏允许时再删）
-dist-broken/
 exe-shots/
+spike-out/
+
+# ------------------------------------------------------------------ 编辑器 / 系统
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.swp
+.DS_Store
+Thumbs.db
+*.local
+
+# ------------------------------------------------------------------ 🔴 隐私 / 凭据
+#
+# 这个仓库要公开，下面这些**提交上去就等于泄露**。
+# 原则：凡是带机器相关信息或密钥的，一律不进版本库。
+#
+# ⚠️ .workbuddy/ 只是不入库，**目录本身不要删** —— 它是项目长期笔记的存放处
+# 它含**本机内网 IP**、会话记忆
+.workbuddy/
+# 运行日志里可能带绝对路径
+*.log
+# 保存批注时自动留的备份，可能是私人文档
+*.bak
+*.epl.json
+.env
+.env.*
+!.env.example
+
+# 代码签名（以后给 exe 签名时会出现，绝不能提交）
+*.pfx
+*.p12
+*.pem
+*.key
+*.keystore
+*.jks
+secrets.*
+*credentials*
+tauri.conf.local.json

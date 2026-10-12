@@ -16,6 +16,12 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+/*
+ * ⚠️ 默认值只能是 localhost —— 仓库要开源，**内网 IP 属于隐私**，
+ *    之前这里写死过一台机器的真实地址，后来从历史里也抹掉了。
+ *    要测另一台机器就从命令行传：
+ *      node scripts/probe-worker.mjs http://<那台机器的IP>:4173/spike.html
+ */
 const TARGET_URL = process.argv[2] ?? 'http://127.0.0.1:4173/spike.html'
 const PORT = Number(process.env.EPL_PORT ?? 9399)
 const WORKER_PATH = '/assets/pdfWorker-BP-Dpq4t.js'
