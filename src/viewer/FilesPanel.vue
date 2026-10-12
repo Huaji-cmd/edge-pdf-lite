@@ -6,18 +6,22 @@
  *    列表只活在本次会话，刷新就没。原因是 `<input type=file>` 只给临时
  *    File 对象，拿不到真实路径。（打包成 exe 后才有路径，才能持久化）
  */
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref } from 'vue'
 import Icon from './Icon.vue'
 import {
   addFiles,
   addFolder,
   addFilesViaDialog,
   addFolderViaDialog,
+  copyPath,
   loadChildren,
   removeNode,
+  renameFile,
+  splitExt,
   type FileNode,
 } from './fileList'
 import { IS_TAURI } from '@/platform'
+import { revealInFolder } from './settings'
 
 const props = defineProps<{
   nodes: readonly FileNode[]
@@ -32,6 +36,8 @@ const emit = defineEmits<{
   open: [node: FileNode]
   /** 列表内容变了 */
   change: []
+  /** 弹个提示（重命名成败、复制结果这类反馈） */
+  toast: [msg: string]
 }>()
 
 // ---------------- 展开状态（这是纯 UI 状态，不是"懒加载完成了"）
@@ -111,16 +117,108 @@ function onFolderPicked(e: Event): void {
 
 // ---------------- 右键菜单
 
-const menu = ref<{ x: number; y: number } | null>(null)
+/**
+ * 菜单有两种内容：`node` 为空 = 在空白处右键（添加文件/文件夹）；
+ * `node` 非空 = 在某个**文件**上右键（重命名 / 打开位置 / 复制路径）。
+ *
+ * ⚠️ 行上的右键必须 `stopPropagation`，否则会冒泡到面板空白处的处理器 ——
+ *    那样在文件上右键也会弹出"添加文件"，看着像菜单点错了。
+ */
+const menu = ref<{ x: number; y: number; node: FileNode | null } | null>(null)
 
-function openMenu(e: MouseEvent): void {
-  e.preventDefault()
+function menuPos(e: MouseEvent): { x: number; y: number } {
   // 菜单要贴着鼠标，但不能超出右/下边界
-  menu.value = { x: Math.min(e.clientX, window.innerWidth - 170), y: Math.min(e.clientY, window.innerHeight - 90) }
+  return {
+    x: Math.min(e.clientX, window.innerWidth - 180),
+    y: Math.min(e.clientY, window.innerHeight - 150),
+  }
+}
+
+function openBlankMenu(e: MouseEvent): void {
+  e.preventDefault()
+  menu.value = { ...menuPos(e), node: null }
+}
+
+function openFileMenu(e: MouseEvent, n: FileNode): void {
+  e.preventDefault()
+  e.stopPropagation()
+  // 文件夹暂时没有自己的操作，就不弹菜单了（弹一个只有"添加"的菜单更奇怪）
+  if (n.kind !== 'file') return
+  menu.value = { ...menuPos(e), node: n }
 }
 
 function closeMenu(): void {
   menu.value = null
+}
+
+// ---------------- 文件操作（都要真实路径，浏览器版没有）
+
+/** 某个条目能不能做"改磁盘文件"这类操作 */
+function hasPath(n: FileNode): boolean {
+  return IS_TAURI && !!n.path
+}
+
+async function onReveal(n: FileNode): Promise<void> {
+  closeMenu()
+  if (!(await revealInFolder(n.path ?? ''))) emit('toast', `打不开：${n.path ?? '（没有路径）'}`)
+}
+
+async function onCopyPath(n: FileNode): Promise<void> {
+  closeMenu()
+  const ok = await copyPath(n)
+  // ⚠️ 复制成功/失败都要给反馈：剪贴板是"看不见"的操作，
+  //    一声不响的话用户不知道到底成没成（而且失败时他会以为程序坏了）
+  emit('toast', ok ? `已复制路径：${n.path}` : '复制失败，可能是浏览器不允许访问剪贴板')
+}
+
+// ---------------- 重命名
+
+const renaming = ref<string | null>(null)
+const renameDraft = ref('')
+
+/**
+ * 重命名输入框的引用。
+ *
+ * ⚠️ **不能用字符串 ref**（`ref="renameInput"`）：它在 `v-for` 里，
+ *    Vue 会把同名 ref 收集成**数组**，于是 `.focus()` 报
+ *    "value?.focus is not a function" —— 而且这条错误只在控制台里，
+ *    界面上表现为"点了重命名但没聚焦，得再点一下输入框"，很容易被当成小毛病放过。
+ *    改用**函数 ref** 就不会有这层歧义。
+ */
+let renameInput: HTMLInputElement | null = null
+function bindRenameInput(el: unknown): void {
+  renameInput = (el as HTMLInputElement | null) ?? null
+}
+
+async function startRename(n: FileNode): Promise<void> {
+  closeMenu()
+  renaming.value = n.id
+  renameDraft.value = splitExt(n.name).base // 只改主文件名，后缀由代码拼回
+  await nextTick()
+  // 自动聚焦并全选 —— 不然用户还得再点一下输入框才能改
+  renameInput?.focus()
+  renameInput?.select()
+}
+
+function cancelRename(): void {
+  renaming.value = null
+}
+
+async function commitRename(n: FileNode): Promise<void> {
+  // ⚠️ Esc 之后还会再触发一次 blur，靠这行挡掉第二次提交
+  const id = renaming.value
+  if (id !== n.id) return
+  renaming.value = null
+
+  const r = await renameFile(n, renameDraft.value)
+  if (!r.ok) {
+    emit('toast', `重命名失败：${r.error ?? '未知错误'}`)
+    return
+  }
+  if (r.name && r.name !== n.name) {
+    emit('toast', `已重命名为 ${r.name}`)
+    emit('change')
+  }
 }
 
 /**
@@ -175,7 +273,7 @@ const rows = computed(() => {
 </script>
 
 <template>
-  <div class="files" data-tid="files-panel" @contextmenu="openMenu" @click="closeMenu">
+  <div class="files" data-tid="files-panel" @contextmenu="openBlankMenu" @click="closeMenu">
     <!-- 隐藏的文件选择器：右键菜单点完才触发 -->
     <input
       ref="fileInput"
@@ -210,6 +308,7 @@ const rows = computed(() => {
         :data-kind="r.node.kind"
         :title="r.node.name"
         @click.stop="openNode(r.node)"
+        @contextmenu.stop="openFileMenu($event, r.node)"
       >
         <span v-if="r.node.kind === 'folder'" class="twisty" :class="{ open: isOpen(r.node.id) }">
           <Icon name="chevron-right" />
@@ -217,7 +316,26 @@ const rows = computed(() => {
         <span v-else class="twisty" />
 
         <Icon :name="r.node.kind === 'folder' ? 'folder' : 'file'" class="leaf" />
-        <span class="name">{{ r.node.name }}</span>
+
+        <!--
+          重命名：行内编辑，**只编辑主文件名**，后缀拼在旁边当固定后缀显示。
+          这样"不允许改后缀"是界面本身就说清楚的事，不是靠报错拦。
+        -->
+        <span v-if="renaming === r.node.id" class="ren-wrap">
+          <input
+            :ref="bindRenameInput"
+            v-model="renameDraft"
+            class="ren"
+            data-tid="rename-input"
+            @keydown.enter.prevent="commitRename(r.node)"
+            @keydown.esc.prevent="cancelRename()"
+            @blur="commitRename(r.node)"
+            @click.stop
+          />
+          <span class="ren-ext">{{ splitExt(r.node.name).ext }}</span>
+        </span>
+        <span v-else class="name">{{ r.node.name }}</span>
+
         <span v-if="loading.has(r.node.id)" class="busy" title="正在读这一层…">…</span>
 
         <button
@@ -230,26 +348,57 @@ const rows = computed(() => {
       </div>
     </template>
 
-    <p class="hint">
-      <template v-if="!IS_TAURI">
-        浏览器版：这里的条目只在本次会话有效，<b>刷新后要重新添加</b>（浏览器拿不到文件真实路径）。
-      </template>
-      <template v-else>桌面版：列表会记住，下次打开还在。</template>
+    <!--
+      桌面版不再写"列表会记住" —— 那是**默认行为**，说出来反而是噪音
+      （用户要求删）。浏览器版那条限制说明保留：它是"会丢东西"的警告，
+      不说用户真的会以为下次还在。
+    -->
+    <p v-if="!IS_TAURI" class="hint">
+      浏览器版：这里的条目只在本次会话有效，<b>刷新后要重新添加</b>（浏览器拿不到文件真实路径）。
     </p>
 
-    <!-- 右键菜单 -->
+    <!-- 右键菜单：空白处 vs 文件上，内容不同 -->
     <div
       v-if="menu"
       class="ctx"
       :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
       @click.stop
     >
-      <button data-tid="add-files" @click="menuPick('file')">
-        <Icon name="file" /> 添加文件…
-      </button>
-      <button data-tid="add-folder" @click="menuPick('folder')">
-        <Icon name="folder" /> 添加文件夹…
-      </button>
+      <template v-if="!menu.node">
+        <button data-tid="add-files" @click="menuPick('file')">
+          <Icon name="file" /> 添加文件…
+        </button>
+        <button data-tid="add-folder" @click="menuPick('folder')">
+          <Icon name="folder" /> 添加文件夹…
+        </button>
+      </template>
+
+      <template v-else>
+        <button
+          data-tid="file-rename"
+          :disabled="!hasPath(menu.node)"
+          :title="hasPath(menu.node) ? '改名（后缀不会变）' : '浏览器版没有真实路径，改不了磁盘上的文件名'"
+          @click="startRename(menu.node)"
+        >
+          <Icon name="file" /> 重命名…
+        </button>
+        <button
+          data-tid="file-reveal"
+          :disabled="!hasPath(menu.node)"
+          :title="hasPath(menu.node) ? '在资源管理器里显示' : '浏览器版没有真实路径'"
+          @click="onReveal(menu.node)"
+        >
+          <Icon name="folder-open" /> 在资源管理器打开
+        </button>
+        <button
+          data-tid="file-copy-path"
+          :disabled="!hasPath(menu.node)"
+          :title="hasPath(menu.node) ? '复制磁盘上的绝对路径' : '浏览器版没有真实路径'"
+          @click="onCopyPath(menu.node)"
+        >
+          <Icon name="file" /> 复制路径
+        </button>
+      </template>
     </div>
   </div>
 </template>
@@ -347,6 +496,31 @@ const rows = computed(() => {
   white-space: nowrap;
 }
 
+/* 重命名：输入框后面紧跟一个灰掉的后缀 —— 视觉上就说明了"后缀改不了" */
+.ren-wrap {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+}
+.ren {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0 4px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+.ren-ext {
+  flex: 0 0 auto;
+  font-size: 13px;
+  color: var(--dim-2);
+}
+
 .rm {
   flex: 0 0 auto;
   width: 18px;
@@ -411,6 +585,17 @@ const rows = computed(() => {
 }
 .ctx button:hover {
   background: var(--btn);
+}
+/*
+ * 禁用的项要**看得出来是禁用的** —— 光是点了没反应，用户会以为程序坏了。
+ * 浏览器版这三个操作都需要真实路径，做不到就得当场说清（title 里也写了原因）。
+ */
+.ctx button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.ctx button:disabled:hover {
+  background: none;
 }
 .ctx :deep(.ic) {
   width: 15px;

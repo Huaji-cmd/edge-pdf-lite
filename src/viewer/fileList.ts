@@ -206,6 +206,70 @@ export async function stillExists(node: FileNode): Promise<boolean> {
   }
 }
 
+// ---------------------------------------------------------------- 文件级操作（都要真实路径）
+
+/**
+ * 把主文件名和后缀拆开。
+ *
+ * 重命名的交互**只让用户编辑前半段**，后缀由代码拼回去 ——
+ * 这样"不允许改后缀"是**结构上的保证**，而不是"改完再校验、报错"
+ * （那种做法里用户已经白输一遍了）。
+ */
+export function splitExt(name: string): { base: string; ext: string } {
+  const i = name.lastIndexOf('.')
+  return i > 0 ? { base: name.slice(0, i), ext: name.slice(i) } : { base: name, ext: '' }
+}
+
+export interface RenameResult {
+  ok: boolean
+  name?: string
+  error?: string
+}
+
+/**
+ * 重命名 —— **真的改磁盘上的文件名**。
+ *
+ * 失败时返回错误文案（不抛），让 UI 直接显示：
+ * 重命名是用户主动发起的小操作，抛异常只会在控制台留一条没人看的记录。
+ */
+export async function renameFile(node: FileNode, newBase: string): Promise<RenameResult> {
+  const base = newBase.trim()
+  if (!base) return { ok: false, error: '名字不能为空' }
+  // ⚠️ Windows 文件名禁字符。不在这里拦的话，Rust 会抛一个看不懂的 OS 错误
+  if (/[\\/:*?"<>|]/.test(base)) {
+    return { ok: false, error: '名字里不能有 \\ / : * ? " < > |' }
+  }
+  const { ext } = splitExt(node.name)
+  const newName = base + ext
+  if (newName === node.name) return { ok: true, name: newName }
+
+  if (!IS_TAURI || !node.path) {
+    return { ok: false, error: '浏览器版没有真实路径，改不了磁盘上的文件名' }
+  }
+  try {
+    const p = await invoke<string>('rename_file', { path: node.path, newName })
+    node.name = newName
+    node.path = p
+    node.key = `p:${p}`
+    persistList()
+    return { ok: true, name: newName }
+  } catch (e) {
+    // ⚠️ Tauri 抛的可能是字符串也可能是 Error，统一 String() 一下
+    return { ok: false, error: String(e) }
+  }
+}
+
+/** 复制绝对路径到剪贴板（就一串路径，不做别的加工） */
+export async function copyPath(node: FileNode): Promise<boolean> {
+  if (!node.path) return false
+  try {
+    await navigator.clipboard.writeText(node.path)
+    return true
+  } catch {
+    return false
+  }
+}
+
 // ---------------------------------------------------------------- 添加（浏览器端）
 
 /** 递归数一共多少个**文件**（文件夹不算） */

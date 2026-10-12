@@ -505,9 +505,24 @@ function goToDest(p: number, top: number | null): void {
   void viewerRef.value?.goToDestination(p, top)
 }
 
-/** 点顶栏的面板图标：切过去，并顺带把侧边栏打开（关着的时候点它没有意义） */
+/**
+ * 进入设置之前所在的面板 —— 再点一次齿轮就退回这里。
+ *
+ * ⚠️ 用 **watch** 维护，而不是"点齿轮那一刻记一下"：
+ *    这样从设置里点顶栏的「目录」切走时，记忆也会跟着更新 ——
+ *    `文件 → 设置 → 目录 → 再点设置` 应该回到**目录**，不是文件。
+ */
+let panelBeforeSettings: SidePanelKind = 'files'
+watch(panel, (p) => {
+  if (p !== 'settings') panelBeforeSettings = p
+})
+
+/**
+ * 切面板。设置是**可来回切**的：已经在设置里了，再点一次就退回上一个面板
+ * （否则用户进了设置就出不来，除非去顶栏重新点一次）。
+ */
 function setPanel(p: SidePanelKind): void {
-  panel.value = p
+  panel.value = p === 'settings' && panel.value === 'settings' ? panelBeforeSettings : p
   sideOpen.value = true
 }
 

@@ -138,7 +138,15 @@ ws.addEventListener('message', (ev) => {
     errors.push(m.params?.exceptionDetails?.text ?? 'unknown')
   }
   if (m.method === 'Runtime.consoleAPICalled' && m.params?.type === 'error') {
-    errors.push(String(m.params.args?.[0]?.value ?? 'console error'))
+    // ⚠️ console.error(x) 的 x 可能是对象/Error —— 只取 value 会得到 undefined，
+    //    于是错误变成一条没有内容的 "console error"，根本看不出是什么坏了
+    const a = m.params.args?.[0]
+    const txt =
+      a?.value ??
+      a?.description ??
+      a?.preview?.properties?.map((p) => `${p.name}=${p.value}`).join(' ') ??
+      '（无内容的 console error）'
+    errors.push(String(txt))
   }
 })
 
@@ -598,8 +606,108 @@ if (existsSync(bakPath)) {
 const shot6 = await send('Page.captureScreenshot', { format: 'png' })
 await writeFile(resolve(SHOTS, '03-exe-saved.png'), Buffer.from(shot6.data, 'base64'))
 
-// ---------------------------------------------------------------- 7. 控制台
-console.log('\n[7] 控制台')
+// ---------------------------------------------------------------- 7. 文件的右键菜单
+console.log('\n[7] 文件右键：重命名 / 复制路径 / 在资源管理器打开')
+
+const REN_SRC = join(SAVE_DIR, 'rename-me.pdf')
+await copyFile(PDF, REN_SRC)
+await evaluate(`
+  localStorage.setItem('epl:file-list', JSON.stringify([
+    { name: 'rename-me.pdf', path: ${JSON.stringify(REN_SRC)}, kind: 'file' },
+  ]))
+`)
+await send('Page.reload')
+await sleep(2600)
+await evaluate(clickByTidExpr('文件'))
+await sleep(700)
+
+const ctxOnFile = () =>
+  evaluate(`
+    (() => {
+      const row = document.querySelector('[data-tid="files-panel"] [data-kind="file"]');
+      if (!row) return false;
+      const r = row.getBoundingClientRect();
+      row.dispatchEvent(new MouseEvent('contextmenu', {
+        bubbles: true, cancelable: true,
+        clientX: Math.round(r.left + 40), clientY: Math.round(r.top + r.height / 2),
+      }));
+      return true;
+    })()
+  `)
+
+await ctxOnFile()
+await sleep(320)
+check(
+  '桌面端右键文件，三项都可用（有真实路径，跟浏览器版的禁用相反）',
+  await evaluate(`
+    ['file-rename', 'file-reveal', 'file-copy-path'].every((i) => {
+      const b = document.querySelector('[data-tid="' + i + '"]');
+      return b && !b.disabled;
+    })
+  `),
+)
+{
+  const s = await send('Page.captureScreenshot', { format: 'png' })
+  await writeFile(resolve(SHOTS, '04-exe-file-menu.png'), Buffer.from(s.data, 'base64'))
+}
+
+// ---- 重命名
+await evaluate(`document.querySelector('[data-tid="file-rename"]').click()`)
+await sleep(380)
+check('出现行内输入框（不是弹对话框 —— 对话框在 CDP 下会把页面卡住）', await evaluate(`!!document.querySelector('[data-tid="rename-input"]')`))
+const draft = await evaluate(`document.querySelector('[data-tid="rename-input"]')?.value ?? ''`)
+check('输入框里只有主文件名，后缀不在编辑范围内', draft === 'rename-me', `"${draft}"`)
+/*
+ * 必须断言**自动聚焦**：字符串 ref 在 v-for 里会变成数组，`.focus()` 于是报错，
+ * 而这条错误只在控制台里，界面上只是"没聚焦"—— 很容易被当成小毛病放过。
+ */
+check(
+  '输入框自动聚焦了（不用再点一下才能改）',
+  await evaluate(`document.activeElement === document.querySelector('[data-tid="rename-input"]')`),
+  await evaluate(`document.activeElement?.getAttribute?.('data-tid') ?? document.activeElement?.tagName`),
+)
+check(
+  '内容被全选了（直接打字就能覆盖原名字）',
+  await evaluate(`
+    (() => {
+      const i = document.querySelector('[data-tid="rename-input"]');
+      return i.selectionStart === 0 && i.selectionEnd === i.value.length && i.value.length > 0;
+    })()
+  `),
+)
+
+await evaluate(`
+  (() => {
+    const i = document.querySelector('[data-tid="rename-input"]');
+    i.value = 'renamed-ok';
+    i.dispatchEvent(new Event('input', { bubbles: true }));
+    i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  })()
+`)
+await sleep(1000)
+const REN_DST = join(SAVE_DIR, 'renamed-ok.pdf')
+check('磁盘上的文件**真的**改名了', await invoke('path_exists', { path: REN_DST }))
+check('是改名不是复制（原名已经不在了）', !(await invoke('path_exists', { path: REN_SRC })))
+check(
+  '后缀没被改（还是 .pdf）',
+  /\.pdf$/i.test(await evaluate(`document.querySelector('[data-tid="files-panel"]').textContent.match(/renamed-ok[^\\s]*/)?.[0] ?? ''`)),
+  await evaluate(`document.querySelector('[data-tid="files-panel"]').textContent.match(/renamed-ok[^\\s]*/)?.[0] ?? '（没找到）'`),
+)
+
+// ---- 复制路径：剪贴板在 CDP 里可能被拒，但**无论如何都要有反馈**
+await ctxOnFile()
+await sleep(320)
+await evaluate(`document.querySelector('[data-tid="file-copy-path"]').click()`)
+await sleep(600)
+const cpToast = await evaluate(`(document.querySelector('.toast') || {}).textContent || ''`)
+check(
+  '复制路径给了反馈（剪贴板是看不见的操作，静默=不知道成没成）',
+  /已复制路径|复制失败/.test(cpToast),
+  cpToast.replace(/\s+/g, ' ').slice(0, 80),
+)
+
+// ---------------------------------------------------------------- 8. 控制台
+console.log('\n[8] 控制台')
 const real = errors.filter((e) => !/favicon/i.test(e))
 check('没有未捕获异常 / error', real.length === 0, real.slice(0, 3).join(' | ') || '干净')
 

@@ -65,10 +65,9 @@ function pick(node: FileNode): void {
       />
     </div>
 
-    <p v-if="!q.trim()" class="tip">
-      输入关键词，在文件列表里匹配**文件名**。<br />
-      （不搜内容：扫描件没有文本层，搜不出东西会让人以为坏了）
-    </p>
+    <!-- 只留一句"按文件名搜"。原来还解释了为什么不搜正文 —— 那是设计理由，
+         不是用户要读的信息（用户要求删）。 -->
+    <p v-if="!q.trim()" class="tip">输入关键词，按文件名搜索。</p>
 
     <p v-else-if="!hits.length" class="tip">没有匹配的文件</p>
 

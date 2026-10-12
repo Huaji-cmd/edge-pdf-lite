@@ -158,6 +158,44 @@ fn backup_path(path: &str) -> std::path::PathBuf {
     out
 }
 
+/*
+ * 重命名（**真的改磁盘上的文件名**）。
+ *
+ * ⚠️ `new_name` 必须带后缀，且后缀要与原来一致 —— 前端只让用户编辑主文件名、
+ *    再自己拼回原后缀，所以到这里两者必然一致。这里再校验一次是为了防御：
+ *    万一传了个新后缀进来，改完就打不开了（pdf.js 按扩展名找 mime 之外的场景
+ *    还有一堆），宁可直接报错。
+ *
+ * ⚠️ 目标已存在时不覆盖 —— 那会静默毁掉另一个文件。
+ */
+#[tauri::command]
+fn rename_file(path: String, new_name: String) -> Result<String, String> {
+    let p = Path::new(&path);
+    let old_ext = p
+        .extension()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let new_ext = Path::new(&new_name)
+        .extension()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if old_ext != new_ext {
+        return Err(format!("不能改后缀（{} → {}）", old_ext, new_ext));
+    }
+
+    let dir = p
+        .parent()
+        .ok_or_else(|| format!("拿不到所在目录：{}", path))?;
+    let target = dir.join(&new_name);
+    if target.exists() {
+        return Err(format!("已经有一个 {} 了", new_name));
+    }
+
+    std::fs::rename(&path, &target)
+        .map_err(|e| format!("重命名失败（原文件没动）：{}", e))?;
+    Ok(target.to_string_lossy().into_owned())
+}
+
 /// 在文件管理器里选中这个文件（Windows 自带 explorer，不用额外插件）
 #[tauri::command]
 fn reveal_in_folder(path: String) -> Result<(), String> {
@@ -215,7 +253,8 @@ pub fn run() {
             path_exists,
             default_save_dir,
             write_pdf_b64,
-            reveal_in_folder
+            reveal_in_folder,
+            rename_file
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");

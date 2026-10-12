@@ -438,6 +438,55 @@ try {
   )
   await shot('03c-files-opened')
 
+  // ---- 在**文件行**上右键（不是空白处）—— 内容应该是"对这个文件能做什么"
+  await evaluate(`
+    (() => {
+      const row = document.querySelector('[data-tid="files-panel"] [data-kind="file"]');
+      const r = row.getBoundingClientRect();
+      row.dispatchEvent(new MouseEvent('contextmenu', {
+        bubbles: true, cancelable: true,
+        clientX: Math.round(r.left + 40), clientY: Math.round(r.top + r.height / 2),
+      }));
+    })()
+  `)
+  await sleep(260)
+  check(
+    '在文件上右键弹出的是**文件**菜单，不是「添加文件」',
+    await evaluate(`
+      !!document.querySelector('[data-tid="file-rename"]') &&
+      !document.querySelector('[data-tid="add-files"]')
+    `),
+  )
+  check(
+    '菜单里有：重命名 / 在资源管理器打开 / 复制路径',
+    await evaluate(`
+      !!document.querySelector('[data-tid="file-rename"]') &&
+      !!document.querySelector('[data-tid="file-reveal"]') &&
+      !!document.querySelector('[data-tid="file-copy-path"]')
+    `),
+  )
+  check(
+    '浏览器版这三项目前都禁用，并写清了原因（需要真实路径）',
+    await evaluate(`
+      (() => {
+        const ids = ['file-rename', 'file-reveal', 'file-copy-path'];
+        const all = ids.map(i => document.querySelector('[data-tid="' + i + '"]'));
+        return all.every(b => b && b.disabled) &&
+               /真实路径/.test(all[0].title);
+      })()
+    `),
+  )
+  await shot('03c-file-menu')
+  await evaluate(`document.querySelector('[data-tid="files-panel"]').click()`)
+  await sleep(200)
+
+  check(
+    '文件面板不再有「列表会记住」那句（默认行为不用讲出来）',
+    !(await evaluate(
+      `/列表会记住/.test(document.querySelector('[data-tid="files-panel"]')?.textContent || '')`,
+    )),
+  )
+
   // ---- 搜索（只匹配文件名）
   check('切到「搜索」面板', await toolbarBtn('搜索'))
   await sleep(320)
@@ -557,6 +606,45 @@ try {
   await sleep(300)
   check('点「夜间」切回 dark', (await themeOf()) === 'dark')
   check('切回后背景色也回到原值', (await bgOf()) === bg0, `${await bgOf()} vs ${bg0}`)
+
+  /*
+   * 设置是**可以来回切**的：再点一次齿轮退回进设置之前的那个面板。
+   * 之前用户进了设置就出不来了（只能去顶栏重点一次别的面板）。
+   */
+  // ⚠️ 先把面板显式切到「文件」再测：这条断言依赖"进设置前的那个面板"，
+  //    不写死前置状态的话，它会跟着上一段结束时的面板漂移
+  await toolbarBtn('文件')
+  await sleep(320)
+  await toolbarBtn('设置')
+  await sleep(320)
+  await toolbarBtn('设置')
+  await sleep(320)
+  check(
+    '再点一次设置 → 退回上一个面板（文件）',
+    (await evaluate(`!!document.querySelector('[data-tid="files-panel"]')`)) &&
+      !(await evaluate(`!!document.querySelector('[data-tid="save-mode-copy"]')`)),
+    `files=${await evaluate(`!!document.querySelector('[data-tid="files-panel"]')`)}`,
+  )
+
+  // 记忆要跟着更新：文件 → 设置 → 搜索 → 再点设置，应该回**搜索**
+  await toolbarBtn('设置')
+  await sleep(300)
+  await toolbarBtn('搜索')
+  await sleep(300)
+  await toolbarBtn('设置')
+  await sleep(300)
+  await toolbarBtn('设置')
+  await sleep(300)
+  check(
+    '记忆会更新：搜索 → 设置 → 再点设置回到搜索',
+    await evaluate(`!!document.querySelector('[data-tid="search-panel"]')`),
+  )
+  check(
+    '搜索面板不再有「不搜内容」那句解释（用户要求删）',
+    !(await evaluate(
+      `/不搜内容/.test(document.querySelector('[data-tid="search-panel"]')?.textContent || '')`,
+    )),
+  )
 
   await toolbarBtn('文件')
   await sleep(200)

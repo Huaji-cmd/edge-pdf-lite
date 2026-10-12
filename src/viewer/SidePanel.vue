@@ -58,6 +58,7 @@ const emit = defineEmits<{
         :busy="busy"
         @open="(n) => emit('open-file', n)"
         @change="emit('files-change')"
+        @toast="(m) => emit('toast', m)"
       />
       <SearchPanel
         v-else-if="panel === 'search'"
@@ -94,7 +95,7 @@ const emit = defineEmits<{
         class="gear"
         :class="{ on: panel === 'settings' }"
         data-tid="side-settings"
-        title="设置"
+        :title="panel === 'settings' ? '设置（再点一次回到上一个面板）' : '设置'"
         @click="emit('set-panel', 'settings')"
       >
         <Icon name="gear" />
