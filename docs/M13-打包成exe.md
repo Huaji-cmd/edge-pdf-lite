@@ -75,8 +75,9 @@ cat src-tauri/target/release/build/indexmap-*/output
 
 ## 三、另外三个坑（都不是"Tauri 不行"）
 
-1. **Git Bash 里 PATH 要用 `/d/your-tools/...`，不能用 `D:/your-tools/...`**
+1. **Git Bash 里给 PATH 加 Windows 路径要用 `/d/your-tools/...` 这种风格，写 `D:/your-tools/...` 不生效。**
    之前一直报 `cargo: command not found`，真因是这个，不是工具链装错。
+   （现在 `scripts/tauri.mjs` 已经会自动找工具链，不用手动配 PATH 了。）
 
 2. **`vite.config.ts` 里不能写 `minify: 'esbuild'`**
    本项目用的是 **rolldown 版 vite**，压根没装 esbuild 包。写了会报
