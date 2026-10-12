@@ -15,6 +15,8 @@ import FilesPanel from './FilesPanel.vue'
 import SearchPanel from './SearchPanel.vue'
 import OutlinePanel from './OutlinePanel.vue'
 import Thumbnails from './Thumbnails.vue'
+import SettingsPanel from './SettingsPanel.vue'
+import Icon from './Icon.vue'
 
 defineProps<{
   /** 当前显示哪个面板 */
@@ -39,6 +41,10 @@ const emit = defineEmits<{
   'open-file': [node: FileNode]
   /** 文件列表内容变了 */
   'files-change': []
+  /** 切到某个面板（底部齿轮用） */
+  'set-panel': [panel: SidePanelKind]
+  /** 设置面板要弹提示 */
+  toast: [msg: string]
 }>()
 </script>
 
@@ -74,6 +80,26 @@ const emit = defineEmits<{
         :current-page="currentPage"
         @go="(p) => emit('go-page', p)"
       />
+
+      <SettingsPanel v-else-if="panel === 'settings'" @toast="(m) => emit('toast', m)" />
+    </div>
+
+    <!--
+      底部：设置入口。
+      ⚠️ 它**不属于**任何一个面板，所以放在 .body 外面 ——
+         否则切到别的面板它就消失了，而"设置"应该随时能进。
+    -->
+    <div class="foot">
+      <button
+        class="gear"
+        :class="{ on: panel === 'settings' }"
+        data-tid="side-settings"
+        title="设置"
+        @click="emit('set-panel', 'settings')"
+      >
+        <Icon name="gear" />
+        <span>设置</span>
+      </button>
     </div>
   </aside>
 </template>
@@ -85,8 +111,8 @@ const emit = defineEmits<{
   display: flex;
   flex-direction: column;
   min-height: 0;
-  background: #171a20;
-  border-right: 1px solid #2b313a;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
 }
 
 /* ⚠️ 这里**不滚动** —— 滚动交给里面的面板自己，理由见文件头 */
@@ -99,6 +125,38 @@ const emit = defineEmits<{
 .body > * {
   flex: 1 1 auto;
   min-width: 0;
+}
+
+/* 底部常驻：跟着侧边栏一起收起，但不受面板切换影响 */
+.foot {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--line);
+  padding: 6px;
+}
+.gear {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.gear:hover {
+  background: var(--hover);
+  color: var(--fg);
+}
+.gear.on {
+  background: var(--sel-bg);
+  color: var(--sel-fg);
+}
+.gear :deep(svg) {
+  width: 16px;
+  height: 16px;
 }
 
 </style>

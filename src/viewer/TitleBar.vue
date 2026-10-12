@@ -96,8 +96,8 @@ function isOn(kind: SidePanelKind): boolean {
   height: 38px;
   display: flex;
   align-items: center;
-  background: #14161b;
-  border-bottom: 1px solid #2e333d;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
   user-select: none;
   -webkit-app-region: drag;
 }
@@ -121,7 +121,7 @@ function isOn(kind: SidePanelKind): boolean {
   min-width: 0;
   text-align: center;
   font-size: 12px;
-  color: #9aa3b2;
+  color: var(--dim);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -136,18 +136,18 @@ function isOn(kind: SidePanelKind): boolean {
   justify-content: center;
   padding: 0 7px;
   background: transparent;
-  color: #9aa3b2;
+  color: var(--dim);
   border: 0;
   border-radius: 5px;
   cursor: pointer;
 }
 .tb:hover {
-  background: #262b33;
-  color: #e6e8ec;
+  background: var(--btn);
+  color: var(--fg);
 }
 .tb.on {
-  background: #2b3d57;
-  color: #9ecbff;
+  background: var(--sel-bg);
+  color: var(--sel-fg);
 }
 
 .tb.win {
@@ -156,7 +156,7 @@ function isOn(kind: SidePanelKind): boolean {
   border-radius: 0;
 }
 .tb.win.close:hover {
-  background: #c0392b;
-  color: #fff;
+  background: var(--danger-solid);
+  color: var(--on-danger);
 }
 </style>

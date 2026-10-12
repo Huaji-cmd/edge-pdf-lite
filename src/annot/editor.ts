@@ -456,8 +456,13 @@ export class AnnotEditor {
     }
   }
 
-  /** 把当前选区变成标记类批注 */
-  private async commitMarkup(e: PointerEvent): Promise<void> {
+  /**
+   * 把当前选区变成标记类批注。
+   *
+   * ⚠️ 对外开放：触屏上选区是 PdfViewer 自己划出来的（见那里的 markupTouch），
+   *    划完要调这个来提交。鼠标仍然走 `pointerUp` 里的原生选区分支。
+   */
+  async commitMarkup(e: PointerEvent): Promise<void> {
     const tool = this.tool
     if (tool === 'none') return
     const loc = this.host.locate(e)

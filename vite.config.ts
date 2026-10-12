@@ -37,9 +37,6 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: fileURLToPath(new URL('./index.html', import.meta.url)),
-        // spike.html 也要进构建 —— 否则 npm run build 之后
-        // 拷到另一台机器上没有实验页可跑
-        spike: fileURLToPath(new URL('./spike.html', import.meta.url)),
         // 批注兼容性自检页：要拿到目标机上去跨查看器核对，同样必须进构建
         annotCheck: fileURLToPath(new URL('./annot-check.html', import.meta.url)),
         // 批注「写回 PDF」自检页：同样要能拿到目标机上跑

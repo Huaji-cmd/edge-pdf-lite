@@ -271,10 +271,10 @@ const rows = computed(() => {
   margin: 14px 10px;
   font-size: 12px;
   line-height: 1.9;
-  color: #6b7480;
+  color: var(--mute);
 }
 .empty b {
-  color: #9aa3b2;
+  color: var(--dim);
 }
 
 .row {
@@ -285,19 +285,19 @@ const rows = computed(() => {
   border-radius: 5px;
   cursor: pointer;
   font-size: 13px;
-  color: #e6e8ec;
+  color: var(--fg);
 }
 .row:hover {
-  background: #262b33;
+  background: var(--btn);
 }
 .row.cur {
-  background: #2b3d57;
-  color: #9ecbff;
+  background: var(--sel-bg);
+  color: var(--sel-fg);
 }
 
 .busy {
   flex: 0 0 auto;
-  color: #6b7480;
+  color: var(--mute);
   animation: pulse 1s ease-in-out infinite;
 }
 @keyframes pulse {
@@ -319,7 +319,7 @@ const rows = computed(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: #7d8695;
+  color: var(--dim-2);
   transition: transform 0.12s;
 }
 .twisty.open {
@@ -333,10 +333,10 @@ const rows = computed(() => {
 .leaf {
   width: 15px;
   height: 15px;
-  color: #7d8695;
+  color: var(--dim-2);
 }
 .row.cur .leaf {
-  color: #9ecbff;
+  color: var(--sel-fg);
 }
 
 .name {
@@ -357,7 +357,7 @@ const rows = computed(() => {
   background: none;
   border: 0;
   border-radius: 3px;
-  color: #7d8695;
+  color: var(--dim-2);
   cursor: pointer;
   padding: 0;
 }
@@ -365,8 +365,8 @@ const rows = computed(() => {
   display: inline-flex;
 }
 .rm:hover {
-  background: #3a2020;
-  color: #f87171;
+  background: var(--err-bg);
+  color: var(--err);
 }
 .rm :deep(.ic) {
   width: 12px;
@@ -377,10 +377,10 @@ const rows = computed(() => {
   margin: 14px 10px 0;
   font-size: 11px;
   line-height: 1.7;
-  color: #6b7480;
+  color: var(--mute);
 }
 .hint b {
-  color: #9aa3b2;
+  color: var(--dim);
 }
 
 .ctx {
@@ -388,10 +388,10 @@ const rows = computed(() => {
   z-index: 300;
   min-width: 160px;
   padding: 4px;
-  background: #0d0f13;
-  border: 1px solid #2e333d;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 8px 26px var(--shadow);
   display: flex;
   flex-direction: column;
 }
@@ -403,18 +403,18 @@ const rows = computed(() => {
   background: none;
   border: 0;
   border-radius: 5px;
-  color: #e6e8ec;
+  color: var(--fg);
   font: inherit;
   font-size: 12.5px;
   text-align: left;
   cursor: pointer;
 }
 .ctx button:hover {
-  background: #262b33;
+  background: var(--btn);
 }
 .ctx :deep(.ic) {
   width: 15px;
   height: 15px;
-  color: #9aa3b2;
+  color: var(--dim);
 }
 </style>

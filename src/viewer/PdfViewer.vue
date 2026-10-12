@@ -377,6 +377,76 @@ function selHit(e: PointerEvent): { handle: HandleId | null; onBody: boolean } {
 
 const touchPointers = new Map<number, { x: number; y: number }>()
 
+/*
+ * 触屏上的标记类工具（高亮 / 下划线 / 删除线）：**自己划选区**。
+ *
+ * 为什么必须自己做 ——
+ * 这类工具原本靠浏览器原生选区：手指按下拖动，浏览器自己去选词。
+ * 但在 Surface 上这条路径根本走不通：viewport 是个可滚动容器，浏览器会先把
+ * 这一下判成 pan 手势 → 自己开始滚动，并给页面发一个 `pointercancel`，
+ * 选区压根建立不起来。表现就是用户报的那个现象：**单指一拖，页面跟着动**。
+ *
+ * 解法两步，缺一不可：
+ *   ① `touch-action: none`（见样式段 `.viewport.markup-tool`）——
+ *      在手势开始前声明"这片区域归我"。等手指落下再改就晚了（这是声明不是拦截）。
+ *   ② 原生选区没了，就得自己算：用 `caretRangeFromPoint` 把屏幕坐标换算成
+ *      文本层里的字符位置，再用 Range 拼出选区。
+ *
+ * ⚠️ 只对 `pointerType === 'touch'` 生效。鼠标继续走原生选区 ——
+ *    那条路径本来就顺，改了反而会破坏已有的鼠标划选行为。
+ */
+let markupTouch: { startX: number; startY: number; moved: boolean } | null = null
+
+/** 屏幕坐标 → 文本层里的字符位置。没命中文本层返回 null */
+function caretAt(x: number, y: number): { node: Node; offset: number } | null {
+  const d = document as Document & {
+    caretRangeFromPoint?: (x: number, y: number) => Range | null
+    caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null
+  }
+  let node: Node | null = null
+  let offset = 0
+  if (typeof d.caretRangeFromPoint === 'function') {
+    // Chromium（含 WebView2）的非标准但唯一可靠的实现
+    const r = d.caretRangeFromPoint(x, y)
+    if (!r) return null
+    node = r.startContainer
+    offset = r.startOffset
+  } else if (typeof d.caretPositionFromPoint === 'function') {
+    const p = d.caretPositionFromPoint(x, y) // 标准写法（Firefox）
+    if (!p) return null
+    node = p.offsetNode
+    offset = p.offset
+  } else {
+    return null
+  }
+  // ⚠️ 必须落在文本层里：命中画布的话选区会横跨整页，出来的高亮是整块错的
+  const el = node.nodeType === Node.TEXT_NODE ? node.parentElement : (node as Element)
+  if (!el?.closest?.('.text-layer')) return null
+  return { node, offset }
+}
+
+/** 把「起点 → 终点」设成当前选区（手指划到哪，蓝底就跟到哪） */
+function applyTouchRange(x0: number, y0: number, x1: number, y1: number): void {
+  const a = caretAt(x0, y0)
+  const b = caretAt(x1, y1)
+  if (!a || !b) return
+  const range = document.createRange()
+  const pos = a.node.compareDocumentPosition(b.node)
+  // 同节点时 compareDocumentPosition 返回 0，这时只能比 offset
+  const bAfter = pos === 0 ? b.offset >= a.offset : (pos & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+  if (bAfter) {
+    range.setStart(a.node, a.offset)
+    range.setEnd(b.node, b.offset)
+  } else {
+    range.setStart(b.node, b.offset)
+    range.setEnd(a.node, a.offset)
+  }
+  const sel = window.getSelection()
+  if (!sel) return
+  sel.removeAllRanges()
+  sel.addRange(range)
+}
+
 /** 双指手势的参考系 —— 手势开始时测一次，之后每帧都相对它算 */
 let gesture: {
   /** 参与手势的两个 pointerId —— 固定住，避免中途抬指后"前两个"换了人导致跳变 */
@@ -516,10 +586,20 @@ function onPointerDown(e: PointerEvent): void {
   if (e.pointerType === 'touch') {
     touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
     if (touchPointers.size === 2) {
+      // 第二根手指落下 → 转入手势，正在划的选区作废
+      markupTouch = null
       beginGesture()
       return
     }
     if (touchPointers.size > 2) return // 三指以上不处理
+
+    // 标记类工具：单指归我们（原生选区在触屏上建立不起来，见 markupTouch 的说明）
+    if (isMarkupTool(props.tool)) {
+      markupTouch = { startX: e.clientX, startY: e.clientY, moved: false }
+      window.getSelection()?.removeAllRanges()
+      e.preventDefault()
+      return
+    }
   }
 
   const hint = selHit(e)
@@ -545,6 +625,11 @@ function onPointerMove(e: PointerEvent): void {
       updateGesture()
       return
     }
+    if (markupTouch) {
+      markupTouch.moved = true
+      applyTouchRange(markupTouch.startX, markupTouch.startY, e.clientX, e.clientY)
+      return
+    }
   }
   if (pan) {
     movePan(e)
@@ -566,6 +651,13 @@ function onPointerUp(e: PointerEvent): void {
       return
     }
   }
+  // 触屏划选：选区已经建好了，交回编辑器去生成批注
+  if (markupTouch) {
+    const m = markupTouch
+    markupTouch = null
+    if (m.moved) void annotEditor?.commitMarkup(e)
+    return
+  }
   if (pan) {
     endPan()
     return
@@ -580,6 +672,8 @@ function onPointerCancel(e: PointerEvent): void {
       endGesture()
       return
     }
+    // 被系统抢走手势（比如边缘滑动）→ 放弃这次划选，别留下半个选区
+    if (touchPointers.size === 0) markupTouch = null
   }
   if (pan) endPan()
   annotEditor?.cancelSession()
@@ -1278,7 +1372,7 @@ watch(
   flex: 1;
   min-height: 0;
   overflow: auto;
-  background: #14161a;
+  background: var(--viewport-bg);
   /* 滚动容器自成一个层，避免整页重绘 */
   contain: strict;
   will-change: scroll-position;
@@ -1313,6 +1407,20 @@ watch(
   touch-action: none;
 }
 /*
+ * 标记类工具（高亮 / 下划线 / 删除线）**也要** none —— 这是「Surface 上
+ * 单指一拖页面就跟着动」的直接解药。
+ *
+ * 之前这里故意不设，是因为标记工具要靠浏览器原生选区选词，而 touch-action
+ * 一关就选不中了。现在改成自己算选区（见 markupTouch），这个顾虑不成立了。
+ *
+ * ⚠️ touch-action 是**手势开始前**的声明，不是拦截 —— 必须工具激活时就切好，
+ *    等手指落下再改已经来不及（浏览器那一帧就已经判成 pan 了）。
+ * ⚠️ 代价同样是"单指翻不了页"，靠双指平移/捏合补（同绘图工具）。
+ */
+.viewport.markup-tool {
+  touch-action: none;
+}
+/*
  * 拖拽期间禁掉文字选中。
  * 否则手指按下拖动时，浏览器会顺势进入"选词"状态，表现为拖出一堆蓝色高亮，
  * 而笔画本身画不出来（尤其在手写这种连续移动的场景）。
@@ -1325,7 +1433,7 @@ watch(
 
 .loading {
   padding: 40px;
-  color: #8b93a1;
+  color: var(--dim);
   font-size: 14px;
 }
 
@@ -1342,8 +1450,8 @@ watch(
   top: calc(var(--by) * var(--scale, 1) * 1px);
   width: calc(var(--bw) * var(--scale, 1) * 1px);
   height: calc(var(--bh) * var(--scale, 1) * 1px);
-  background: #2a2f38;
-  outline: 1px solid #333a45;
+  background: var(--btn);
+  outline: 1px solid var(--line-strong);
   overflow: hidden;
   /* ⚠️ 把高亮层的 multiply 限制在本页内 —— 否则它会去跟视口深色背景相乘，
      页面还没渲染出来时高亮会变成一团黑。 */
@@ -1411,9 +1519,9 @@ watch(
   z-index: 4;
   box-sizing: border-box;
   /* 用负 offset 把描边画在框内 —— 页插槽是 overflow:hidden，画在外会被裁掉一半 */
-  outline: 1.5px solid #4aa3ff;
+  outline: 1.5px solid var(--accent-strong);
   outline-offset: -1px;
-  background: rgba(74, 163, 255, 0.09);
+  background: var(--sel-wash);
   cursor: move;
 }
 
@@ -1429,7 +1537,7 @@ watch(
   width: 10px;
   height: 10px;
   background: #fff;
-  border: 1.5px solid #2b6cb0;
+  border: 1.5px solid var(--accent-solid);
   border-radius: 2px;
 }
 .sel-handle.h-nw {
@@ -1494,7 +1602,7 @@ watch(
 .modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(8, 10, 14, 0.62);
+  background: var(--scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1504,16 +1612,16 @@ watch(
 .modal {
   width: 380px;
   max-width: calc(100vw - 40px);
-  background: #1e2128;
-  border: 1px solid #333a45;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
   border-radius: 10px;
   padding: 16px;
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 16px 48px var(--shadow-lg);
 }
 
 .modal-title {
   font-size: 13px;
-  color: #9aa3b2;
+  color: var(--dim);
   margin-bottom: 10px;
 }
 
@@ -1521,16 +1629,16 @@ watch(
   width: 100%;
   box-sizing: border-box;
   resize: vertical;
-  background: #14161a;
-  color: #e6e8ec;
-  border: 1px solid #2e333d;
+  background: var(--viewport-bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
   border-radius: 7px;
   padding: 9px 10px;
   font: 13px/1.5 "Microsoft YaHei", system-ui, sans-serif;
   outline: none;
 }
 .modal textarea:focus {
-  border-color: #60a5fa;
+  border-color: var(--accent);
 }
 
 .modal-actions {
@@ -1544,16 +1652,16 @@ watch(
   padding: 6px 16px;
   border: 0;
   border-radius: 6px;
-  background: #2b5fd9;
-  color: #fff;
+  background: var(--accent-solid);
+  color: var(--on-accent);
   font: inherit;
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
 }
 .mbtn.ghost {
-  background: #2a2f38;
-  color: #c8cfda;
+  background: var(--btn);
+  color: var(--fg-2);
   font-weight: 500;
 }
 
@@ -1599,6 +1707,6 @@ watch(
   display: contents;
 }
 .page-slot :deep(.text-layer ::selection) {
-  background: rgba(64, 140, 255, 0.45);
+  background: var(--sel-wash-strong);
 }
 </style>

@@ -63,14 +63,14 @@ const emit = defineEmits<{ go: [pageNumber: number, destTop: number | null] }>()
 .empty {
   padding: 18px 12px;
   font-size: 12.5px;
-  color: #9aa3b2;
+  color: var(--dim);
   line-height: 1.7;
 }
 .empty p {
   margin: 0 0 6px;
 }
 .dim {
-  color: #7d8593;
+  color: var(--dim-2);
   font-size: 12px;
 }
 </style>

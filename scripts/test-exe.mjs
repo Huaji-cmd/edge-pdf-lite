@@ -18,7 +18,7 @@
  */
 import { spawn } from 'node:child_process'
 import { existsSync, renameSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -327,8 +327,279 @@ for (let i = 0; i < 60; i++) {
 }
 check('点列表里的文件真的打开了（Rust 读字节这条路通）', openedFromList)
 
-// ---------------------------------------------------------------- 6. 控制台
-console.log('\n[6] 控制台')
+// ---------------------------------------------------------------- 6. 保存批注
+console.log('\n[6] 保存批注：另存到指定目录 / 覆盖原文件（含自动 .bak）')
+
+/*
+ * 这一段测的是**桌面端独有的保存能力**，也是用户这轮提的核心诉求：
+ * "按下保存之后显示了保存，但我不知道保存到了哪里"。
+ *
+ * 用到一条不容易想到的事实：**「覆盖原文件」只在"从文件列表打开"时才可用**。
+ * 拖放和 <input type=file> 都只给一个临时 File 对象，没有真实路径 ——
+ * 所以覆盖那一段必须走文件列表，不能图省事用 file input。
+ */
+
+const invoke = (cmd, args) =>
+  evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(cmd)}, ${JSON.stringify(args ?? {})})`)
+
+/** 数一个 PDF 里所有页的 /Annots 总数（用项目自己的 pdf-lib 依赖，不额外装东西） */
+async function countAnnots(path) {
+  try {
+    // ⚠️ 包名是 @cantoo/pdf-lib（pdf-lib 的 fork），不是 pdf-lib
+    const { PDFDocument } = await import('@cantoo/pdf-lib')
+    const p = await PDFDocument.load(await readFile(path), {
+      ignoreEncryption: true,
+      updateMetadata: false,
+    })
+    let n = 0
+    for (const page of p.getPages()) n += page.node.Annots()?.size() ?? 0
+    return n
+  } catch (e) {
+    console.log(`     （解析失败：${String(e.message).slice(0, 80)}）`)
+    return -1
+  }
+}
+
+// ---- 6a. 默认保存目录
+const defDir = await invoke('default_save_dir')
+check(
+  '默认保存目录在文档库里，不是安装目录（安装目录在 Program Files 下是只读的）',
+  typeof defDir === 'string' && /edge-pdf-lite/i.test(defDir) && !/Program Files/i.test(defDir),
+  String(defDir),
+)
+check(
+  '默认保存目录已经建好了（第一次保存不该遇到"目录不存在"）',
+  await invoke('path_exists', { path: defDir }),
+)
+
+// ---- 6b. 另存一份到指定目录
+const SAVE_DIR = resolve(ROOT, 'exe-shots', 'save-test')
+// 每次重跑都要先清空：否则上一轮的 .bak 还在，Rust 会往后排成 .bak2
+await rm(SAVE_DIR, { recursive: true, force: true }).catch(() => {})
+await mkdir(SAVE_DIR, { recursive: true })
+
+// 把设置改成"另存到 SAVE_DIR"（等价于用户在设置面板里点了「更改…」）
+await evaluate(`
+  localStorage.setItem('epl.settings.v1', JSON.stringify({
+    saveMode: 'copy',
+    saveDir: ${JSON.stringify(SAVE_DIR)},
+    theme: 'dark',
+  }))
+`)
+await send('Page.reload')
+await sleep(2600)
+
+// 先记下原件自带多少批注（113 条），后面要拿"恰好 +1"来判有没有写进去
+const annotsBefore = await countAnnots(PDF)
+
+// 打开 PDF 并画一笔，否则没有批注可存
+await send('DOM.enable')
+{
+  const root = await send('DOM.getDocument', { depth: 1 })
+  const q = await send('DOM.querySelector', { nodeId: root.root.nodeId, selector: 'input[type=file]' })
+  await send('DOM.setFileInputFiles', { files: [PDF], nodeId: q.nodeId })
+}
+let ready6 = false
+for (let i = 0; i < 60; i++) {
+  await sleep(400)
+  ready6 = await evaluate(`!!document.querySelector('.page-slot[data-page="1"]')`)
+  if (ready6) break
+}
+check('保存测试用的 PDF 打开了', ready6)
+
+await evaluate(clickByTidExpr('手写'))
+await sleep(250)
+{
+  const box = JSON.parse(
+    await evaluate(`
+      (() => {
+        const s = document.querySelector('.page-slot[data-page="1"]');
+        const r = s.getBoundingClientRect();
+        return JSON.stringify({ x: r.left, y: r.top, w: r.width, h: r.height });
+      })()
+    `),
+  )
+  const mouseAt = (type, x, y, buttons) =>
+    send('Input.dispatchMouseEvent', {
+      type,
+      x: Math.round(x),
+      y: Math.round(y),
+      button: 'left',
+      buttons,
+      clickCount: 1,
+    })
+  const cx = box.x + box.w / 2
+  const cy = box.y + Math.min(box.h * 0.4, 380)
+  await mouseAt('mousePressed', cx - 70, cy, 1)
+  for (let i = 1; i <= 10; i++) {
+    await mouseAt('mouseMoved', cx - 70 + i * 14, cy + Math.sin(i / 2) * 15, 1)
+    await sleep(12)
+  }
+  await mouseAt('mouseReleased', cx + 70, cy, 0)
+  await sleep(400)
+}
+check(
+  '画上了一笔（有东西可存）',
+  (await evaluate(`Number(document.querySelector('[data-tid="annot-count"]')?.textContent ?? 0)`)) > 0,
+)
+
+await evaluate(clickByTidExpr('保存批注'))
+// 等提示条出现，并从里面读路径。失败时把错误框的内容也捞出来，
+// 否则"什么都没发生"这种症状查不出是保存失败还是压根没触发。
+let toastText = ''
+let errText = ''
+for (let i = 0; i < 80; i++) {
+  await sleep(300)
+  toastText = await evaluate(`(document.querySelector('.toast') || {}).textContent || ''`)
+  errText = await evaluate(`(document.querySelector('.err') || {}).textContent || ''`)
+  if (/已保存/.test(toastText) || errText) break
+}
+if (errText) console.log(`     保存报错: ${errText.replace(/\s+/g, ' ').slice(0, 180)}`)
+const hasOpenBtn = await evaluate(`!!document.querySelector('[data-tid="toast-open-dir"]')`)
+check(
+  '保存后提示里带上了**完整路径**（用户就是想知道存哪了）',
+  /已保存/.test(toastText) && /save-test/i.test(toastText),
+  toastText.replace(/\s+/g, ' ').slice(0, 110) || '（没有提示）',
+)
+check('提示右边有「打开文件夹」按钮', hasOpenBtn)
+
+/*
+ * 在 **Node 侧**解析路径，不要在页面里写正则。
+ *
+ * ⚠️ 坑：把正则写进 evaluate 的模板字符串时，`\.` 会被 JS 当成无效转义而**吞掉反斜杠**
+ *    （模板字符串里 `\.` === `.`）。结果 `\.pdf` 变成 `.pdf`，于是路径被匹配到
+ *    `edge-pdf` 就截断了 —— 看起来像"文件没写成功"，其实是解析错了。
+ *    Node 侧的普通正则没有这层转义，直接在这儿做最省事。
+ */
+const savedName = (toastText.match(/[A-Za-z]:\\[^]*?\.pdf/) ?? [''])[0].trim()
+check('从提示里解析出了落盘路径', !!savedName, savedName)
+if (savedName) {
+  check('文件真的写到磁盘上了', await invoke('path_exists', { path: savedName }))
+  const bytes = await readFile(savedName).catch(() => Buffer.alloc(0))
+  check('内容是有效 PDF（%PDF 头）', bytes.subarray(0, 5).toString('latin1') === '%PDF-')
+
+  /*
+   * 判"批注写进去了"用 **pdf-lib 解析**，不要搜字节串。
+   *
+   * ⚠️ 搜 `edge-pdf-lite` 这种写法在这个样本上会假红：2.2 MB 的论文 PDF
+   *    对象流是 Flate 压缩的，作者名不以明文出现（小样本 annot-fixture.pdf
+   *    没压缩，所以以前那条断言能过）。用解析出来的 /Annots 数量才跟压缩无关。
+   */
+  /*
+   * ⚠️ 判据必须是**精确 +1**，不能写"大于 0"。
+   * 这个样本自带 113 条批注 —— 写成 `> 0` 的话，writer 一行都没写也照样绿。
+   */
+  const annotCount = await countAnnots(savedName)
+  check(
+    '写回后批注数 = 原件 + 1（直查 /Annots，不经 UI）',
+    annotCount === annotsBefore + 1,
+    `${annotsBefore} → ${annotCount}`,
+  )
+  check('文件名带「已批注」后缀，不跟原件混淆', /已批注/.test(savedName), savedName.split(/[\\/]/).pop())
+}
+
+// ---- 6c. 覆盖原文件（必须走文件列表，才有真实路径）
+const copyPath = join(SAVE_DIR, 'overwrite-target.pdf')
+await copyFile(PDF, copyPath)
+const beforeSize = (await stat(copyPath)).size
+const annotsBefore2 = await countAnnots(copyPath)
+
+await evaluate(`
+  localStorage.setItem('epl:file-list', JSON.stringify([
+    { name: 'overwrite-target.pdf', path: ${JSON.stringify(copyPath)}, kind: 'file' },
+  ]));
+  localStorage.setItem('epl.settings.v1', JSON.stringify({
+    saveMode: 'overwrite',
+    saveDir: ${JSON.stringify(SAVE_DIR)},
+    theme: 'dark',
+  }));
+`)
+await send('Page.reload')
+await sleep(2600)
+
+await evaluate(clickByTidExpr('文件'))
+await sleep(700)
+await evaluate(`document.querySelector('[data-tid="files-panel"] [data-kind="file"]')?.click()`)
+let ready6c = false
+for (let i = 0; i < 60; i++) {
+  await sleep(400)
+  ready6c = /overwrite-target/.test(
+    await evaluate(`(document.querySelector('[data-tid="file-name"]')||{}).textContent||''`),
+  )
+  if (ready6c) break
+}
+check('从文件列表打开了副本（这样才有真实路径可覆盖）', ready6c)
+
+await evaluate(clickByTidExpr('手写'))
+await sleep(250)
+{
+  const box = JSON.parse(
+    await evaluate(`
+      (() => {
+        const s = document.querySelector('.page-slot[data-page="1"]');
+        const r = s.getBoundingClientRect();
+        return JSON.stringify({ x: r.left, y: r.top, w: r.width, h: r.height });
+      })()
+    `),
+  )
+  const mouseAt = (type, x, y, buttons) =>
+    send('Input.dispatchMouseEvent', {
+      type,
+      x: Math.round(x),
+      y: Math.round(y),
+      button: 'left',
+      buttons,
+      clickCount: 1,
+    })
+  const cx = box.x + box.w / 2
+  const cy = box.y + Math.min(box.h * 0.5, 460)
+  await mouseAt('mousePressed', cx - 60, cy, 1)
+  for (let i = 1; i <= 10; i++) {
+    await mouseAt('mouseMoved', cx - 60 + i * 12, cy + Math.cos(i / 2) * 14, 1)
+    await sleep(12)
+  }
+  await mouseAt('mouseReleased', cx + 60, cy, 0)
+  await sleep(400)
+}
+
+await evaluate(clickByTidExpr('保存批注'))
+let toast2 = ''
+for (let i = 0; i < 80; i++) {
+  await sleep(300)
+  toast2 = await evaluate(`(document.querySelector('.toast') || {}).textContent || ''`)
+  if (/已覆盖/.test(toast2)) break
+}
+check('提示明说「已覆盖原文件」', /已覆盖/.test(toast2), toast2.slice(0, 90))
+
+const afterSize = (await stat(copyPath)).size
+check('原文件确实被改写了', afterSize !== beforeSize, `${beforeSize} → ${afterSize} 字节`)
+{
+  const n = await countAnnots(copyPath)
+  check('覆盖后的原文件批注数 = 原来 + 1', n === annotsBefore2 + 1, `${annotsBefore2} → ${n}`)
+}
+
+const bakPath = join(SAVE_DIR, 'overwrite-target.bak.pdf')
+check('自动留了一份 .bak', existsSync(bakPath))
+if (existsSync(bakPath)) {
+  const bak = await readFile(bakPath)
+  check(
+    '.bak 是**覆盖前**的原件（不含我们写进去的作者名）',
+    !bak.includes(Buffer.from('edge-pdf-lite')),
+    `${(bak.length / 1024).toFixed(1)} KB`,
+  )
+  check('.bak 字节数与原件一致', bak.length === beforeSize, `${bak.length} vs ${beforeSize}`)
+  check(
+    '.bak 的批注数与原件一致（备份是覆盖前的状态，不是覆盖后的）',
+    (await countAnnots(bakPath)) === annotsBefore2,
+    `${await countAnnots(bakPath)} vs ${annotsBefore2}`,
+  )
+}
+
+const shot6 = await send('Page.captureScreenshot', { format: 'png' })
+await writeFile(resolve(SHOTS, '03-exe-saved.png'), Buffer.from(shot6.data, 'base64'))
+
+// ---------------------------------------------------------------- 7. 控制台
+console.log('\n[7] 控制台')
 const real = errors.filter((e) => !/favicon/i.test(e))
 check('没有未捕获异常 / error', real.length === 0, real.slice(0, 3).join(' | ') || '干净')
 

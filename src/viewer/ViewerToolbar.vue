@@ -405,6 +405,14 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
       </span>
     </button>
 
+    <!--
+      顺序：撤销在左、重做在右。
+      这是"时间轴"方向的直觉 —— 左=往回、右=往前，也跟 Office / Edge 一致。
+      ⚠️ 屏幕上的左右由这里的 DOM 顺序决定，改一个就得改另一个。
+    -->
+    <button class="rb" data-tid="undo" :disabled="!canUndo" title="撤销 (Ctrl+Z)" @click="emit('undo')">
+      <Icon name="undo" />
+    </button>
     <button
       class="rb"
       data-tid="redo"
@@ -413,9 +421,6 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
       @click="emit('redo')"
     >
       <Icon name="redo" />
-    </button>
-    <button class="rb" data-tid="undo" :disabled="!canUndo" title="撤销 (Ctrl+Z)" @click="emit('undo')">
-      <Icon name="undo" />
     </button>
 
     <span
@@ -466,8 +471,8 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
   align-items: center;
   gap: 2px;
   padding: 0 8px;
-  background: #1b1e24;
-  border-bottom: 1px solid #2e333d;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
   /* 放不下时兜底可滚；正常窗口下不该出现滚动条 */
   overflow-x: auto;
   overflow-y: hidden;
@@ -486,7 +491,7 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
 .sep {
   width: 1px;
   height: 22px;
-  background: #2e333d;
+  background: var(--line);
   margin: 0 6px;
 }
 .spacer {
@@ -508,7 +513,7 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
   gap: 5px;
   padding: 0 6px;
   background: transparent;
-  color: #9aa3b2;
+  color: var(--dim);
   border: 1px solid transparent;
   border-radius: 6px;
   font: inherit;
@@ -516,12 +521,12 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
   cursor: pointer;
 }
 .rb:hover {
-  background: #2f353f;
-  color: #e6e8ec;
+  background: var(--btn-hover);
+  color: var(--fg);
 }
 .rb.on {
-  background: #2b3d57;
-  color: #9ecbff;
+  background: var(--sel-bg);
+  color: var(--sel-fg);
 }
 .rb:disabled {
   opacity: 0.35;
@@ -534,7 +539,7 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
 .pct {
   min-width: 52px;
   font-variant-numeric: tabular-nums;
-  color: #7d8695;
+  color: var(--dim-2);
 }
 
 .pager {
@@ -546,9 +551,9 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
 .page-input {
   width: 46px;
   height: 26px;
-  background: #14161b;
-  color: #e6e8ec;
-  border: 1px solid #2e333d;
+  background: var(--surface-2);
+  color: var(--fg);
+  border: 1px solid var(--line);
   border-radius: 4px;
   text-align: center;
   font: inherit;
@@ -556,10 +561,10 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
 }
 .page-input:focus {
   outline: none;
-  border-color: #60a5fa;
+  border-color: var(--accent);
 }
 .total {
-  color: #7d8695;
+  color: var(--dim-2);
   font-size: 11px;
 }
 
@@ -583,8 +588,8 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
   min-width: 16px;
   padding: 0 4px;
   border-radius: 8px;
-  background: #2b6cb0;
-  color: #fff;
+  background: var(--accent-solid);
+  color: var(--on-accent);
   font-size: 10.5px;
   line-height: 15px;
   text-align: center;
@@ -594,7 +599,7 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
   width: 11px;
   height: 11px;
   border-radius: 50%;
-  border: 1px solid rgba(255, 255, 255, 0.25);
+  border: 1px solid var(--hairline);
 }
 .annot-btn .color-caret {
   display: inline-flex;
@@ -605,7 +610,7 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
   border-radius: 3px;
 }
 .annot-btn .color-caret:hover {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--hairline);
 }
 .annot-btn .color-caret :deep(.ic) {
   width: 11px;
@@ -615,7 +620,7 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
 .unsaved {
   display: inline-flex;
   align-items: center;
-  color: #fbbf24;
+  color: var(--warn);
   font-size: 11px;
   padding: 0 6px;
   white-space: nowrap;
@@ -625,11 +630,11 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
 .color-menu {
   position: fixed;
   z-index: 200;
-  background: #0d0f13;
-  border: 1px solid #2e333d;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
   border-radius: 8px;
   padding: 8px;
-  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 8px 26px var(--shadow);
   display: grid;
   grid-template-columns: repeat(5, 22px);
   gap: 6px;
@@ -637,7 +642,7 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
 .menu-label {
   grid-column: 1 / -1;
   font-size: 10.5px;
-  color: #8b93a1;
+  color: var(--dim);
   padding: 0 2px 3px;
   white-space: nowrap;
 }
@@ -650,6 +655,6 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
   padding: 0;
 }
 .sw.on {
-  border-color: #fff;
+  border-color: var(--on-accent);
 }
 </style>

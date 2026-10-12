@@ -74,11 +74,11 @@ const open = ref(props.node.level < props.autoCollapseBelow)
 }
 
 .row:hover {
-  background: #262b33;
+  background: var(--btn);
 }
 
 .row.current {
-  background: #2b3d57;
+  background: var(--sel-bg);
 }
 
 .twisty {
@@ -88,7 +88,7 @@ const open = ref(props.node.level < props.autoCollapseBelow)
   padding: 0;
   border: 0;
   background: none;
-  color: #8b93a1;
+  color: var(--dim);
   font-size: 11px;
   line-height: 20px;
   cursor: pointer;
@@ -104,7 +104,7 @@ const open = ref(props.node.level < props.autoCollapseBelow)
   padding: 2px 4px;
   border: 0;
   background: none;
-  color: #d7dce4;
+  color: var(--fg-2);
   font: inherit;
   font-size: 12.5px;
   line-height: 1.45;
@@ -116,11 +116,11 @@ const open = ref(props.node.level < props.autoCollapseBelow)
   text-overflow: ellipsis;
 }
 .title:disabled {
-  color: #7a828f;
+  color: var(--dim-2);
   cursor: default;
 }
 .row.current .title {
-  color: #cfe4ff;
+  color: var(--sel-fg);
   font-weight: 600;
 }
 

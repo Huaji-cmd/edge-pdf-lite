@@ -27,7 +27,7 @@ export type ViewMode = 'single' | 'dual'
  * 左侧边栏能显示的面板。
  * `null` = 整个侧边栏收起。
  */
-export type SidePanelKind = 'files' | 'search' | 'outline' | 'thumbs'
+export type SidePanelKind = 'files' | 'search' | 'outline' | 'thumbs' | 'settings'
 
 export interface LayoutOptions {
   mode: ViewMode

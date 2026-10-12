@@ -143,6 +143,12 @@ try {
     await writeFile(join(SHOTS, `${name}.png`), Buffer.from(r.data, 'base64'))
   }
 
+  /** 重新加载当前页（用来验证"设置有没有被记住"） */
+  const reload = async () => {
+    await send('Page.reload', { ignoreCache: false })
+    await sleep(1200)
+  }
+
   /** 点工具栏上某个按钮（按文字精确匹配） */
   const toolbarBtn = (label) => evaluate(clickByTidExpr(label))
 
@@ -464,6 +470,97 @@ try {
     await evaluate(`/没有匹配/.test(document.querySelector('[data-tid="search-panel"]').textContent)`),
   )
 
+  // ---------------------------------------------------------------- 3d. 设置
+
+  console.log('\n[3d] 设置（保存方式 / 保存位置 / 主题）')
+  await toolbarBtn('设置')
+  await sleep(300)
+  check(
+    '点左下角齿轮进到设置面板',
+    await evaluate(`!!document.querySelector('[data-tid="save-mode-copy"]')`),
+  )
+
+  // 默认「另存一份」—— 覆盖原文件不可逆，不该是默认
+  check(
+    '保存方式默认是「另存一份」',
+    await evaluate(`document.querySelector('[data-tid="save-mode-copy"]').checked`),
+  )
+  check(
+    '网页版下「覆盖原文件」是禁用的（做不到就该禁用并说明，而不是点了没反应）',
+    await evaluate(`document.querySelector('[data-tid="save-mode-overwrite"]').disabled`),
+  )
+  check(
+    '禁用时说明了原因',
+    await evaluate(
+      `/网页版改不了原文件/.test(document.querySelector('[data-tid="save-mode-overwrite"]').closest('.opt').textContent)`,
+    ),
+  )
+  check(
+    '网页版保存位置显示为浏览器的下载目录',
+    await evaluate(`/浏览器的下载目录/.test(document.body.textContent)`),
+  )
+  await shot('03d-settings')
+
+  // ---- 主题：判据必须落到"背景色真的变了"，而不是"按钮高亮了"
+  const themeOf = () => evaluate(`document.documentElement.dataset.theme`)
+  const bgOf = () =>
+    evaluate(`getComputedStyle(document.querySelector('.side') || document.body).backgroundColor`)
+
+  const t0 = await themeOf()
+  const bg0 = await bgOf()
+  await evaluate(`document.querySelector('[data-tid="theme-light"]').click()`)
+  await sleep(300)
+  const t1 = await themeOf()
+  const bg1 = await bgOf()
+  check('点「日间」切到 light', t1 === 'light', `${t0} → ${t1}`)
+  check('背景色真的跟着变了（不是只有按钮高亮）', bg1 !== bg0, `${bg0} → ${bg1}`)
+  check(
+    '日间模式下文字是深色（否则就是暗底暗字）',
+    await evaluate(`
+      (() => {
+        const el = document.querySelector('.side') || document.body;
+        const c = getComputedStyle(el).color;
+        const m = c.match(/\\d+/g).map(Number);
+        return (m[0] * 0.299 + m[1] * 0.587 + m[2] * 0.114) < 128;
+      })()
+    `),
+  )
+  /*
+   * 逐块检查：切到日间之后，**每一块**面板都必须是浅底。
+   *
+   * 为什么要逐块查而不是看整张截图：截图缩小之后 #f6f7f9 和 #eef0f4 根本分不出来，
+   * 漏掉某一块的配色（比如工具栏还留着暗色变量）在图上就是"看着差不多"。
+   * 判据用亮度阈值：日间模式下任何一个面板底色的亮度都不该低于 200。
+   */
+  const lumOf = (sel) =>
+    evaluate(`
+      (() => {
+        const el = document.querySelector(${JSON.stringify(sel)});
+        if (!el) return -1;
+        const m = getComputedStyle(el).backgroundColor.match(/[\\d.]+/g).map(Number);
+        if (m.length < 3) return -1;
+        return m[3] === 0 ? -1 : Math.round(m[0] * 0.299 + m[1] * 0.587 + m[2] * 0.114);
+      })()
+    `)
+  for (const [name, sel] of [
+    ['标题栏', '.titlebar'],
+    ['功能区', '.ribbon'],
+    ['侧边栏', '.side'],
+    ['阅读区', '.viewport'],
+  ]) {
+    const l = await lumOf(sel)
+    check(`日间模式下「${name}」是浅底`, l < 0 || l > 180, l < 0 ? '元素不存在' : `亮度 ${l}`)
+  }
+  await shot('03d-light')
+
+  await evaluate(`document.querySelector('[data-tid="theme-dark"]').click()`)
+  await sleep(300)
+  check('点「夜间」切回 dark', (await themeOf()) === 'dark')
+  check('切回后背景色也回到原值', (await bgOf()) === bg0, `${await bgOf()} vs ${bg0}`)
+
+  await toolbarBtn('文件')
+  await sleep(200)
+
   // ---------------------------------------------------------------- 4. 收起
 
   console.log('\n[4] 收起侧边栏')
@@ -476,6 +573,31 @@ try {
   await sleep(400)
   const alive = await evaluate(`!!document.querySelector('.viewport .page-slot')`)
   check('收起后阅读区还在（版面没被破坏）', alive)
+
+  /*
+   * 4b. 设置要能跨刷新记住。
+   *
+   * ⚠️ 放在最后：刷新必然丢掉当前打开的文档（浏览器版不自动恢复上一次的文件），
+   *    放在中间会把后面的"阅读区还在"这类断言冲掉。
+   */
+  console.log('\n[4b] 刷新后设置还在吗')
+  // ⚠️ 设置入口在侧边栏底部 —— 上一段刚把它收起来了，得先展开才点得到
+  await toolbarBtn('侧边栏')
+  await sleep(350)
+  await toolbarBtn('设置')
+  await sleep(250)
+  await evaluate(`document.querySelector('[data-tid="theme-light"]').click()`)
+  await sleep(200)
+  await reload()
+  await sleep(900)
+  check(
+    '刷新后主题仍是日间',
+    (await evaluate(`document.documentElement.dataset.theme`)) === 'light',
+    await evaluate(`document.documentElement.dataset.theme`),
+  )
+  await reload() // 复原，免得影响别的用例共用同一份 localStorage
+  await sleep(600)
+  await evaluate(`localStorage.removeItem('epl.settings.v1')`)
 
   // ---------------------------------------------------------------- 5. 控制台
 

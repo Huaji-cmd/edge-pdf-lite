@@ -1,14 +1,124 @@
-:root {
+/*
+ * 主题变量：一套名字，两套取值。
+ *
+ * ⚠️ 所有组件都**只能用这里的变量**，不要再写死颜色 ——
+ *    写死的那一处在切到日间模式时会留下"暗底上的暗字"，
+ *    而且不会报错，只能靠眼睛找。
+ *
+ * 怎么切：`<html data-theme="light|dark">`，由 settings.ts 负责。
+ * `system` 不是这里的取值 —— 它会先被解析成 light / dark 再落到 DOM 上，
+ *    这样 CSS 不用处理"未定"状态。
+ *
+ * 命名按**用途**不按**色值**：日间模式下的 --surface 比暗色更亮（层级反过来），
+ * 如果按"深灰/浅灰"命名，换主题时语义就全乱了。
+ */
+
+:root,
+:root[data-theme='dark'] {
   color-scheme: dark;
-  --bg: #16181d;
-  --panel: #1e2128;
+
+  /* 背景，由外到内一层层抬高 */
+  --bg: #14161a; /* 应用最底 */
+  --panel: #171a20; /* 侧边栏 */
+  --surface: #1b1e24; /* 工具栏 */
+  --surface-2: #1e2128; /* 浮层 / 菜单 / 输入框 */
+  --btn: #262b33; /* 按钮 */
+  --btn-hover: #2f353f;
+  --viewport-bg: #14161a; /* 阅读区（PDF 白纸周围） */
+
+  /* 线与面 */
   --line: #2e333d;
+  --line-strong: #333a45;
+  --hairline: rgba(255, 255, 255, 0.12);
+  --hover: rgba(255, 255, 255, 0.08);
+  --scrim: rgba(8, 10, 14, 0.62);
+  /* ⚠️ 这两个是**纯颜色**，不是完整的 box-shadow —— 用法是
+     `box-shadow: 0 8px 26px var(--shadow)`，写成完整值会拼出无效语法 */
+  --shadow: rgba(0, 0, 0, 0.6);
+  --shadow-lg: rgba(0, 0, 0, 0.5);
+
+  /* 文字 */
   --fg: #e6e8ec;
+  --fg-2: #c8cfda;
   --dim: #9aa3b2;
+  --dim-2: #7d8695;
+  --mute: #6b7480;
+
+  /* 强调 */
   --accent: #60a5fa;
+  --accent-strong: #4aa3ff;
+  --accent-solid: #2b6cb0;
+  --accent-solid-hover: #3478c0;
+  --on-accent: #fff;
+  --sel-bg: #2b3d57; /* 选中项底色 */
+  --sel-fg: #9ecbff; /* 选中项文字 */
+  --accent-wash: rgba(43, 108, 176, 0.18);
+  --sel-wash: rgba(74, 163, 255, 0.09);
+  --sel-wash-strong: rgba(64, 140, 255, 0.45);
+
+  /* 状态色 */
   --ok: #4ade80;
   --warn: #fbbf24;
   --err: #f87171;
+  --err-bg: #2a1d1f;
+  --err-line: #6b2b30;
+  --err-fg: #f0c6c9;
+  --danger-solid: #c0392b;
+  --on-danger: #fff;
+  --toast-bg: #22303f;
+  --toast-fg: #cfe2f7;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --bg: #eef0f4;
+  --panel: #ffffff;
+  --surface: #f6f7f9;
+  --surface-2: #ffffff;
+  --btn: #e7eaef;
+  --btn-hover: #dbe0e7;
+  /*
+   * 阅读区比面板再暗一档 —— 否则白纸和背景糊成一片，看不出页边界。
+   * 这个值要跟"白纸"有明确反差，但别深到像暗色模式。
+   */
+  --viewport-bg: #dfe2e8;
+
+  --line: #d8dce3;
+  --line-strong: #c8cdd6;
+  --hairline: rgba(0, 0, 0, 0.12);
+  --hover: rgba(0, 0, 0, 0.06);
+  --scrim: rgba(255, 255, 255, 0.72);
+  --shadow: rgba(20, 24, 32, 0.16);
+  --shadow-lg: rgba(20, 24, 32, 0.2);
+
+  --fg: #1f2329;
+  --fg-2: #3d4450;
+  --dim: #5c6472;
+  --dim-2: #6b7480;
+  --mute: #858d9b;
+
+  --accent: #1668dc;
+  --accent-strong: #1668dc;
+  --accent-solid: #2b6cb0;
+  --accent-solid-hover: #3478c0;
+  --on-accent: #fff;
+  --sel-bg: #dbeafe;
+  --sel-fg: #1a4f8a;
+  --accent-wash: rgba(43, 108, 176, 0.12);
+  --sel-wash: rgba(22, 104, 220, 0.1);
+  --sel-wash-strong: rgba(22, 104, 220, 0.35);
+
+  --ok: #16a34a;
+  --warn: #b45309;
+  --err: #c0392b;
+  --err-bg: #fdecec;
+  --err-line: #e5b4b4;
+  --err-fg: #8a2b23;
+  --danger-solid: #c0392b;
+  --on-danger: #fff;
+  --toast-bg: #e8f0fb;
+  --toast-fg: #1a4f8a;
 }
 
 * {

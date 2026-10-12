@@ -5,6 +5,8 @@ import PdfViewer from './viewer/PdfViewer.vue'
 import ViewerToolbar from './viewer/ViewerToolbar.vue'
 import SidePanel from './viewer/SidePanel.vue'
 import TitleBar from './viewer/TitleBar.vue'
+import Icon from './viewer/Icon.vue'
+import { initTheme, resolveSaveDir, settings } from './viewer/settings'
 import {
   useFileList,
   readPdfBytes,
@@ -66,7 +68,24 @@ const errorText = ref('')
 const busy = ref(false)
 const busyLabel = ref('正在打开…')
 const dragging = ref(false)
+/*
+ * 提示条。
+ *
+ * `toastPath` 非空时会在提示里带一个「打开文件夹」按钮 ——
+ * 保存之后用户最想知道的就是"存哪了"，光给一句话他要自己去找。
+ */
 const toast = ref('')
+const toastPath = ref('')
+let toastTimer: number | null = null
+
+/**
+ * 当前文件的**原始路径**。
+ *
+ * 只有桌面端从文件列表 / 对话框打开才有值 —— 浏览器里 `<input type=file>`
+ * 和拖放都只给一个临时 File 对象，没有路径，也就没法"覆盖原文件"。
+ * 空串表示"不知道原文件在哪"，保存时会自动退回"另存一份"。
+ */
+const currentSourcePath = ref('')
 
 /** 当前批注工具；`none` = 纯阅读 */
 const tool = ref<ToolKind>('none')
@@ -278,11 +297,26 @@ async function onViewerReady(): Promise<void> {
   }
 }
 
-function showToast(msg: string): void {
+function showToast(msg: string, path?: string): void {
   toast.value = msg
-  window.setTimeout(() => {
-    if (toast.value === msg) toast.value = ''
-  }, 2600)
+  toastPath.value = path ?? ''
+  if (toastTimer !== null) clearTimeout(toastTimer)
+  // 带路径的提示要留久一点 —— 路径长，2.6 秒读不完
+  toastTimer = window.setTimeout(
+    () => {
+      toast.value = ''
+      toastPath.value = ''
+      toastTimer = null
+    },
+    path ? 9000 : 2600,
+  )
+}
+
+/** 提示条上的「打开文件夹」 */
+async function openToastDir(): Promise<void> {
+  if (!toastPath.value) return
+  const { revealInFolder } = await import('./viewer/settings')
+  if (!(await revealInFolder(toastPath.value))) showToast(`打不开：${toastPath.value}`)
 }
 
 // ---------------------------------------------------------------- 安装为应用
@@ -354,6 +388,8 @@ async function openBytes(bytes: Uint8Array, name: string): Promise<boolean> {
   }
 
   errorText.value = ''
+  // 打开新文档 = 原路径作废。桌面端从列表打开的会由调用方在成功后重新设上
+  currentSourcePath.value = ''
   busy.value = true
   try {
     const next = await PdfDocument.open(bytes, name)
@@ -408,7 +444,10 @@ async function openFromList(node: FileNode): Promise<void> {
     errorText.value = (e as Error).message
     return
   }
-  if (await openBytes(bytes, node.name)) currentFileId.value = node.id
+  if (await openBytes(bytes, node.name)) {
+    currentFileId.value = node.id
+    currentSourcePath.value = node.path ?? ''
+  }
 }
 
 async function onPickFile(e: Event): Promise<void> {
@@ -519,12 +558,19 @@ function fitPage(): void {
 // ---------------------------------------------------------------- 导出带批注的 PDF
 
 /**
- * 用"下载一份新文件"的方式交付结果，而不是原地覆盖。
+ * 保存批注 —— 按设置里的「保存方式」走两条不同的路。
  *
- * 原因：浏览器里想原地覆盖必须走 File System Access API（拿到文件句柄），
- * 那条路只在 Chromium 系可用、且需要用户先授权；而"另存为"在任何浏览器都稳，
- * 也天然满足了"覆盖不可逆，先留一份"的安全要求。
- * 等 M8 上了 Tauri，再换成真正的原地写回 + 自动 `.bak`。
+ * | 环境 | 另存 | 覆盖 |
+ * |---|---|---|
+ * | 桌面端 | 写到设置里的保存目录 | 写回原文件路径（**先自动留 .bak**） |
+ * | 浏览器 | 下载到浏览器下载目录 | 做不到 —— 自动退回另存并说明原因 |
+ *
+ * 为什么覆盖要自动备份：这是不可逆操作，而没有备份的话"保存后想反悔"
+ * 就只能靠重新画一遍。备份失败时**整个保存中止**（Rust 侧先备份后写），
+ * 不会出现"备份没成、原文件已经被盖掉"这种最坏结果。
+ *
+ * ⚠️ 用户提的第一个问题就是"保存之后不知道存到哪了" ——
+ *    所以每次保存都把**完整路径**写进提示，并附一个「打开文件夹」按钮。
  */
 async function exportAnnotated(): Promise<void> {
   const d = doc.value
@@ -541,17 +587,85 @@ async function exportAnnotated(): Promise<void> {
     const { buildAnnotatedPdf, annotatedFileName } = await loadWriter()
     const bytes = await buildAnnotatedPdf(d.originalBytes, list)
     const name = annotatedFileName(fileName.value)
-    downloadBytes(bytes, name)
+
     // 已经落到文件里了 —— 之后退出不再拦截
-    viewerRef.value?.markSaved()
-    refreshUnsaved()
-    showToast(`已导出 ${name}`)
+    const done = (): void => {
+      viewerRef.value?.markSaved()
+      refreshUnsaved()
+    }
+
+    // ---- 浏览器：只有"下载"这一条路
+    if (!IS_TAURI) {
+      downloadBytes(bytes, name)
+      done()
+      showToast(`已下载 ${name}（在浏览器的下载目录里）`)
+      return
+    }
+
+    const { invoke } = await import('@tauri-apps/api/core')
+    const wantOverwrite = settings.value.saveMode === 'overwrite'
+    const overwrite = wantOverwrite && currentSourcePath.value !== ''
+
+    let target = ''
+    let note = ''
+    if (overwrite) {
+      target = currentSourcePath.value
+    } else {
+      const dir = await resolveSaveDir()
+      if (!dir) {
+        // 拿不到目录也不能把用户的批注丢掉 —— 退回下载
+        downloadBytes(bytes, name)
+        done()
+        showToast(`拿不到保存目录，已改为下载 ${name}`)
+        return
+      }
+      target = joinPath(dir, name)
+      // 选了覆盖但没有原路径（比如是拖进来的文件），要说清为什么没覆盖
+      if (wantOverwrite) note = '（这个文件没有原路径，已改为另存）'
+    }
+
+    // ⚠️ 参数名用 **camelCase**：Tauri v2 按前端 camelCase → Rust snake_case
+    //    来匹配，写成 `make_backup` 会直接报 "missing required key"。
+    const written = await invoke<string>('write_pdf_b64', {
+      path: target,
+      b64: bytesToBase64(bytes),
+      makeBackup: overwrite,
+    })
+    done()
+    showToast(
+      `${overwrite ? '已覆盖原文件（原件备份为 .bak）' : '已保存'}${note}：${written}`,
+      written,
+    )
   } catch (e) {
-    console.error('[export] 失败', e)
-    errorText.value = `导出失败：${(e as Error).message}`
+    console.error('[save] 失败', e)
+    errorText.value = `保存失败：${(e as Error).message}`
   } finally {
     busy.value = false
   }
+}
+
+/** 拼路径。打包目标只有 Windows，但 dev 时可能在别的系统 —— 两种分隔符都认 */
+function joinPath(dir: string, name: string): string {
+  const sep = dir.includes('/') && !dir.includes('\\') ? '/' : '\\'
+  const base = dir.replace(/[\\/]+$/, '')
+  // 盘符根（D:\）不能把末尾的斜杠去掉，否则会变成"当前目录下的相对路径"
+  if (/^[A-Za-z]:$/.test(base)) return dir.endsWith(sep) ? dir + name : dir + sep + name
+  return base + sep + name
+}
+
+/**
+ * 字节 → base64。
+ *
+ * ⚠️ 必须**分块**再 `fromCharCode`：一次性把 20 MB 展开成 apply 的参数
+ *    会直接爆栈（V8 的参数个数上限）。8 KB 一块是常规做法。
+ */
+function bytesToBase64(bytes: Uint8Array): string {
+  let s = ''
+  const CHUNK = 0x8000
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
+  }
+  return btoa(s)
 }
 
 function downloadBytes(bytes: Uint8Array, name: string): void {
@@ -637,6 +751,9 @@ onMounted(() => {
   standalone.value = window.matchMedia?.('(display-mode: standalone)').matches ?? false
   window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt)
   window.addEventListener('appinstalled', onInstalled)
+
+  // 主题要在挂载时就落到 DOM 上 —— 晚了会先闪一下暗色再变
+  initTheme()
 
   // 桌面端：恢复上次记住的文件列表，并清掉其中已经不存在的条目
   if (IS_TAURI) {
@@ -736,6 +853,8 @@ onBeforeUnmount(() => {
         @go-dest="goToDest"
         @go-page="goTo"
         @open-file="openFromList"
+        @set-panel="setPanel"
+        @toast="showToast"
       />
 
       <PdfViewer
@@ -783,14 +902,23 @@ onBeforeUnmount(() => {
     <!-- 下面这些是覆盖层（position: fixed），留在 .app 下而不是侧边栏的 .main 里 -->
     <div v-if="dragging" class="drop-hint">松手打开 PDF</div>
     <div v-if="busy" class="overlay">{{ busyLabel }}</div>
-    <div v-if="toast" class="toast">{{ toast }}</div>
+    <div v-if="toast" class="toast">
+      <span class="toast-msg">{{ toast }}</span>
+      <button
+        v-if="toastPath"
+        class="toast-open"
+        data-tid="toast-open-dir"
+        title="在文件管理器里显示这个文件"
+        @click="openToastDir"
+      >
+        <Icon name="folder-open" /> 打开文件夹
+      </button>
+    </div>
 
     <div v-if="errorText" class="err" @click="errorText = ''">
       <pre>{{ errorText }}</pre>
       <span class="dim">（点击关闭）</span>
     </div>
-
-    <a class="spike-link" href="/spike.html">M0 实验页</a>
 
     <input
       ref="fileInputRef"
@@ -807,7 +935,7 @@ onBeforeUnmount(() => {
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: #14161a;
+  background: var(--bg);
 }
 
 /* 工具栏下面这一横排：[侧边栏] [阅读区] */
@@ -818,20 +946,20 @@ onBeforeUnmount(() => {
 }
 
 .btn {
-  background: #262b33;
-  color: #dfe4ec;
-  border: 1px solid #333a45;
+  background: var(--btn);
+  color: var(--fg);
+  border: 1px solid var(--line-strong);
   border-radius: 6px;
   padding: 6px 12px;
   font: inherit;
   cursor: pointer;
 }
 .btn.primary {
-  background: #2b6cb0;
-  border-color: #2b6cb0;
+  background: var(--accent-solid);
+  border-color: var(--accent-solid);
 }
 .btn.primary:hover {
-  background: #3478c0;
+  background: var(--accent-solid-hover);
 }
 
 .welcome {
@@ -842,7 +970,7 @@ onBeforeUnmount(() => {
 }
 .welcome-box {
   text-align: center;
-  color: #dfe4ec;
+  color: var(--fg);
 }
 .welcome-box h1 {
   font-size: 22px;
@@ -851,7 +979,7 @@ onBeforeUnmount(() => {
   letter-spacing: 0.02em;
 }
 .welcome-box p {
-  color: #8b93a1;
+  color: var(--dim);
   margin: 0 0 18px;
   font-size: 14px;
 }
@@ -866,7 +994,7 @@ onBeforeUnmount(() => {
   font-size: 12.5px !important;
 }
 .touch-hint strong {
-  color: #c8cfda;
+  color: var(--fg-2);
   font-weight: 600;
 }
 .hint {
@@ -874,8 +1002,8 @@ onBeforeUnmount(() => {
   font-size: 12px !important;
 }
 kbd {
-  background: #262b33;
-  border: 1px solid #333a45;
+  background: var(--btn);
+  border: 1px solid var(--line-strong);
   border-radius: 4px;
   padding: 1px 5px;
   font-size: 11px;
@@ -887,9 +1015,9 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(43, 108, 176, 0.18);
-  border: 3px dashed #2b6cb0;
-  color: #dfe4ec;
+  background: var(--accent-wash);
+  border: 3px dashed var(--accent-solid);
+  color: var(--fg);
   font-size: 18px;
   pointer-events: none;
 }
@@ -900,8 +1028,8 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(10, 12, 15, 0.6);
-  color: #dfe4ec;
+  background: var(--scrim);
+  color: var(--fg);
   font-size: 14px;
 }
 
@@ -911,12 +1039,12 @@ kbd {
   bottom: 24px;
   transform: translateX(-50%);
   max-width: min(720px, 90vw);
-  background: #2a1d1f;
-  border: 1px solid #6b2b30;
+  background: var(--err-bg);
+  border: 1px solid var(--err-line);
   border-left-width: 3px;
   border-radius: 8px;
   padding: 12px 16px;
-  color: #f0c6c9;
+  color: var(--err-fg);
   cursor: pointer;
   font-size: 13px;
 }
@@ -926,20 +1054,8 @@ kbd {
   font-size: 12px;
 }
 .dim {
-  color: #8b93a1;
+  color: var(--dim);
   font-size: 11px;
-}
-
-.spike-link {
-  position: fixed;
-  right: 10px;
-  bottom: 8px;
-  font-size: 11px;
-  color: #4a5260;
-  text-decoration: none;
-}
-.spike-link:hover {
-  color: #8b93a1;
 }
 
 .toast {
@@ -947,14 +1063,44 @@ kbd {
   left: 50%;
   top: 62px;
   transform: translateX(-50%);
-  background: #22303f;
-  border: 1px solid #2b6cb0;
+  background: var(--toast-bg);
+  border: 1px solid var(--accent-solid);
   border-radius: 8px;
   padding: 8px 16px;
-  color: #cfe2f7;
+  color: var(--toast-fg);
   font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(92vw, 720px);
+  /* 整体不拦点击（它飘在工具栏上方），但下面的按钮要能按 */
   pointer-events: none;
   animation: toast-in 0.18s ease-out;
+}
+.toast-msg {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.toast-open {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border: 1px solid var(--accent-solid);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--toast-fg);
+  font-size: 12px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.toast-open:hover {
+  background: var(--accent-wash);
+}
+.toast-open :deep(svg) {
+  width: 13px;
+  height: 13px;
 }
 @keyframes toast-in {
   from {

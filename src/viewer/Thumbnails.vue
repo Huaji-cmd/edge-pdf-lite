@@ -218,9 +218,9 @@ onBeforeUnmount(() => {
 .thumb {
   position: relative;
   padding: 0;
-  border: 1px solid #333a45;
+  border: 1px solid var(--line-strong);
   border-radius: 3px;
-  background: #2a2f38;
+  background: var(--btn);
   cursor: pointer;
   overflow: hidden;
   /* ⚠️ 高度由 inline style 按宽高比预设好 —— canvas 还没渲染时也能占位，
@@ -229,11 +229,11 @@ onBeforeUnmount(() => {
   width: 96px;
 }
 .thumb:hover {
-  border-color: #4a86c8;
+  border-color: var(--accent-strong);
 }
 .thumb.current {
-  border-color: #4aa3ff;
-  box-shadow: 0 0 0 1px #4aa3ff;
+  border-color: var(--accent-strong);
+  box-shadow: 0 0 0 1px var(--accent-strong);
 }
 
 .cv {
@@ -245,14 +245,14 @@ onBeforeUnmount(() => {
   left: 0;
   bottom: 0;
   padding: 0 4px;
-  background: rgba(10, 12, 16, 0.72);
-  color: #b9c1cd;
+  background: var(--scrim);
+  color: var(--fg-2);
   font-size: 10.5px;
   line-height: 15px;
   font-variant-numeric: tabular-nums;
 }
 .thumb.current .pn {
-  color: #cfe4ff;
+  color: var(--sel-fg);
 }
 
 .empty {
@@ -260,6 +260,6 @@ onBeforeUnmount(() => {
   font-size: 12.5px;
 }
 .dim {
-  color: #7d8593;
+  color: var(--dim-2);
 }
 </style>

@@ -20,6 +20,17 @@ export const TID = {
   sideSearch: 'side-search',
   sideOutline: 'side-outline',
   sideThumbs: 'side-thumbs',
+  // 侧边栏底部的设置入口
+  sideSettings: 'side-settings',
+  // 设置面板
+  saveModeCopy: 'save-mode-copy',
+  saveModeOverwrite: 'save-mode-overwrite',
+  saveChangeDir: 'save-change-dir',
+  saveOpenDir: 'save-open-dir',
+  themeSystem: 'theme-system',
+  themeLight: 'theme-light',
+  themeDark: 'theme-dark',
+  toastOpenDir: 'toast-open-dir',
   winMin: 'win-min',
   winMax: 'win-max',
   winClose: 'win-close',
@@ -80,6 +91,8 @@ export const LABEL_TO_TID = {
   滚动: TID.pmScroll,
   目录: TID.sideOutline,
   文件: TID.sideFile,
+  // 设置入口在**侧边栏底部**（左下角齿轮），不在顶栏
+  设置: TID.sideSettings,
   搜索: TID.sideSearch,
   // ⚠️ 「目录」在新界面里是**切到目录面板**，不再负责收起侧边栏
   //    （收起是顶栏最左边那个开关图标）。要收起用下面这个。

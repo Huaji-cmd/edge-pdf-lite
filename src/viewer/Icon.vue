@@ -43,6 +43,11 @@ export type IconName =
   | 'chevron-left'
   | 'chevron-right'
   | 'chevron-down'
+  | 'gear'
+  | 'folder-open'
+  | 'sun'
+  | 'moon'
+  | 'auto'
 </script>
 
 <script setup lang="ts">

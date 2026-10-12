@@ -485,17 +485,106 @@ try {
 
   // ---------------------------------------------------------------- 6. markup 工具不能关掉滚动
 
-  console.log('\n[6] 高亮这类「标记工具」要保持可滚动（它靠浏览器原生选区）')
+  /*
+   * 6. 标记类工具（高亮 / 下划线 / 删除线）在触屏上单指要能**划出选区**。
+   *
+   * ⚠️ 这一段的前提被推翻过一次，改测试时务必看清楚：
+   *    旧版本断言的是"标记工具下 touch-action 不能是 none"，理由是它要靠
+   *    浏览器原生选区选词。但用户实测反馈"Surface 上高亮用不了，单指还是拖动"
+   *    —— 因为 viewport 是可滚动容器，浏览器会把这一下判成 pan 并抢走手势，
+   *    原生选区压根建立不起来。现在改成自己算选区（caretRangeFromPoint），
+   *    所以 touch-action 必须 none，前提反过来了。
+   *
+   * 判据有三条，缺一不可：
+   *   ① touch-action 是 none（手势归我们）
+   *   ② 单指划过之后**真的生成了一条 highlight**
+   *   ③ 划的过程中页面**没有滚动**（证明浏览器没把手势抢走）
+   */
+  console.log('\n[6] 标记工具在触屏上单指划选（Surface 上的老问题）')
+
+  const before6 = (await annots()).length
   await toolbarBtn('高亮')
   await sleep(300)
   {
     const s = await styles()
     check(
-      '高亮工具下 touch-action 不是 none',
-      s.touchAction !== 'none',
+      '高亮工具下 touch-action 是 none（手势归我们）',
+      s.touchAction === 'none',
       `touch-action=${s.touchAction}`,
     )
   }
+
+  /*
+   * 找一行真实文字的位置。
+   *
+   * ⚠️ 必须挑**当前视口内**的 span：文本层里可能有一百多个 span，其中大部分
+   *    滚在屏幕外，对它们的坐标调 elementFromPoint / caretRangeFromPoint
+   *    一律返回 null（不是"没命中文字"，是"这个坐标在视口之外"）。
+   *    第一版就是踩了这个 —— 症状是 caret 恒为 null，看着像功能没实现。
+   */
+  const pickLine = () =>
+    evaluate(`
+      (() => {
+        const spans = [...document.querySelectorAll('.text-layer span')]
+          .filter(s => (s.textContent || '').trim().length > 3);
+        const H = window.innerHeight, W = window.innerWidth;
+        for (const s of spans) {
+          const r = s.getBoundingClientRect();
+          if (r.width < 24 || r.height < 4) continue;
+          if (r.top < 120 || r.bottom > H - 40) continue;   // 留出工具栏/边缘
+          if (r.left < 8 || r.right > W - 8) continue;
+          return JSON.stringify({
+            x0: r.left + r.width * 0.15,
+            x1: r.right - r.width * 0.15,
+            y: r.top + r.height / 2,
+            text: (s.textContent || '').trim().slice(0, 24),
+          });
+        }
+        return 'null';
+      })()
+    `).then(JSON.parse)
+  const line = await pickLine()
+
+  if (!line) {
+    check('找得到一行文字用来划选', false, '文本层里没找到可用的 span')
+  } else {
+    const top0 = await scrollTop()
+    // 单指从这行的左边划到右边
+    const frames = []
+    for (let i = 0; i <= 8; i++) {
+      frames.push([{ id: 1, x: line.x0 + ((line.x1 - line.x0) * i) / 8, y: line.y }])
+    }
+    await touchSeq(frames)
+    await sleep(400)
+
+    const list = await annots()
+    check(
+      '单指划过生成了一条高亮',
+      list.length === before6 + 1 && list[list.length - 1]?.kind === 'highlight',
+      `count ${before6} → ${list.length}，kind=${list[list.length - 1]?.kind ?? '无'}`,
+    )
+    const top1 = await scrollTop()
+    check(
+      '划选过程中页面没有跟着滚（浏览器没抢手势）',
+      Math.abs(top1 - top0) < 4,
+      `scrollTop ${top0} → ${top1}`,
+    )
+    /*
+     * 判"有没有真的选中那行" —— 用**尺寸**而不是文字：
+     * 快照里不带文字，而尺寸能抓住真正的失败模式：如果选区落到了画布上
+     * （caretRangeFromPoint 命中了文本层之外的元素），矩形会横跨整页，
+     * 宽高都是几百 pt。一行文字的高只会有十几 pt。
+     */
+    const a = list[list.length - 1]
+    const w = a.rect[2] - a.rect[0]
+    const h = a.rect[3] - a.rect[1]
+    check(
+      '高亮是"一行文字"的大小（不是横跨整页的一大块）',
+      w > 8 && h > 4 && h < 40,
+      `rect ${w.toFixed(1)}×${h.toFixed(1)} pt`,
+    )
+  }
+
   await toolbarBtn('高亮') // 再点一次关掉工具
   await evaluate(`document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'})); true`)
   await sleep(200)

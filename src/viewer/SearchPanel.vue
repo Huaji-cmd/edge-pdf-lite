@@ -111,36 +111,36 @@ function pick(node: FileNode): void {
   left: 8px;
   width: 14px;
   height: 14px;
-  color: #6b7480;
+  color: var(--mute);
   pointer-events: none;
 }
 .box input {
   width: 100%;
   height: 30px;
   padding: 0 8px 0 27px;
-  background: #14161b;
-  border: 1px solid #2e333d;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
   border-radius: 5px;
-  color: #e6e8ec;
+  color: var(--fg);
   font: inherit;
   font-size: 12.5px;
 }
 .box input:focus {
   outline: none;
-  border-color: #60a5fa;
+  border-color: var(--accent);
 }
 
 .tip {
   margin: 14px 4px;
   font-size: 11.5px;
   line-height: 1.8;
-  color: #6b7480;
+  color: var(--mute);
 }
 
 .count {
   margin: 10px 4px 6px;
   font-size: 11px;
-  color: #6b7480;
+  color: var(--mute);
 }
 
 .hit {
@@ -152,24 +152,24 @@ function pick(node: FileNode): void {
   background: none;
   border: 0;
   border-radius: 5px;
-  color: #e6e8ec;
+  color: var(--fg);
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
 .hit:hover {
-  background: #262b33;
+  background: var(--btn);
 }
 .hit.cur {
-  background: #2b3d57;
-  color: #9ecbff;
+  background: var(--sel-bg);
+  color: var(--sel-fg);
 }
 .leaf {
   width: 14px;
   height: 14px;
   margin-top: 2px;
   flex: 0 0 14px;
-  color: #7d8695;
+  color: var(--dim-2);
 }
 .col {
   display: flex;
@@ -184,7 +184,7 @@ function pick(node: FileNode): void {
 }
 .dir {
   font-size: 10.5px;
-  color: #6b7480;
+  color: var(--mute);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
