@@ -1,9 +1,10 @@
 {
   "name": "edge-pdf-lite",
-  "private": true,
   "version": "0.1.0",
   "type": "module",
   "description": "轻量 PDF 阅读 + 批注编辑器（面向低配 Windows）",
+  "license": "MIT",
+  "keywords": ["pdf", "reader", "annotation", "tauri", "vue", "pdfjs"],
   "scripts": {
     "postinstall": "node scripts/copy-pdfjs-assets.mjs",
     "pdfjs-assets": "node scripts/copy-pdfjs-assets.mjs",
@@ -21,7 +22,6 @@
     "preview:host": "vite preview --host",
     "serve:dist": "node scripts/serve-dist.mjs",
     "app": "node scripts/app.mjs",
-    "spike": "node scripts/spike-run-crop-render.mjs",
     "test:viewer": "node scripts/test-viewer.mjs",
     "test:annot": "node scripts/test-annot.mjs",
     "test:writer": "node scripts/test-writer.mjs",
@@ -32,7 +32,6 @@
     "test": "node scripts/test-viewer.mjs && node scripts/test-annot.mjs && node scripts/test-writer.mjs && node scripts/test-interact.mjs && node scripts/test-touch.mjs && node scripts/test-pwa.mjs && node scripts/test-preview.mjs",
     "variants": "node scripts/make-highlight-variants.mjs",
     "edge:shot": "node scripts/edge-pdf-shot.mjs",
-    "probe:worker": "node scripts/probe-worker.mjs",
     "tauri": "node scripts/tauri.mjs",
     "exe": "node scripts/tauri.mjs build --no-bundle",
     "test:exe": "node scripts/test-exe.mjs",
