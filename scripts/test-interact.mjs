@@ -879,6 +879,29 @@ try {
   await tapEl('[data-tid="te-color"]')
   const teSwatchCount = await evaluate(`document.querySelectorAll(".te-swatches .te-sw").length`)
   check("字色色板展开了，且是完整色板（含黑/白 —— 文字必须能用黑色）", teSwatchCount === 10, `${teSwatchCount} 色`)
+  /*
+   * ★ 色板**不能压在正文上**。
+   *
+   * 用户报的："把调色板放在上面，不要放在下面遮住文本内容"。
+   * 判据只量几何：色板矩形与文本框矩形**不相交**，且整体在框上方。
+   * ⚠️ 别只看截图 —— 遮挡是"矩形相交"这件事，量出来才有定论。
+   */
+  const swGeo = JSON.parse(
+    await evaluate(`(() => {
+      const p = document.querySelector('.te-swatches');
+      const b = document.querySelector('[data-tid="text-edit"]');
+      if (!p || !b) return 'null';
+      const a = p.getBoundingClientRect(), c = b.getBoundingClientRect();
+      const w = Math.max(0, Math.min(a.right, c.right) - Math.max(a.left, c.left));
+      const h = Math.max(0, Math.min(a.bottom, c.bottom) - Math.max(a.top, c.top));
+      return JSON.stringify({ overlapPx: Math.round(w * h), above: a.bottom <= c.top + 0.5 });
+    })()`),
+  )
+  check(
+    '色板展开在**上方**，不遮住框里的文字',
+    !!swGeo && swGeo.overlapPx === 0 && swGeo.above === true,
+    `与文本框重叠 ${swGeo?.overlapPx}px² · 在框上方=${swGeo?.above}`,
+  )
   await tapEl('.te-swatches .te-sw:nth-child(9)') // 黑（色板里第 9 个）
   const ftBlack = (await annots()).find((a) => a.id === ft?.id)
   check(

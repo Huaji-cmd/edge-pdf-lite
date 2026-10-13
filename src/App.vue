@@ -883,6 +883,25 @@ onMounted(() => {
   // 主题要在挂载时就落到 DOM 上 —— 晚了会先闪一下暗色再变
   initTheme()
 
+  /*
+   * 桌面端：向宿主报一声「界面真的跑起来了」。
+   *
+   * 🔴 这一声是**唯一能判断"这次启动成没成"的信号**：白屏时我们的 JS 一次都不会执行，
+   *    所以只要这个命令被调到，就说明页面加载、CSP、IPC 整条链是通的。
+   *    Rust 那边（`heal_webview_profile`）拿它当"上次启动是否正常"的判据 ——
+   *    跑不起来的那次不会留标记，下次启动就会自愈。
+   */
+  if (IS_TAURI) {
+    void (async () => {
+      try {
+        const core = await import('@tauri-apps/api/core')
+        await core.invoke('app_ready')
+      } catch {
+        /* 报不上就算了：顶多下次启动多清一次 profile，不该影响使用 */
+      }
+    })()
+  }
+
   // 桌面端：恢复上次记住的文件列表，并清掉其中已经不存在的条目
   if (IS_TAURI) {
     restoreList()

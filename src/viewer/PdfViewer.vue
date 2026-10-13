@@ -2358,10 +2358,17 @@ watch(
   border-radius: 1px;
 }
 
+/*
+ * 色板：挂在**工具条上方**。
+ *
+ * 🔴 之前写的是 `top: calc(100% + 6px)`（工具条**下方**），而工具条下方那一块
+ *    正是文本框自己的正文 —— 一弹出来就把字盖住了（用户报的"放在下面遮住文本内容"）。
+ *    上方是空白的，往那边展开不挡任何东西。
+ */
 .te-swatches {
   position: absolute;
   left: 0;
-  top: calc(100% + 6px);
+  bottom: calc(100% + 6px);
   display: grid;
   grid-template-columns: repeat(5, auto);
   gap: 6px;

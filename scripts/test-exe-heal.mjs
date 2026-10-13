@@ -19,7 +19,7 @@
  */
 import { spawn } from 'node:child_process'
 import { existsSync, renameSync } from 'node:fs'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -241,6 +241,113 @@ check(
 const shot = await app.send('Page.captureScreenshot', { format: 'png' })
 await writeFile(resolve(SHOTS, '05-exe-after-heal.png'), Buffer.from(shot.data, 'base64'))
 
+await shutdown(app)
+
+/*
+ * ---------------------------------------------------------------- 3. 「上次白屏 → 这次自愈」
+ *
+ * 用户报的第二个问题：**第一次启动正常、第二次以后每次都白屏，而且好不了**。
+ * 旧逻辑只在"版本/结构变了"时才清 —— profile 因别的原因坏掉时标记照样匹配，
+ * 于是自愈**永远不再触发**，用户就卡死在里面了。
+ *
+ * 现在多了一条更强的判据（两个标记比 mtime）：
+ *   · `.epl-bad`  `setup` 里先记（"这次启动还没证明自己是好的"）
+ *   · `.epl-ok`   前端就绪后 `app_ready` 写（更新 ⇒ 把它盖过去）
+ * `bad` 更新 ⇒ 上次没跑到 ready ⇒ 该自愈。
+ *
+ * ⚠️ 判据用**自愈日志**当"到底清没清"的信号（只有真清了才会写它）。
+ */
+console.log('\n[3] 「上次白屏 → 这次自愈」，以及「正常启动不该乱清」')
+const OK_MARK = join(PROFILE, '.epl-ok')
+const BAD_MARK = join(PROFILE, '.epl-bad')
+const HEAL_LOG = join(tmpdir(), 'epl-profile-heal.log')
+
+// ---- 3a. 刚正常跑过一次 → 再启动**不该**清
+await rm(HEAL_LOG, { force: true })
+app = await launch()
+await waitRendered(app)
+check('正常启动会先记 .epl-bad（"这次还没证明自己"）', existsSync(BAD_MARK))
+check('页面就绪后写 .epl-ok 把它盖过去', existsSync(OK_MARK))
+check(
+  '正常启动**不会**触发清理（没有自愈日志）',
+  !existsSync(HEAL_LOG),
+  existsSync(HEAL_LOG) ? String(await readFile(HEAL_LOG, 'utf8').catch(() => '')) : '无日志',
+)
+await shutdown(app)
+
+// ---- 3b. 造"上次白屏"：删掉 .epl-ok（= 那次没跑到 ready），再把标记时间拨老绕过冷却
+await rm(OK_MARK, { force: true })
+const old = new Date(Date.now() - 300_000)
+await utimes(STAMP, old, old).catch(() => {})
+await rm(HEAL_LOG, { force: true })
+
+app = await launch()
+const rendered3 = await waitRendered(app)
+check(
+  '上次没跑到 ready → 这次启动**自己修**（自愈日志有记录）',
+  existsSync(HEAL_LOG),
+  existsSync(HEAL_LOG) ? String(await readFile(HEAL_LOG, 'utf8').catch(() => '')).split('\n')[2] ?? '' : '无日志',
+)
+check(
+  '自愈之后应用照常渲染（不是白屏）',
+  rendered3 > 0,
+  `#app 子节点=${rendered3}`,
+)
+const probe3 = await app.evaluate(`localStorage.getItem('epl-heal-probe') ?? ''`)
+check(
+  '这次自愈同样**没有**动用户的 Local Storage',
+  String(probe3) === 'kept-ok',
+  String(probe3) || '（没了）',
+)
+await shutdown(app)
+
+// ---- 3c. 自愈过之后：再启动不该继续清（防连环清）
+await rm(HEAL_LOG, { force: true })
+app = await launch()
+await waitRendered(app)
+check(
+  '紧接着再启动一次**不再清**（自愈过就好了，不会连环清）',
+  !existsSync(HEAL_LOG),
+  existsSync(HEAL_LOG) ? String(await readFile(HEAL_LOG, 'utf8').catch(() => '')) : '无日志',
+)
+await shutdown(app)
+
+/*
+ * ---------------------------------------------------------------- 4. 单实例
+ *
+ * 用户报的"第二次启动就变成这样"里，**能稳定复现的一条**就是这个：
+ * 两个实例会去开同一个 WebView2 profile 目录，而 WebView2 不允许共用 ——
+ * 第二个实例窗口能出来，但里面的环境是坏的（实测过：调试端口都连不上）。
+ * 现在装了单实例插件：第二次双击只会把已有窗口拉到前面，不再碰 profile。
+ */
+console.log('\n[4] 第二次启动不会去抢同一个 profile（单实例保护）')
+app = await launch()
+await waitRendered(app)
+
+const second = spawn(EXE, [], { stdio: 'ignore' })
+const secondExit = await new Promise((res) => {
+  const t = setTimeout(() => res(null), 10_000)
+  second.on('exit', (code) => {
+    clearTimeout(t)
+    res(code ?? -1)
+  })
+})
+check(
+  /*
+   * ⚠️ 必须查**退出码是不是 0**，不能只查"退出了"。
+   *    没有单实例插件时，第二个实例是**崩掉**的（WebView2 建不起共用 profile 的环境，
+   *    进程 panic → 退出码 101）。只判"退出了"的话，崩溃也能过 —— 那就等于没测。
+   *    有插件时是插件主动 `exit(0)`，是"我知道有别人在跑，我让位"。
+   */
+  '第二个实例**干净地**让位（退出码 0，不是崩溃退出）',
+  secondExit === 0,
+  secondExit === null ? '10 秒还没退' : `退出码 ${secondExit}`,
+)
+check(
+  '第一个实例照常在跑、界面没被搞坏',
+  (await waitRendered(app)) > 0,
+  '第一个实例仍在渲染',
+)
 await shutdown(app)
 
 console.log(`\n==================================================`)

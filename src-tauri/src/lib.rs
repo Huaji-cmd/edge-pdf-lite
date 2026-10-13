@@ -3,6 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
+// `get_webview_window` / `config()` 这些是 trait 方法，不 import 就调不到
+// （编译器会提示 "trait Manager which provides ... is implemented but not in scope"）
+use tauri::Manager;
+
 /*
  * 关于下面这段"自愈"代码的来龙去脉 —— 这是用户实际踩到、且很难自己查的问题。
  *
@@ -28,6 +32,50 @@ use std::path::{Path, PathBuf};
  * 会被重新清一次，否则他们会停在"标记已写、但没真正清干净"的状态里出不来。
  */
 const PROFILE_STAMP: &str = "2";
+
+/**
+ * 「上次跑挂之后，隔多久才允许再自愈一次」。
+ *
+ * 目的是**防连环清**：如果清了也修不好（或者根因根本不是 profile），
+ * 没有冷却就会变成"每次启动都把 profile 清一遍" —— 用户每次都得重新攒缓存。
+ * 两分钟足够区分"又一次启动"和"刚清完立刻又失败"。
+ */
+const HEAL_COOLDOWN_SECS: u64 = 120;
+
+/**
+ * 前端挂载完成时报一声。
+ *
+ * 为什么需要它：**"这次启动成功了吗"只有界面自己知道**。
+ * 白屏 = 我们的 JS 一次都没跑起来，所以只要这个命令被调到，就说明
+ * 「虚拟主机映射、资源加载、CSP、IPC」这一整条链是通的。
+ * `heal_webview_profile` 拿它当"上次启动是否正常"的判据（`.epl-ok` 比 `.epl-bad` 新）。
+ *
+ * ⚠️ 顺带把版本标记补齐：全新安装时 profile 目录还不存在，开机那次自愈会提前返回
+ *    什么都不写 —— 由这里补上，第二次启动就不会再白清一遍。
+ */
+#[tauri::command]
+fn app_ready(app: tauri::AppHandle) {
+    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+        return;
+    };
+    let root: PathBuf = PathBuf::from(&local)
+        .join(app.config().identifier.clone())
+        .join("EBWebView");
+    mark(&root.join(".epl-profile"), &format!(
+        "{}|{}",
+        PROFILE_STAMP,
+        tauri::webview_version().unwrap_or_default()
+    ));
+    mark(&root.join(".epl-ok"), "ok");
+}
+
+/** 写（或刷新）一个小标记文件，顺带把父目录建出来 */
+fn mark(path: &Path, text: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, text);
+}
 
 /// 删掉一个路径（文件或目录都行）
 fn rm_any(p: &Path) -> std::io::Result<()> {
@@ -56,6 +104,35 @@ fn rm_any(p: &Path) -> std::io::Result<()> {
  *    原地逐个删的好处是：**用户数据从头到尾没被移动过**，
  *    而且就算某些文件删不掉，也只是"这次没清干净"，下次启动接着清 —— 没有中间态。
  */
+/**
+ * 除了自己以外，还有别的 edge-pdf-lite 在跑吗？
+ *
+ * 🔴 **必须在真动手清 profile 之前问这一句。**
+ *    自愈跑在 `Builder` 之前 —— 也就是**比单实例判断还早**：
+ *    用户第二次双击时，这个进程已经先把自愈跑完了，然后才轮到单实例插件把它挡掉。
+ *    要是那一轮正好命中"该自愈"，就会把**另一个正在运行的实例**的 profile 删掉一半
+ *    （开着句柄的文件删不掉，于是清得七零八落）—— 把好的弄成坏的，
+ *    正是我们要修的那个症状。
+ *
+ * ⚠️ 用 tasklist 是刻意的：这段只在**真要清之前**执行（很少见），
+ *    为它引一套 Windows API 依赖不值得，那点进程启动开销无所谓。
+ */
+fn another_instance_running() -> bool {
+    let me = std::process::id();
+    let Ok(out) = std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq edge-pdf-lite.exe", "/NH", "/FO", "CSV"])
+        .output()
+    else {
+        return false; // 查不了就当没有，别把自愈卡死
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.to_lowercase().contains("edge-pdf-lite.exe"))
+        .filter_map(|l| l.split(',').nth(1))
+        .filter_map(|s| s.trim().trim_matches('"').parse::<u32>().ok())
+        .any(|pid| pid != me)
+}
+
 fn heal_webview_profile(identifier: &str) {
     let Ok(local) = std::env::var("LOCALAPPDATA") else {
         return;
@@ -63,7 +140,7 @@ fn heal_webview_profile(identifier: &str) {
     let root: PathBuf = PathBuf::from(&local).join(identifier).join("EBWebView");
     if !root.is_dir() {
         // 全新安装：WebView2 还没建这个目录，没什么可修的
-        // （所以"第一次运行不写标记、第二次才写"是正常的）
+        // （标记由前端跑起来之后的 `app_ready` 补写，所以第二次启动不会再白清一遍）
         return;
     }
 
@@ -73,11 +150,68 @@ fn heal_webview_profile(identifier: &str) {
         tauri::webview_version().unwrap_or_default()
     );
     let stamp = root.join(".epl-profile");
-    if std::fs::read_to_string(&stamp)
+    let stamp_ok = std::fs::read_to_string(&stamp)
         .map(|s| s.trim() == want)
-        .unwrap_or(false)
-    {
-        return; // 常态：什么都没变，直接走
+        .unwrap_or(false);
+
+    /*
+     * 「上次那次启动，界面真的跑起来了吗？」
+     *
+     * 🔴 这是**唯一能覆盖未知原因**的判据。原来的写法只看"版本/结构有没有变"：
+     *    profile 一旦因为别的原因坏掉（不是版本变化），标记照样匹配 →
+     *    自愈**永远不再触发** → 用户就卡在"每次启动都白屏"里出不来
+     *    （用户报的正是这个："第二次以后启动就变成了这样"）。
+     *
+     * 两个文件比时间戳，**不靠"这次启动去删上次的标记"**：
+     *   · `.epl-bad`  `setup` 里先记一笔（"这次启动还没证明自己是好的"）
+     *   · `.epl-ok`   前端跑起来后 `app_ready` 写（更新的 mtime 把它盖过去）
+     * `bad` 更新 ⇒ 上次那次没跑到 ready ⇒ 该自愈。（两个标记都只有活下来的实例会写，
+     * 详见 `setup` 与 `app_ready` 里的说明。）
+     *
+     * ⚠️ **这两个文件只有"活下来的那个实例"会写**：`app_ready` 在窗口出来之后，
+     *    看门狗也在 `setup` 里 —— 那时候单实例插件早就把多余的实例干掉了。
+     *    之前我写的是"启动时先乐观删掉标记"，结果第二个实例（马上要被杀掉的）
+     *    也会把它删掉，害得**下一次启动误判成上次失败**。这个坑别踩回去。
+     */
+    let ok_marker = root.join(".epl-ok");
+    let bad_marker = root.join(".epl-bad");
+    let mtime = |p: &Path| -> Option<std::time::SystemTime> {
+        std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
+    };
+    let last_run_failed = match (mtime(&ok_marker), mtime(&bad_marker)) {
+        (Some(ok), Some(bad)) => bad > ok, // 上次的结果以上述两个事件里更晚的那个为准
+        (Some(_), None) => false,          // 只有 ok：上次是好的
+        (None, Some(_)) => true,           // 只有 bad：上次是坏的
+        (None, None) => false,             // 谁都没有：全新，或从没跑到过 ready（交给 stamp 那条判断）
+    };
+
+    if stamp_ok && !last_run_failed {
+        return; // 常态：版本没变、上次也正常
+    }
+    if stamp_ok && last_run_failed {
+        /*
+         * 「上次跑挂了」这条**要带冷却**，否则会变成"每次启动都重建 profile"：
+         * 清完还是坏（比如根因根本不是 profile）→ 下次又清 ……
+         * 用标记文件的年龄当"上次清理是什么时候"—— 刚清过就先正常启动，别连环清。
+         */
+        let recent = std::fs::metadata(&stamp)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age.as_secs() < HEAL_COOLDOWN_SECS)
+            .unwrap_or(false);
+        if recent {
+            return;
+        }
+    }
+
+    // 真要动手了 —— 先确认没有别的实例正在用这个 profile（见 another_instance_running）
+    if another_instance_running() {
+        let _ = std::fs::write(
+            std::env::temp_dir().join("epl-profile-heal.log"),
+            "跳过：还有另一个实例在跑，不能删它正在用的 profile\n",
+        );
+        return;
     }
 
     let keep = root.join("Default").join("Local Storage");
@@ -375,9 +509,44 @@ pub fn run() {
     heal_webview_profile(&context.config().identifier);
 
     tauri::Builder::default()
+        /*
+         * 🔴 **单实例保护，必须是第一个注册的插件**（插件文档要求）。
+         *
+         * 为什么非有不可：两次启动会去开**同一个 WebView2 profile 目录**，
+         * 而 WebView2 不允许两个浏览器进程共用它 —— 实测第二个实例起得来窗口，
+         * 但 WebView2 环境建不起来，界面就是坏的（用户报的"第二次启动就变成这样"，
+         * 而且这种坏状态还会连累下一次启动）。
+         * 有了它，第二次启动会把**已有窗口**拉到前面，不再去碰 profile。
+         */
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         // 文件 / 文件夹选择对话框（拿**真实路径**用，浏览器里没有这个能力）
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            /*
+             * 「这次启动到此为止还算数吗」——先按**坏的**记一笔，
+             * 等前端真的跑起来，`app_ready` 会用 `.epl-ok` 把它盖过去（更新的 mtime）。
+             *
+             * 🔴 为什么写在 `setup` 而不是更早：**只有活下来的那个实例会走到这儿**。
+             *    第二次双击的那个进程在单实例插件里就被干掉了（插件注册在最前面、
+             *    初始化也在我们前面），所以它一个字都不会写 —— 这正是我第一版写错的地方
+             *    （把标记写在 Builder 之前，结果被要死的实例篡改，下一次启动误判）。
+             *
+             * 这一笔同时覆盖了两种"没跑起来"：
+             *   · 白屏（JS 从没执行 → 没人写 `.epl-ok`）
+             *   · 用户看到白屏就关掉了（哪怕只开了一秒，`.epl-bad` 已经记下了）
+             */
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                let root = PathBuf::from(&local)
+                    .join(app.config().identifier.clone())
+                    .join("EBWebView");
+                mark(&root.join(".epl-bad"), "started, waiting for app_ready");
+            }
             if cfg!(debug_assertions) {
                 app.handle()
                     .plugin(
@@ -395,7 +564,8 @@ pub fn run() {
             default_save_dir,
             write_pdf_b64,
             reveal_in_folder,
-            rename_file
+            rename_file,
+            app_ready
         ])
         .run(context)
         .expect("error while building tauri application");

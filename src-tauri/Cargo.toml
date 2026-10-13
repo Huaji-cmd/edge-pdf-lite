@@ -30,6 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.12.3", features = [] }
 tauri-plugin-log = "2"
+tauri-plugin-single-instance = "2"
 
 # ⚠️ 这一行看着像多余（我们自己的 Rust 代码里没用到 indexmap），
 #    但它修的是一个**编译不过去**的依赖 bug，别删：
