@@ -823,11 +823,25 @@ try {
     ftBlack ? `color=[${ftBlack.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
   )
   await shot('03d-freetext-black')
-  // 改回蓝色，后面几张截图好看一点
-  await evaluate(`document.querySelector('[data-tid="te-color"]')?.click()`)
+  /*
+   * 改回蓝色，后面几张截图好看一点。
+   *
+   * ⚠️ 色板选完**不会自动关**（用户可能想连着调几档试试），所以这里必须写成
+   *    「没开才点」—— 无条件点一次 `te-color` 会把它**关掉**，紧接着那次 swatch 点击
+   *    就静默失效：截图里字还是黑的，而脚本一声不吭。（第一版就是这么写的。）
+   */
+  await evaluate(`(() => {
+    if (!document.querySelector('.te-swatches')) document.querySelector('[data-tid="te-color"]')?.click();
+  })()`)
   await sleep(200)
   await evaluate(`document.querySelectorAll('.te-swatches .te-sw')[5]?.click()`)
   await sleep(300)
+  const backToBlue = (await annots()).find((a) => a.id === ft?.id)
+  check(
+    '（截图整理）字色确实改回蓝色了',
+    !!backToBlue && backToBlue.color[2] > 0.8 && backToBlue.color[0] < 0.3,
+    backToBlue ? `color=[${backToBlue.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
+  )
 
   // ---------------------------------------------------------------- 5. 拖动（左实心条）
 
