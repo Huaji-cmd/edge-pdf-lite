@@ -13,10 +13,30 @@ import type { PageSize, ViewMode } from './types'
 import { AnnotationStore } from '@/annot/store'
 import { AnnotLayer } from '@/annot/annotLayer'
 import { AnnotEditor, HANDLES } from '@/annot/editor'
-import type { TextRequestResult } from '@/annot/editor'
 import type { HandleId } from '@/annot/geometry'
-import type { ToolKind, ToolColors, PointerMode, Rgb, SelectedInfo } from '@/annot/types'
-import { isResizable, isMarkupTool, sanitizeToolColor } from '@/annot/types'
+import type {
+  ToolKind,
+  ToolColors,
+  PointerMode,
+  Rgb,
+  SelectedInfo,
+  Annotation,
+  FreeTextAnnot,
+  Rect,
+} from '@/annot/types'
+import {
+  isResizable,
+  isMarkupTool,
+  sanitizeToolColor,
+  normalizeRect,
+  FONT_SIZES,
+  FONT_SIZE_LABELS,
+  FREETEXT_SWATCHES,
+  FREETEXT_FONT_FAMILY,
+  nearestFontSize,
+} from '@/annot/types'
+import { lineHeightOf, textPad, wrapText } from '@/annot/textWrap'
+import { rgbCss } from '@/annot/draw'
 import { PageTransform } from '@/annot/coords'
 
 const props = defineProps<{
@@ -31,6 +51,8 @@ const props = defineProps<{
   colors: ToolColors
   /** 手写笔尖粗细（pt）—— 工具栏三档之一，改了立刻对下一笔生效 */
   inkWidth: number
+  /** 新建文本框的默认字号（pt）—— 工具栏三档之一 */
+  fontSize: number
 }>()
 
 /** scale 用 v-model 双向绑定：父组件（工具栏）也能改 */
@@ -49,6 +71,8 @@ const emit = defineEmits<{
   'history-change': [state: { canUndo: boolean; canRedo: boolean }]
   /** 工具用完自己退出了（目前只有文本框）—— 工具栏的按钮高亮要跟着复位 */
   'tool-auto-exit': []
+  /** 用户在文本框里改了字号 —— 上层把它记成"下一个新框的默认字号" */
+  'font-size-change': [size: number]
 }>()
 
 const MIN_SCALE = 0.2
@@ -113,9 +137,22 @@ const selBox = ref<{ left: number; top: number; width: number; height: number } 
 const canUndo = ref(false)
 const canRedo = ref(false)
 
-const selResizable = computed(() => {
+/**
+ * 要不要画那 8 个改大小的手柄。
+ *
+ * ⚠️ 文本框**排除在外**：它有自己的 Chrome（左实心条 + 右圆圈 + 三边虚线，见
+ *    `.text-edit`），再叠一层 8 手柄会两边打架 —— 而且用户在文本框上要做的是
+ *    "改字、调宽度"，不是"四角拉伸"。
+ */
+const selHandlesVisible = computed(() => {
   const a = selId.value ? annotStore.get(selId.value) : null
-  return !!a && isResizable(a)
+  return !!a && isResizable(a) && a.kind !== 'freetext'
+})
+
+/** 选中框本体：文本框不画（编辑态自己有框） */
+const selBoxVisible = computed(() => {
+  const a = selId.value ? annotStore.get(selId.value) : null
+  return !!a && a.kind !== 'freetext'
 })
 
 const selBoxStyle = computed(() => {
@@ -124,10 +161,97 @@ const selBoxStyle = computed(() => {
   return { left: `${b.left}px`, top: `${b.top}px`, width: `${b.width}px`, height: `${b.height}px` }
 })
 
-/** 文字工具用的小输入框（居中弹，不做点击处定位 —— 便宜且够用） */
-const textModal = ref<{ open: boolean; value: string }>({ open: false, value: '' })
-let textResolve: ((r: { text: string; cssWidth: number; cssHeight: number } | null) => void) | null =
-  null
+// ---------------------------------------------------------------- 文本框：就地编辑
+
+/**
+ * 就地文本编辑（复刻 Edge 的文本框）。
+ *
+ * 交互：点页面就地出现一个框 —— **左边实心条**拖动位置、**右边圆圈**调宽度、
+ * 其余三边虚线；输入到框宽**自动换行**；点空白处收起，盒子消失、文字与 PDF 融为一体。
+ *
+ * 两条不写下来就会踩的规则：
+ *
+ * ⚠️ **编辑中的那条批注要从画布上排除掉**（见 annotLayer 的取数回调）。
+ *    画布画一遍、DOM 又画一遍同样的字 → 看起来像被人描了粗体，而且选区位置对不上。
+ *
+ * ⚠️ **`textEditBox` 必须跟着缩放/滚动重算**（refreshTextEditBox）。
+ *    它存的是"页内 CSS"坐标，缩放一变就不对了；不重算的话编辑框会飘到别处。
+ */
+const textEditId = ref<string | null>(null)
+const textEditBox = ref<{ left: number; top: number; width: number; height: number } | null>(null)
+const textEditEl = ref<HTMLElement | null>(null)
+/** 字号/颜色工具条是否展开 */
+const textMenuOpen = ref(false)
+/** 每次进入编辑态 +1，用来丢弃过期的异步定位结果 */
+let textEditToken = 0
+
+/**
+ * 等编辑框渲染出来之后要把光标放进去。
+ *
+ * ⚠️ 不能直接在 beginTextEdit 里 `nextTick(focus)`：编辑框的位置是**异步**算出来的
+ *（要 `await doc.getPage()`），那一刻元素还不存在，focus 会静默失败 ——
+ * 症状是"框出来了但打不了字"，而且控制台一声不吭。
+ */
+let textPendingFocus = false
+/** 进入编辑时的快照；null = 这次是**新建**的框（新建已经进过一次历史，收尾不再记） */
+let textEditBefore: Annotation | null = null
+
+/**
+ * 正在编辑的那条批注。
+ *
+ * 🔴 **必须是一个由我们显式同步的 shallowRef，不能写成「computed 里调 store.get()」**。
+ *    `AnnotationStore` 是**普通类、不是响应式对象** —— 放进 computed 会被**永久缓存**：
+ *    第一次取到的那份对象之后再也不更新。踩过的两个症状都由此而来：
+ *      · 改字号时读到的 `contents` 还是「新建时的空串」→ 文本被清空
+ *      · 拖动时读到的 `rect` 还是旧值 → 编辑框不跟随（数据其实早就对了）
+ *    取值一律走 `currentFreeText()`（每次都从 store 拉最新）；
+ *    渲染用的 `textEditFree` 依赖这个 ref，所以才有响应性。
+ */
+const textEditAnnotRef = shallowRef<Annotation | null>(null)
+
+function syncTextEditAnnot(): void {
+  const id = textEditId.value
+  textEditAnnotRef.value = id ? ((annotStore.get(id) as Annotation | null) ?? null) : null
+}
+
+/** 取当前编辑中的文本框（**总是先从 store 同步一次**，避免拿到过期对象） */
+function currentFreeText(): FreeTextAnnot | null {
+  syncTextEditAnnot()
+  const a = textEditAnnotRef.value
+  return a && a.kind === 'freetext' ? a : null
+}
+
+/**
+ * 同上，但收窄成 `FreeTextAnnot`。
+ *
+ * 单独一个 computed 是为了让模板里的类型检查能干净地通过 ——
+ * 否则每个用到 `fontSize` 的地方都要写断言，还容易写漏。
+ */
+const textEditFree = computed<FreeTextAnnot | null>(() => {
+  const a = textEditAnnotRef.value
+  return a && a.kind === 'freetext' ? a : null
+})
+
+const textEditStyle = computed(() => {
+  const b = textEditBox.value
+  if (!b || !textEditFree.value) return null
+  return { left: `${b.left}px`, top: `${b.top}px`, width: `${b.width}px`, height: `${b.height}px` }
+})
+
+/** 可编辑区自己的样式：字体、行高、颜色、内边距必须与绘制/写回三处一致 */
+const textEditInnerStyle = computed(() => {
+  const a = textEditFree.value
+  if (!a) return null
+  const s = scale.value
+  const pad = textPad(a.fontSize) * s
+  return {
+    fontFamily: FREETEXT_FONT_FAMILY,
+    fontSize: `${a.fontSize * s}px`,
+    lineHeight: `${lineHeightOf(a.fontSize) * s}px`,
+    color: rgbCss(a.color),
+    padding: `${pad}px`,
+  }
+})
 
 // ---------------------------------------------------------------- 版面
 
@@ -335,8 +459,6 @@ function renderAnnotsIfScaleChanged(): void {
 }
 
 // ---------------------------------------------------------------- 批注交互
-
-const textModalInput = ref<HTMLTextAreaElement | null>(null)
 
 function locatePage(e: { clientX: number; clientY: number }): {
   pageNumber: number
@@ -710,33 +832,304 @@ async function updateSelBox(): Promise<void> {
 /** 批注被删掉（擦除 / 撤销）之后，选中态不能还留着 —— 否则手柄画在空气上 */
 function validateSelection(): void {
   if (selId.value && !annotStore.get(selId.value)) annotEditor?.setSelected(null)
+  /*
+   * ⚠️ 正在编辑的那条被删掉时（`Delete` / 工具栏的「删除所选」/ 撤销），
+   *    编辑态必须一起清 —— 否则会留下"编辑框开着、但批注已经不存在"的幽灵：
+   *    `currentFreeText()` 返回 null，框看不见了，可 `textEditId` 还指着空气，
+   *    下一次点空白也不会走"结束编辑"那条路。
+   */
+  if (textEditId.value && !annotStore.get(textEditId.value)) {
+    textEditId.value = null
+    textEditBox.value = null
+    textEditAnnotRef.value = null
+    textEditBefore = null
+  }
 }
 
-// ---- 文字工具的输入框（居中弹。不做点击处定位：便宜、够用、不出错位）
+// ---- 文本框：就地编辑（复刻 Edge）
 
-function openTextModal(initial = ''): Promise<TextRequestResult | null> {
-  textModal.value = { open: true, value: initial }
-  void nextTick(() => textModalInput.value?.focus())
-  return new Promise((resolve) => {
-    textResolve = resolve
-  })
+/**
+ * 进入编辑态。宿主接口 `beginTextEdit` 与"选中文本框"两条路都来这里。
+ *
+ * @param isNew 这次是**新建**的框。新建时 store 已经 `add` 过一次（那条就是历史），
+ *              所以收尾时不再补一条 edit 记录 —— 否则 Ctrl+Z 要按两下才见效。
+ */
+function beginTextEdit(annotId: string, isNew?: boolean): void {
+  const a = annotStore.get(annotId)
+  if (!a || a.kind !== 'freetext') return
+  if (textEditId.value === annotId) return // 已经在编辑它了，别重入（会重置快照）
+  /*
+   * ⚠️ 从**另一个**文本框切过来时，先把上一个的编辑会话收尾（提交历史）。
+   *    不收的话：那一段编辑既没进历史、`textEditBefore` 也被覆盖 —— 用户点来点去
+   *    就会丢掉中间那些改动。
+   */
+  if (textEditId.value) endTextEdit()
+  textEditId.value = annotId
+  syncTextEditAnnot()
+  /*
+   * `isNew` 没显式给出来时按"内容为空"推断。
+   *
+   * 这条兜底是有用的：编辑会话有**两个**入口（工具点出来的新建、以及"选中即进编辑"），
+   * 后者拿不到这个标志。而空文本的框只可能是刚建出来的 —— 收尾时 `endTextEdit`
+   * 会把没打字的框直接删掉，所以能存下来的框一定非空。
+   */
+  const fresh = isNew ?? String(a.contents ?? '').trim() === ''
+  textEditBefore = fresh ? null : ({ ...a, rect: [...a.rect] as Rect } as Annotation)
+  textMenuOpen.value = false
+  // 焦点要等**编辑框真的渲染出来**才能给 —— 而它依赖异步算出来的位置。
+  // 所以这里只挂个标记，由 refreshTextEditBox 在定位完成后收尾（见那里的注释）。
+  textPendingFocus = true
+  void refreshTextEditBox()
 }
 
-function closeTextModal(result: TextRequestResult | null): void {
-  const fn = textResolve
-  textResolve = null
-  textModal.value = { open: false, value: '' }
-  fn?.(result)
+/** 把光标放到可编辑区末尾（重新编辑时用户多半是接着改） */
+function focusTextEditor(): void {
+  const el = textEditEl.value
+  if (!el) return
+  el.focus()
+  const r = document.createRange()
+  r.selectNodeContents(el)
+  r.collapse(false)
+  const sel = window.getSelection()
+  sel?.removeAllRanges()
+  sel?.addRange(r)
 }
 
-function confirmTextModal(): void {
-  const t = textModal.value.value
-  if (!t.trim()) {
-    closeTextModal(null)
+/**
+ * 重算编辑框位置。缩放 / 版面变化后必须调，否则框会飘。
+ *
+ * ⚠️ 坐标是**相对 `.content`** 的，不是相对页槽：页槽是 `overflow: hidden` 的
+ *（为了裁批注手柄），而编辑框的工具条要浮在框**上方**、右圆圈还会探出右边 ——
+ * 挂在页槽里会被裁掉。所以这里额外加上该页在 `.content` 里的偏移。
+ */
+async function refreshTextEditBox(): Promise<void> {
+  const token = ++textEditToken
+  const a = currentFreeText()
+  if (!a) {
+    textEditBox.value = null
     return
   }
-  const lines = Math.max(1, t.split('\n').length)
-  closeTextModal({ text: t, cssWidth: 190, cssHeight: 22 + lines * 18 })
+  const slot = layout.value?.pages.find((p) => p.pageNumber === a.pageNumber)
+  if (!slot) {
+    textEditBox.value = null
+    return
+  }
+  const page = await props.doc.getPage(a.pageNumber)
+  if (token !== textEditToken || textEditId.value !== a.id) return
+  const tf = new PageTransform(page.getViewport({ scale: scale.value }))
+  const [left, top, width, height] = tf.rectToView(a.rect)
+  const s = scale.value
+  textEditBox.value = { left: slot.x * s + left, top: slot.y * s + top, width, height }
+
+  // 位置就绪 → 元素才真的挂上去了，这时候给焦点才有效
+  if (textPendingFocus) {
+    textPendingFocus = false
+    await nextTick()
+    focusTextEditor()
+  }
+}
+
+/**
+ * 按当前框宽断行、写回批注，并把框高调成"正好放下这些行"。
+ *
+ * ⚠️ `text` 存**断行后**的文本（`\n` 分隔），`contents` 存**原始**文本：
+ *    · `text` 给绘制与写回用（PDF 内容流没有自动换行，只能吃显式换行）
+ *    · `contents` 是 /Contents，也是用户再次编辑时看到的原文 —— 不带我们插进去的换行
+ */
+function rewrap(a: FreeTextAnnot, raw: string): FreeTextAnnot {
+  const wPt = a.rect[2] - a.rect[0]
+  const pad = textPad(a.fontSize)
+  const avail = Math.max(8, wPt - pad * 2)
+  const lines = wrapText(raw, avail, a.fontSize)
+  const lh = lineHeightOf(a.fontSize)
+  const hPt = Math.max(lh + pad * 2, lines.length * lh + pad * 2)
+  // 框**上边固定、往下长**（页面空间 y 向上，所以是 top - h）
+  const top = a.rect[3]
+  return {
+    ...a,
+    text: lines.join('\n'),
+    contents: raw,
+    rect: normalizeRect([a.rect[0], top - hPt, a.rect[2], top]),
+  }
+}
+
+/** 输入时：断行 + 回写 + 重绘（走 replace，不进历史 —— 整个编辑过程只记一条） */
+function onTextInput(): void {
+  const a = currentFreeText()
+  const el = textEditEl.value
+  if (!a || a.kind !== 'freetext' || !el) return
+  const raw = el.innerText.replace(/\n$/, '')
+  const next = rewrap(a as FreeTextAnnot, raw)
+  annotStore.replace(a.id, next)
+  onAnnotChanged(a.pageNumber)
+  emit('annot-count', annotStore.count())
+  void refreshTextEditBox()
+}
+
+/**
+ * Enter 自己插 `\n`，不用浏览器的默认行为。
+ *
+ * 默认行为会插入 `<div>` / `<br>`，取回的 `innerText` 里换行数不一定对得上
+ * （空行尤其容易丢），而我们是按 `\n` 断行、按 `\n` 写回 PDF 的 —— 对齐不了就是
+ * "编辑时看到的行数"和"写回后的行数"不一致。配合 `white-space: pre-wrap`，
+ * 文本节点里的 `\n` 就是硬换行。
+ */
+function onTextKeydown(e: KeyboardEvent): void {
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    annotEditor?.setSelected(null) // 走统一出口 → onSelectionChange → endTextEdit
+    return
+  }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault()
+    const sel = window.getSelection()
+    if (!sel || !sel.rangeCount) return
+    const r = sel.getRangeAt(0)
+    r.deleteContents()
+    const tn = document.createTextNode('\n')
+    r.insertNode(tn)
+    r.setStartAfter(tn)
+    r.collapse(true)
+    sel.removeAllRanges()
+    sel.addRange(r)
+    onTextInput()
+    return
+  }
+  // 其它键（含 Ctrl+Z）留在编辑框里，别冒泡去触发全局快捷键
+  e.stopPropagation()
+}
+
+/** 结束编辑：空文本的框直接删掉（"随手点一下"不该在文档里留个空框） */
+function endTextEdit(): void {
+  const id = textEditId.value
+  if (!id) return
+  textEditId.value = null
+  textEditBox.value = null
+  textMenuOpen.value = false
+  textEditAnnotRef.value = null
+  const a = annotStore.get(id)
+  if (!a || a.kind !== 'freetext') return
+
+  /*
+   * ⚠️ `textEditBefore === null` 就是「这是新建的框」的信号（见 `beginTextEdit`）。
+   *    新建的框**不能**用 `commitEdit`：它会在 `add` 之上再压一条 `edit`，
+   *    于是"撤销一次"只退回到空框，用户得按两次才删得掉。
+   */
+  const before = textEditBefore
+  if (!String(a.contents ?? '').trim()) {
+    /*
+     * 空框（没打字就点空白处）：
+     *   · 新建的 → 把那条 `add` 一起抹掉。不抹的话撤销会把空框请回来，
+     *     而且它还会作为一条**空批注**被写进 PDF。
+     *   · 编辑既有框时清空内容 = 删除 → 正常记一条 `remove`。
+     */
+    if (before) annotStore.remove(id)
+    else annotStore.collapseNewAnnot(id, null)
+    textEditBefore = null
+    emit('annot-count', annotStore.count())
+    emit('history-change', { canUndo: annotStore.canUndo(), canRedo: annotStore.canRedo() })
+    void annotLayer?.render(a.pageNumber, scale.value)
+    return
+  }
+  // 有内容：整个编辑过程塌成**一条**历史（编辑途中都走 replace）
+  if (before) annotStore.commitEdit(before, a)
+  else annotStore.collapseNewAnnot(id, a)
+  textEditBefore = null
+  onAnnotChanged(a.pageNumber)
+}
+
+/** 工具条：改字号（改完按新字号重新断行，框高跟着变） */
+function setTextFontSize(size: number): void {
+  const a = currentFreeText()
+  if (!a) return
+  const s = nearestFontSize(size)
+  if (s === a.fontSize) return
+  const next = rewrap({ ...a, fontSize: s }, String(a.contents ?? a.text))
+  annotStore.replace(a.id, next)
+  onAnnotChanged(a.pageNumber)
+  void refreshTextEditBox()
+  // 记成"下一个新框的默认字号"（Edge 也是这个行为：工具栏挂在框上，改完就跟着走）
+  emit('font-size-change', s)
+}
+
+/** 工具条：改字色 */
+function setTextColor(c: Rgb): void {
+  const a = currentFreeText()
+  if (!a) return
+  annotStore.replace(a.id, { ...a, color: [...c] as Rgb } as Annotation)
+  onAnnotChanged(a.pageNumber)
+}
+
+/** 工具条：删掉这个文本框 */
+function deleteTextAnnot(): void {
+  const a = currentFreeText()
+  if (!a) return
+  const pn = a.pageNumber
+  textEditId.value = null
+  textEditBox.value = null
+  textEditBefore = null
+  textEditAnnotRef.value = null
+  annotStore.remove(a.id)
+  annotEditor?.setSelected(null)
+  emit('annot-count', annotStore.count())
+  emit('history-change', { canUndo: true, canRedo: false })
+  void annotLayer?.render(pn, scale.value)
+}
+
+// ---- 编辑框上的两个手柄：左实心条（拖动）/ 右圆圈（调宽度）
+
+let textDrag: {
+  mode: 'move' | 'width'
+  startX: number
+  startY: number
+  rect: Rect
+  scale: number
+} | null = null
+
+function onTextHandleDown(e: PointerEvent, mode: 'move' | 'width'): void {
+  const a = currentFreeText()
+  if (!a) return
+  e.preventDefault()
+  e.stopPropagation()
+  ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+  textDrag = {
+    mode,
+    startX: e.clientX,
+    startY: e.clientY,
+    rect: [...a.rect] as Rect,
+    scale: Math.max(scale.value, 0.01),
+  }
+}
+
+function onTextHandleMove(e: PointerEvent): void {
+  if (!textDrag) return
+  const a = currentFreeText()
+  if (!a) return
+  e.preventDefault()
+  e.stopPropagation()
+  const dx = (e.clientX - textDrag.startX) / textDrag.scale
+  const dy = (e.clientY - textDrag.startY) / textDrag.scale
+  const r = textDrag.rect
+  if (textDrag.mode === 'move') {
+    // 屏幕 y 向下、页面 y 向上 → dy 取反
+    const next = [r[0] + dx, r[1] - dy, r[2] + dx, r[3] - dy] as Rect
+    annotStore.replace(a.id, { ...a, rect: normalizeRect(next) } as Annotation)
+  } else {
+    // 只改宽度；改完必须重新断行，否则文字会溢出或提前换行
+    const w = Math.max(24, r[2] - r[0] + dx)
+    const wider = { ...(a as FreeTextAnnot), rect: normalizeRect([r[0], r[1], r[0] + w, r[3]]) as Rect }
+    annotStore.replace(a.id, rewrap(wider, String(a.contents ?? a.text)))
+  }
+  onAnnotChanged(a.pageNumber)
+  void refreshTextEditBox()
+}
+
+function onTextHandleUp(e: PointerEvent): void {
+  if (!textDrag) return
+  e.preventDefault()
+  e.stopPropagation()
+  textDrag = null
+  // 几何改动不在这里进历史 —— 整个编辑过程结束时统一塌成一条（见 endTextEdit）
 }
 
 // ---- 变更通知
@@ -1092,7 +1485,9 @@ function makeEditor(layer: AnnotLayer, doc: PdfDocument): AnnotEditor {
     // 兜一层：localStorage 里可能留着旧版本存的黑/白高亮色
     colorFor: (kind) => sanitizeToolColor(kind, props.colors[kind]),
     inkWidth: () => props.inkWidth,
-    requestText: (_pn, _x, _y, initial) => openTextModal(initial ?? ''),
+    fontSize: () => props.fontSize,
+    // ⚠️ 要原样透传 `isNew`（别写成 `=== true`）—— `undefined` 走的是"按内容推断"那条路
+    beginTextEdit: (id, isNew) => beginTextEdit(id, isNew),
     onChange: (pn) => onAnnotChanged(pn),
     onSelectionChange: (id) => {
       const a = id ? (annotStore.get(id) ?? null) : null
@@ -1100,6 +1495,19 @@ function makeEditor(layer: AnnotLayer, doc: PdfDocument): AnnotEditor {
       selPage.value = a?.pageNumber ?? 0
       emit('sel-change', a ? { id: a.id, kind: a.kind, color: a.color } : null)
       void updateSelBox()
+      /*
+       * 文本框一被选中就直接进编辑态。
+       *
+       * 这是复刻 Edge 的行为，也是唯一说得通的状态：文本框"选中但不可操作"
+       * 对用户没有意义（别的批注选中是为了拖/改大小，文本框这两件事在编辑态里做）。
+       *
+       * ⚠️ 反过来说，**选中了别的东西（或点空）也必须结束编辑** ——
+       *    否则会出现"框还开着、但选中的是另一条批注"，接着按 Delete 删掉的是那条
+       *    而文本框还在光标里，两个状态打架。所以下面这个条件是"选中项 ≠ 正在编辑的那个"，
+       *    不是简单的 `!a`。
+       */
+      if (a && a.kind === 'freetext') beginTextEdit(a.id)
+      else if (textEditId.value && (!a || a.id !== textEditId.value)) endTextEdit()
     },
     onSelectionGeometry: () => void updateSelBox(),
     onHistoryChange: () => pushHistory(),
@@ -1110,7 +1518,11 @@ function makeEditor(layer: AnnotLayer, doc: PdfDocument): AnnotEditor {
 onMounted(() => {
   renderer = new PageRenderer(props.doc, dpr, 2, (s) => emit('stats', s))
 
-  annotLayer = new AnnotLayer(props.doc, dpr, (pn) => annotStore.list(pn))
+  annotLayer = new AnnotLayer(props.doc, dpr, (pn) =>
+    // ⚠️ 编辑中的那个文本框要排除掉：画布画一遍、DOM 编辑框再画一遍，
+    //    字会看起来被描粗，而且浏览器算出来的选区跟画布位置对不上。
+    annotStore.list(pn).filter((a) => a.id !== textEditId.value),
+  )
   annotEditor = makeEditor(annotLayer, props.doc)
   annotEditor.setTool(props.tool)
 
@@ -1142,6 +1554,9 @@ onMounted(() => {
         // 这类交互的 bug（框没动、手柄方向反了、重做没生效）光看截图看不出来，
         // 必须能直接读到数据和可用态。
         tool: props.tool,
+        // 就地编辑框的位置（页内 CSS）。拖动之后"框有没有跟着走"要靠它判 ——
+        // 量手柄的屏幕坐标也能判，但那样出错时分不清是框没动还是手柄没动。
+        textEdit: textEditBox.value ? { ...textEditBox.value } : null,
         pointerMode: props.pointerMode,
         annotCount: annotStore.count(),
         canUndo: annotStore.canUndo(),
@@ -1188,6 +1603,11 @@ onMounted(() => {
           // 只看渲染像素能发现"粗细没变"，但定位不到是数据没写进去还是绘制没读它。
           lineWidth: a.kind === 'ink' || a.kind === 'rect' ? a.lineWidth : undefined,
           fontSize: a.kind === 'freetext' ? a.fontSize : undefined,
+          // 文本：判"自动换行断对没断对""提交后有没有留空框"都要看它
+          text: a.kind === 'freetext' ? a.text : undefined,
+          /** 原始文本（`text` 是断行后的）。两者必须分开看：写回 PDF 用 text，
+           *  再编辑用 contents；只有 contents 为空的框才会被当成"没打字"删掉 */
+          contents: a.kind === 'freetext' ? a.contents : undefined,
         }
       }),
   }
@@ -1238,7 +1658,9 @@ watch(
     annotEditor?.cancelSession()
     annotLayer?.destroy()
     annotStore.clear()
-    annotLayer = new AnnotLayer(doc, dpr, (pn) => annotStore.list(pn))
+    annotLayer = new AnnotLayer(doc, dpr, (pn) =>
+      annotStore.list(pn).filter((a) => a.id !== textEditId.value),
+    )
     // editor 里的 store 引用不变，只换 layer
     annotEditor = makeEditor(annotLayer, doc)
     annotEditor.setTool(props.tool)
@@ -1263,6 +1685,8 @@ watch(scale, () => {
   void nextTick(() => refreshRequests())
   // 选中框的位置是"页内 CSS"（已乘 scale），缩放后必须跟着重算，否则手柄会飘走
   void updateSelBox()
+  // 就地编辑框同理 —— 不重算的话，改完缩放编辑框会留在旧位置
+  if (textEditId.value) void refreshTextEditBox()
 })
 
 /**
@@ -1327,12 +1751,12 @@ watch(
             位置是"页内 CSS"（已乘 scale、已处理 /Rotate），所以旋转页上手柄不会歪。
           -->
           <div
-            v-if="selId && selPage === p.pageNumber && selBoxStyle"
+            v-if="selBoxVisible && selPage === p.pageNumber && selBoxStyle"
             class="sel-box"
             :style="selBoxStyle"
             @dblclick.stop="onSelDblClick"
           >
-            <template v-if="selResizable">
+            <template v-if="selHandlesVisible">
               <div
                 v-for="h in HANDLES"
                 :key="h"
@@ -1343,27 +1767,115 @@ watch(
             </template>
           </div>
         </div>
-      </div>
-    </div>
+        <!--
+          就地文本编辑框（复刻 Edge 的文本框）。
 
-    <!-- 文字批注输入框 -->
-    <div v-if="textModal.open" class="modal-mask" @pointerdown.self="closeTextModal(null)">
-      <div class="modal" @pointerdown.stop>
-        <div class="modal-title">批注文字</div>
-        <textarea
-          ref="textModalInput"
-          v-model="textModal.value"
-          rows="3"
-          placeholder="输入内容（支持中文）· Ctrl+Enter 确定 · Esc 取消"
-          @keydown.enter.ctrl.prevent="confirmTextModal"
-          @keydown.esc.prevent="closeTextModal(null)"
-        />
-        <div class="modal-actions">
-          <button class="mbtn ghost" @click="closeTextModal(null)">取消</button>
-          <button class="mbtn" @click="confirmTextModal">确定</button>
+          ⚠️ 挂在 `.content` 上、**不是**页槽里：页槽是 `overflow: hidden`
+             （为了裁批注手柄），而这里有两样东西必须探出页槽 ——
+             浮在框上方的工具条、以及右边那个调宽度的圆圈。
+           ⚠️ 容器是 `pointer-events: none`，只有子元素接手事件 ——
+             这样"点在框外空白处"才真的落到页面上（从而结束编辑、收起框）。
+        -->
+        <div
+          v-if="textEditFree && textEditStyle"
+          class="text-edit"
+          :style="textEditStyle"
+          data-tid="text-edit"
+        >
+          <!-- 工具条：字号三档 + 字色 + 删除（贴框上方，position:fixed 由 CSS 决定） -->
+          <div class="te-tools" @pointerdown.stop>
+            <span class="te-label">字号</span>
+            <button
+              v-for="(s, i) in FONT_SIZES"
+              :key="s"
+              class="te-size"
+              :class="{ on: textEditFree.fontSize === s }"
+              :data-tid="`te-size-${i}`"
+              :title="`字号${FONT_SIZE_LABELS[i]}（${s}pt）`"
+              @click="setTextFontSize(s)"
+            >
+              {{ FONT_SIZE_LABELS[i] }}
+            </button>
+            <span class="te-sep" />
+            <button
+              class="te-icon-btn"
+              data-tid="te-color"
+              title="字体颜色"
+              :style="{ color: rgbCss(textEditFree.color) }"
+              @click.stop="textMenuOpen = !textMenuOpen"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <text x="12" y="17" text-anchor="middle" font-size="16" fill="currentColor">A</text>
+              </svg>
+              <span class="te-bar" :style="{ background: rgbCss(textEditFree.color) }" />
+            </button>
+            <span class="te-sep" />
+            <button class="te-icon-btn" data-tid="te-delete" title="删除这个文本框" @click="deleteTextAnnot">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" />
+              </svg>
+            </button>
+
+            <div v-if="textMenuOpen" class="te-swatches" @pointerdown.stop>
+              <button
+                v-for="c in FREETEXT_SWATCHES"
+                :key="c.join()"
+                class="te-sw"
+                :class="{ on: c.join() === textEditFree.color.join() }"
+                :style="{ background: rgbCss(c) }"
+                :title="'字体颜色'"
+                @click.stop="setTextColor(c)"
+              />
+            </div>
+          </div>
+
+          <!-- 左边那条实心把手：拖动整个框 -->
+          <div
+            class="te-grip"
+            data-tid="te-grip"
+            title="拖动文本框"
+            @pointerdown="onTextHandleDown($event, 'move')"
+            @pointermove="onTextHandleMove"
+            @pointerup="onTextHandleUp"
+            @pointercancel="onTextHandleUp"
+          >
+            <svg viewBox="0 0 6 10" aria-hidden="true">
+              <circle cx="1.5" cy="1.5" r="1" /><circle cx="4.5" cy="1.5" r="1" />
+              <circle cx="1.5" cy="5" r="1" /><circle cx="4.5" cy="5" r="1" />
+              <circle cx="1.5" cy="8.5" r="1" /><circle cx="4.5" cy="8.5" r="1" />
+            </svg>
+          </div>
+
+          <!-- 右边那个圆圈：调宽度 -->
+          <div
+            class="te-widen"
+            data-tid="te-widen"
+            title="拖动调整宽度"
+            @pointerdown="onTextHandleDown($event, 'width')"
+            @pointermove="onTextHandleMove"
+            @pointerup="onTextHandleUp"
+            @pointercancel="onTextHandleUp"
+          />
+
+          <div
+            ref="textEditEl"
+            class="te-input"
+            data-tid="te-input"
+            contenteditable="true"
+            spellcheck="false"
+            :style="textEditInnerStyle"
+            @input="onTextInput"
+            @keydown="onTextKeydown"
+            @pointerdown.stop
+          />
         </div>
       </div>
     </div>
+
+    <!--
+      文本框不再有"居中弹窗"这回事了 —— 改成页面上的就地编辑（见 .text-edit）。
+      原来那个模态的模板/CSS 一起删掉了，免得留一堆没人用的死样式。
+    -->
   </div>
 </template>
 
@@ -1604,72 +2116,181 @@ watch(
   cursor: grabbing;
 }
 
-/* ---- 文字输入框 ---- */
+/* ---- 就地文本框（复刻 Edge 的文本框） ---- */
 
-.modal-mask {
-  position: fixed;
-  inset: 0;
-  background: var(--scrim);
+/*
+ * 容器只负责定位 + 三边虚线。左边那条由实心把手占掉，所以不给左边框。
+ * ⚠️ `pointer-events: none`：让"点在框外空白处"真的落到页面上，
+ *    从而结束编辑、把框收起来 —— 这是用户要的核心行为。
+ */
+.text-edit {
+  position: absolute;
+  pointer-events: none;
+  z-index: 6;
+  border: 1px dashed var(--accent-strong);
+  border-left: 0;
+  box-sizing: border-box;
+}
+
+/*
+ * 可编辑区。
+ *
+ * ⚠️ **背景必须透明**，不能用主题底色。
+ *    编辑框是压在 PDF 的**白纸**上的，字色是用户选的（常见是深蓝/黑）。
+ *    一旦填主题底色，暗色主题下就变成"深色底 + 深色字" —— 打字时几乎看不见，
+ *    而且这个问题只在暗色主题下出现，很容易漏测。Edge 也是透明的。
+ */
+.te-input {
+  pointer-events: auto;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  outline: none;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  cursor: text;
+  background: transparent;
+}
+
+/* 左边实心把手：拖动整个框（Edge 就是这条蓝条） */
+.te-grip {
+  pointer-events: auto;
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 14px;
+  background: var(--accent-strong);
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 100;
+  cursor: move;
+}
+.te-grip svg {
+  width: 6px;
+  height: 10px;
+  fill: rgba(255, 255, 255, 0.9);
 }
 
-.modal {
-  width: 380px;
-  max-width: calc(100vw - 40px);
+/* 右边圆圈：调宽度 */
+.te-widen {
+  pointer-events: auto;
+  position: absolute;
+  right: -6px;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  margin-top: -6px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  border: 2px solid var(--accent-strong);
+  cursor: ew-resize;
+}
+
+/* 工具条：浮在框上方（所以编辑框必须挂在 .content 上，见模板里的说明） */
+.te-tools {
+  pointer-events: auto;
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
   background: var(--surface-2);
   border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  padding: 16px;
-  box-shadow: 0 16px 48px var(--shadow-lg);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px var(--shadow);
+  white-space: nowrap;
 }
-
-.modal-title {
-  font-size: 13px;
+.te-label {
+  font-size: 11px;
   color: var(--dim);
-  margin-bottom: 10px;
+  margin-right: 2px;
 }
-
-.modal textarea {
-  width: 100%;
-  box-sizing: border-box;
-  resize: vertical;
-  background: var(--viewport-bg);
-  color: var(--fg);
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  padding: 9px 10px;
-  font: 13px/1.5 "Microsoft YaHei", system-ui, sans-serif;
-  outline: none;
-}
-.modal textarea:focus {
-  border-color: var(--accent);
-}
-
-.modal-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.mbtn {
-  padding: 6px 16px;
-  border: 0;
-  border-radius: 6px;
-  background: var(--accent-solid);
-  color: var(--on-accent);
+.te-size {
+  min-width: 26px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg-2);
   font: inherit;
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 12px;
   cursor: pointer;
 }
-.mbtn.ghost {
+.te-size:hover {
+  background: var(--hover);
+}
+.te-size.on {
   background: var(--btn);
-  color: var(--fg-2);
-  font-weight: 500;
+  border-color: var(--line-strong);
+  color: var(--fg);
+}
+.te-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--line);
+  margin: 0 2px;
+}
+.te-icon-btn {
+  position: relative;
+  width: 26px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+}
+.te-icon-btn:hover {
+  background: var(--hover);
+}
+.te-icon-btn svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+}
+/* 「A」下面那条颜色指示（和 Edge 那个 A 一致） */
+.te-icon-btn .te-bar {
+  position: absolute;
+  left: 5px;
+  right: 5px;
+  bottom: 3px;
+  height: 3px;
+  border-radius: 1px;
+}
+
+.te-swatches {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 6px);
+  display: grid;
+  grid-template-columns: repeat(5, auto);
+  gap: 6px;
+  padding: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px var(--shadow);
+}
+.te-sw {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+}
+.te-sw.on {
+  border-color: var(--on-accent);
 }
 
 /*

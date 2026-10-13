@@ -21,7 +21,8 @@
  */
 
 import type { Annotation, Rgb } from './types'
-import { isMarkup } from './types'
+import { isMarkup, FREETEXT_FONT_FAMILY } from './types'
+import { lineHeightOf, textPad } from './textWrap'
 import type { PageTransform } from './coords'
 
 export function rgbCss(c: Rgb, alpha = 1): string {
@@ -142,22 +143,27 @@ export function drawAnnotation(
     ctx.lineWidth = Math.max(0.5, a.lineWidth * scale)
     ctx.strokeRect(l, t, w, h)
   } else if (a.kind === 'freetext') {
-    const [l, t, w, h] = tf.rectToView(a.rect)
+    /*
+     * **只画字，不画白底、不画边框。**
+     *
+     * 用户要的效果是"收起编辑框之后，文字跟 PDF 融为一体"（Edge 的文本框就是这样）。
+     * 所以这里没有底色和边框 —— 写回 PDF 时也一并对齐，
+     * 否则会出现"应用里是融合的、在 Acrobat 里又变成框着的"这种更难受的不一致。
+     *
+     * 行高与内边距都取自 `textWrap.ts`：那两处（绘制 / 断行 / 写回）必须用同一个值，
+     * 否则换行位置会差一点点，看起来像"写回之后排版变了"。
+     */
+    const [l, t, w] = tf.rectToView(a.rect)
     const fs = a.fontSize * scale
-    ctx.strokeStyle = rgbCss(a.color, 0.55)
-    ctx.lineWidth = 1
-    ctx.fillStyle = 'rgba(255,255,255,0.88)'
-    ctx.beginPath()
-    ctx.rect(l, t, w, h)
-    ctx.fill()
-    ctx.stroke()
+    const pad = textPad(a.fontSize) * scale
+    const lh = lineHeightOf(a.fontSize) * scale
+    // 编辑中的那个框由 PdfViewer 的浮层负责（左实心条 / 右圆圈 / 虚线），这里不管
     ctx.fillStyle = rgbCss(a.color)
-    ctx.font = `${fs}px "Microsoft YaHei", system-ui, sans-serif`
+    ctx.font = `${fs}px ${FREETEXT_FONT_FAMILY}`
     ctx.textBaseline = 'top'
-    const pad = Math.min(4, fs * 0.3)
     const lines = a.text.split('\n')
     lines.forEach((ln, i) => {
-      ctx.fillText(ln, l + pad, t + pad + i * fs * 1.3, w - pad * 2)
+      ctx.fillText(ln, l + pad, t + pad + i * lh, Math.max(1, w - pad * 2))
     })
   }
 

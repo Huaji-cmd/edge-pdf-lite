@@ -27,6 +27,7 @@ import { PDFDocument, PDFString, PDFHexString } from '@cantoo/pdf-lib'
 import type { PDFRef } from '@cantoo/pdf-lib'
 import type { Annotation, InkAnnot, RectAnnot, FreeTextAnnot } from './types'
 import { isMarkup, normalizeRect, bboxOfQuads, bboxOfPoints } from './types'
+import { lineHeightOf, textPad } from './textWrap'
 
 /** 写进 `/T` 的作者名 —— 也是「识别哪些批注是我们写的」的唯一可靠依据
  *（pdf.js 不读 /NM，实测 `getAnnotations().id` 是对象引用） */
@@ -202,37 +203,54 @@ function textString(s: string): PDFString | PDFHexString {
  * 中文批注的"占位横线"。
  *
  * 画不了字，但也不能什么都不画 —— 详见 `freeTextAppearance` 里那段说明。
- * 每行长度递减，看起来像一段文字，一眼能认出"这里是个文本批注"。
+ * 每行长度递减，看起来像一段自然结束的文字，一眼能认出"这里是个文本批注"。
+ *
+ * ⚠️ 内边距和行高**必须和英文文本框、以及应用内绘制取同一套值**
+ *（`textPad` / `lineHeightOf`），否则中英文混排在同一页上会明显对不齐。
  */
-function placeholderLines(w: number, h: number): string {
-  const pad = 3
-  const lh = 12
-  const rows = Math.max(1, Math.min(5, Math.floor((h - pad * 2) / lh)))
+function placeholderLines(w: number, h: number, fs: number): string {
+  const pad = textPad(fs)
+  const lh = lineHeightOf(fs)
+  const bar = lh * 0.42
+  const rows = Math.max(1, Math.min(8, Math.floor((h - pad * 2) / lh)))
   let s = 'q\n0.74 0.74 0.78 rg\n'
   for (let i = 0; i < rows; i++) {
-    const y = h - pad - lh * (i + 0.72)
+    // 画在"那一行的中线上"，而不是贴着行顶 —— 否则看起来像行距不均匀
+    const y = h - pad - i * lh - (lh + bar) / 2
     // 末行短一截，看起来才像一段自然结束的文字
     const lw = Math.max(12, (w - pad * 2) * (i === rows - 1 ? 0.52 : 1))
-    s += `${num(pad)} ${num(y)} ${num(lw)} ${num(lh * 0.42)} re\nf\n`
+    s += `${num(pad)} ${num(y)} ${num(lw)} ${num(bar)} re\nf\n`
   }
   return s + 'Q\n'
 }
 
+/**
+ * 文本框的 `/AP` 外观流。
+ *
+ * 🔴 **没有灰框、也没有白底** —— 这是刻意的，和"应用内只画字"（`draw.ts`）一致。
+ * 用户要的是"收起编辑框之后文字跟 PDF 融为一体"；只要这里还画着框，
+ * 文件拿到 Edge / Acrobat 里打开就会又变成一个框住的方块，
+ * 比"一直有框"更让人困惑。
+ *
+ * ⚠️ 历史上这里画过白底，理由是"文字压在图片上会看不清" —— 但那个理由不成立到
+ * 值得上边框的程度：真需要底色的场景应该由用户自己选（背景是内容的一部分），
+ * 而不是我们替他加一个白板。
+ */
 function freeTextAppearance(a: FreeTextAnnot, rect: [number, number, number, number]): string | null {
   const [r, g, b] = a.color
   const w = rect[2] - rect[0]
   const h = rect[3] - rect[1]
-  const box =
-    `q\n0.55 0.55 0.55 RG\n0.8 w\n0 0 ${num(w)} ${num(h)} re\nS\n` +
-    `1 1 1 rg\n0.5 0.5 ${num(Math.max(0, w - 1))} ${num(Math.max(0, h - 1))} re\nf\nQ\n`
+  const fs = a.fontSize
+  const pad = textPad(fs)
+  const lh = lineHeightOf(fs)
+
   if (!isAscii(a.text)) {
     /*
      * 中文：标准 14 字体里没有 CJK 字形，硬画会变成一串 "????"。
      *
-     * ⚠️ 曾经这里只 `return box`，注释写的是"交给查看器用系统字体渲染" ——
-     *    **这个想法是错的**：只要给了 /AP，查看器就用 /AP，不会自己再补文字。
-     *    实际结果是用户在 Edge / Acrobat 里看到一个**莫名其妙的白色空框**，
-     *    根本不知道那里有个批注。
+     * ⚠️ 曾经这里注释写的是"交给查看器用系统字体渲染" —— **那是错的**：
+     *    只要给了 /AP，查看器就用 /AP，不会自己再补文字。实际结果是用户在
+     *    Edge / Acrobat 里看到一个莫名其妙的空框，根本不知道那里有批注。
      *
      * 现在改成画"占位横线"：看得出是一个文本批注、有多少内容，
      * 文字本身在 /Contents 里一个字节都没丢（注释面板 / 应用内都能看全）。
@@ -241,17 +259,20 @@ function freeTextAppearance(a: FreeTextAnnot, rect: [number, number, number, num
      * 一个几 MB 的字体文件）。那跟 lite 的定位冲突，见
      * `docs/待办与验收清单.md` 里 B2 的说明。
      */
-    return box + placeholderLines(w, h)
+    return placeholderLines(w, h, fs)
   }
-  const fs = a.fontSize
+
   const lines = a.text.split('\n')
-  let text = `q\nBT\n/Helv ${num(fs)} Tf\n${num(r)} ${num(g)} ${num(b)} rg\n${num(fs * 1.25)} TL\n1 0 0 1 ${num(3)} ${num(h - fs * 1.15)} Tm\n`
+  // 首行基线 = 顶边 - 内边距 - 约 0.8em 的字身高度（14 标准字体的 ascent 近似值）
+  let text =
+    `q\nBT\n/Helv ${num(fs)} Tf\n${num(r)} ${num(g)} ${num(b)} rg\n${num(lh)} TL\n` +
+    `1 0 0 1 ${num(pad)} ${num(h - pad - fs * 0.8)} Tm\n`
   lines.forEach((ln, i) => {
     const esc = ln.replace(/[\\()]/g, (c) => '\\' + c)
     text += i === 0 ? `(${esc}) Tj\n` : `T*\n(${esc}) Tj\n`
   })
   text += 'ET\nQ\n'
-  return box + text
+  return text
 }
 
 /**

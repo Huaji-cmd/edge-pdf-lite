@@ -436,6 +436,8 @@ const run = async (): Promise<void> => {
       matrix: number[] | null
       bbox: number[] | null
       hasFont: boolean
+      /** /AP 的内容流原文（判「文本框有没有留下框/白底」要看它） */
+      apText: string | null
     }
     const raw: RawRow[] = []
 
@@ -465,6 +467,7 @@ const run = async (): Promise<void> => {
           matrix: sd?.lookupMaybe(PDFName.of('Matrix'), PDFArray) ? nums(sd.lookup(PDFName.of('Matrix'), PDFArray)) : null,
           bbox: sd?.lookupMaybe(PDFName.of('BBox'), PDFArray) ? nums(sd.lookup(PDFName.of('BBox'), PDFArray)) : null,
           hasFont: !!sd?.get(PDFName.of('Resources')),
+          apText: stream ? stream.getContentsString() : null,
         })
       }
     }
@@ -491,6 +494,62 @@ const run = async (): Promise<void> => {
           )
         }),
       ourRaw.map((r) => `${r.subtype.replace('/', '')}:M=${(r.matrix as number[]).join(',')}`).join(' | '),
+    )
+
+    /*
+     * ③ 文本框「融为一体」：写回的文件里**不能再有框和白底**
+     *
+     * 这是用户提的需求里最容易被做成"只做一半"的一条：应用内看着融合了，
+     * 写回的 /AP 里还留着灰框 + 白底 → 在 Edge / Acrobat 里打开还是框着的。
+     *
+     * ⚠️ 两条判据都要有，各管一半：
+     *   · **没有白色填充**（`1 1 1 rg`）—— 白底
+     *   · **没有铺满 BBox 的矩形** —— 边框。不写成"没有某个灰色值"是因为那样
+     *     只能抓住**这一个颜色**，换个灰就漏了；量尺寸才抓得住"整圈框"这件事。
+     *     容差留 2.5pt 是为了把「比 BBox 小一圈的内框」也罩住。
+     */
+    const ftRows = ourRaw.filter((r) => r.subtype.includes('FreeText'))
+    check(
+      '文本框的 /AP 里既没有白底也没有边框（「融为一体」在写回的文件里也成立）',
+      ftRows.length === 2 &&
+        ftRows.every((r) => {
+          const t = r.apText
+          const b = r.bbox as number[] | null
+          if (!t || !b) return false
+          if (/\b1\s+1\s+1\s+rg/.test(t)) return false // 白底
+          const bw = b[2]!
+          const bh = b[3]!
+          const rects = t.match(/-?[\d.]+\s+-?[\d.]+\s+(-?[\d.]+)\s+(-?[\d.]+)\s+re/g) ?? []
+          const full = rects.filter((s) => {
+            const n = s.split(/\s+/).map(Number)
+            return n[2]! <= bw + 0.01 && n[2]! > bw - 2.5 && n[3]! <= bh + 0.01 && n[3]! > bh - 2.5
+          })
+          return full.length === 0
+        }),
+      ftRows
+        .map((r) => {
+          const b = r.bbox as number[] | null
+          const bw = b?.[2] ?? 0
+          const bh = b?.[3] ?? 0
+          const t = r.apText ?? ''
+          const rects = t.match(/-?[\d.]+\s+-?[\d.]+\s+(-?[\d.]+)\s+(-?[\d.]+)\s+re/g) ?? []
+          const full = rects.filter((s) => {
+            const n = s.split(/\s+/).map(Number)
+            return n[2]! <= bw + 0.01 && n[2]! > bw - 2.5 && n[3]! <= bh + 0.01 && n[3]! > bh - 2.5
+          })
+          return `${r.subtype.replace('/', '')} 白底=${/\b1\s+1\s+1\s+rg/.test(t) ? '有' : '无'} 满框=${full.length}`
+        })
+        .join(' | '),
+    )
+    /*
+     * 反向判据：光"没有框"不够 —— **什么都不画**也满足上一条。
+     * ASCII 那条必须真的把字写进去了（BT … Tj）。
+     */
+    const asciiFt = ftRows.find((r) => r.nm.includes('new-freetext'))
+    check(
+      'ASCII 文本框真的把字画进了 /AP（去掉的是框，不是内容）',
+      !!asciiFt?.apText && /BT/.test(asciiFt.apText) && /Tj/.test(asciiFt.apText),
+      asciiFt?.apText ? asciiFt.apText.replace(/\s+/g, ' ').slice(0, 70) : 'null',
     )
 
     // ---------------------------------------------------------------- ③ 渲染差分

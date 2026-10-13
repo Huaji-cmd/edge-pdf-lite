@@ -137,6 +137,46 @@ export class AnnotationStore {
     this.remember({ type: 'edit', before, after })
   }
 
+  /**
+   * 把「新建 → 就地编辑 → 收尾」三个阶段塌成**一条**历史。
+   *
+   * 为什么非得有它：编辑途中（打字、改字号、拖动、改色）一律走 `replace` —— 那是
+   * 为了不让撤销栈被逐帧淹没。于是收尾那一瞬间，栈顶仍然是新建时那条 `add`，
+   * 而它记的是**新建那一刻**的快照 —— 也就是**空框**。
+   * 不处理的话：撤销 → 重做，用户看到的是一个空框，等同数据丢失。
+   *
+   * @param final 最终内容；传 `null` 表示「这个框废了」（没打字就点了空白处），
+   *              此时连那条 `add` 一起抹掉 —— 否则撤销会把空框请回来，
+   *              而且它还会作为一条空批注被写进 PDF。
+   * @returns 是否命中栈顶的那条 `add`。没命中就返回 false，调用方走常规路径
+   *          （`commitEdit` / `remove`）—— 说明中间掺进了别的操作，不能乱塌。
+   */
+  collapseNewAnnot(id: string, final: Annotation | null): boolean {
+    const top = this.undoStack[this.undoStack.length - 1]
+    if (!top || top.type !== 'add' || top.annot.id !== id) return false
+    if (final) {
+      top.annot = final
+      this.emit()
+      return true
+    }
+    // 废掉了：抹掉整条 add，并从活数据里摘掉（但不记历史）
+    this.undoStack.pop()
+    const pn = this.pageOf.get(id)
+    if (pn !== undefined) {
+      const arr = this.byPage.get(pn)
+      const idx = arr ? arr.findIndex((a) => a.id === id) : -1
+      if (arr && idx >= 0) {
+        arr.splice(idx, 1)
+        this.pageOf.delete(id)
+        if (!arr.length) this.byPage.delete(pn)
+        this.dirty.add(pn)
+      }
+    }
+    this.redoStack.length = 0
+    this.emit()
+    return true
+  }
+
   // ---------------------------------------------------------------- 历史
 
   /** 撤销：反向执行栈顶操作，并把它压到重做栈 */

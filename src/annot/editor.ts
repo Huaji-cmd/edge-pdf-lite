@@ -36,7 +36,9 @@ import {
   bboxOfQuads,
   bboxOfPoints,
   normalizeRect,
+  FREETEXT_DEFAULT_WIDTH,
 } from './types'
+import { lineHeightOf, textPad } from './textWrap'
 import type { PageTransform } from './coords'
 import { eventToPageCss, simplifyStroke } from './coords'
 import type { HandleId } from './geometry'
@@ -45,13 +47,14 @@ import type { AnnotationStore } from './store'
 import type { AnnotLayer } from './annotLayer'
 import { harvestSelection, clearSelection } from './textSelect'
 
-export interface TextRequestResult {
-  text: string
-  /** 以页内 CSS 为单位的框尺寸 */
-  cssWidth: number
-  cssHeight: number
-}
-
+/**
+ * 文本框**不再**走"弹框拿结果"那套。
+ *
+ * 原来是：`requestText()` 打开一个居中模态 → 用户在新窗口里打字 → 返回文本与尺寸。
+ * 现在改成**就地编辑**（复刻 Edge）：点一下页面就地在原处出现一个可编辑的框，
+ * 宿主（PdfViewer）负责画它、让用户直接在里面打字。编辑器的职责退化成
+ * 一句"把这个批注交给宿主进入编辑态"。
+ */
 export interface EditorHost {
   store: AnnotationStore
   layer: AnnotLayer
@@ -70,8 +73,18 @@ export interface EditorHost {
    * 编辑器只负责"用"，不负责"存"。不这么做的话，用户改了粗细要重新选工具才生效。
    */
   inkWidth(): number
-  /** 弹文本框；用户取消返回 null */
-  requestText(pageNumber: number, cssX: number, cssY: number, initial?: string): Promise<TextRequestResult | null>
+  /** 当前文本框字号（pt）—— 工具栏三档之一。与 `inkWidth` 同一路子 */
+  fontSize(): number
+  /**
+   * 让宿主把某个文本框切进**就地编辑态**（画出虚线框 + 手柄 + 工具条）。
+   *
+   * 编辑器只负责"什么时候开始编辑"，怎么编辑、什么时候结束由宿主说了算 ——
+   * 因为编辑框本身是 DOM，它的失焦/点击空白/滚动都要宿主来判。
+   *
+   * @param isNew 是**刚新建**的空框。宿主据此决定收尾要不要补一条历史
+   *              （新建时 store 已经 add 过一次了）。
+   */
+  beginTextEdit(annotId: string, isNew?: boolean): void
   /** 批注增删后通知宿主（重绘 + 更新计数） */
   onChange(pageNumber: number, action: 'add' | 'remove' | 'update'): void
   /** 选中项变化；id 为 null = 取消选中。宿主据此显示/隐藏控制手柄 */
@@ -204,16 +217,16 @@ export class AnnotEditor {
     return true
   }
 
-  /** 双击选中项：重新编辑文字（目前只有文本框有文字） */
+  /**
+   * 双击选中项：进入就地编辑（目前只有文本框有文字）。
+   *
+   * 以前这里也是弹模态改文字 —— 现在统一走宿主那一套就地编辑，
+   * 用户的感受是"点两下就接着打字"，而不是"又跳出一个窗口"。
+   */
   async editSelectedText(): Promise<void> {
     const a = this.selectedId ? this.host.store.get(this.selectedId) : null
     if (!a || a.kind !== 'freetext') return
-    const r = await this.host.requestText(a.pageNumber, 0, 0, a.text)
-    if (!r) return
-    const next: FreeTextAnnot = { ...a, text: r.text, contents: r.text, modified: nowIso() }
-    this.host.store.commitEdit(a, next)
-    this.host.onChange(a.pageNumber, 'update')
-    this.host.onHistoryChange()
+    this.host.beginTextEdit(a.id)
   }
 
   // ---------------------------------------------------------------- 指针
@@ -419,34 +432,51 @@ export class AnnotEditor {
 
     if (this.tool === 'freetext') {
       e.preventDefault()
-      const r = await this.host.requestText(loc.pageNumber, cssX, cssY)
-      if (r && r.text.trim()) {
-        // cssY 是点击位置，文本框往下长（页内 CSS 的 y 向下）
-        const w = r.cssWidth / tf.scale
-        const h = r.cssHeight / tf.scale
-        const annot: FreeTextAnnot = {
-          kind: 'freetext',
-          id: newAnnotId(),
-          pageNumber: loc.pageNumber,
-          rect: normalizeRect([px, py - h, px + w, py]),
-          color: this.host.colorFor('freetext'),
-          opacity: 1,
-          contents: r.text,
-          text: r.text,
-          fontSize: 11,
-          created: nowIso(),
-          modified: nowIso(),
-        }
-        this.host.store.add(annot)
-        this.host.onChange(loc.pageNumber, 'add')
-        this.host.onHistoryChange()
-        // 新建的框直接选中，用户接着就能拖动/改大小。
-        // 顺序很重要：先置 tool=none（否则下一次 pointerdown 又走"新建"分支），
-        // 再通知宿主同步 UI，最后设选中。
-        this.tool = 'none'
-        this.host.onToolAutoExit()
-        this.setSelected(annot.id)
+      /*
+       * 就地建一个**空**文本框，然后交给宿主进入编辑态。
+       *
+       * 空框也真的进 store —— 这样拖动、改宽度、改字号、撤销重做全都复用
+       * 已有的那套（拖一条不存在于 store 里的东西要另写一套 state，不值）。
+       * 代价是"建了但一个字没打"会留下一个空批注，所以**结束编辑时宿主负责**
+       * 把空文本的框删掉（见 PdfViewer 的 endTextEdit）。
+       */
+      const fs = this.host.fontSize()
+      const w = FREETEXT_DEFAULT_WIDTH
+      // 初始高度 = 一行（含上下内边距），用户打字时再往下长
+      const h = lineHeightOf(fs) + textPad(fs) * 2
+      const annot: FreeTextAnnot = {
+        kind: 'freetext',
+        id: newAnnotId(),
+        pageNumber: loc.pageNumber,
+        // 往下长：点击处是框的**上边**，页面空间 y 向上所以减去高度
+        rect: normalizeRect([px, py - h, px + w, py]),
+        color: this.host.colorFor('freetext'),
+        opacity: 1,
+        contents: '',
+        text: '',
+        fontSize: fs,
+        created: nowIso(),
+        modified: nowIso(),
       }
+      this.host.store.add(annot)
+      this.host.onChange(loc.pageNumber, 'add')
+      this.host.onHistoryChange()
+      /*
+       * 顺序很重要：先置 tool=none（否则下一次 pointerdown 又走"新建"分支，
+       * 用户想直接拖这个框就变成了再建一个），再通知宿主复位工具按钮，
+       * 最后设选中 + 进编辑态。
+       */
+      this.tool = 'none'
+      this.host.onToolAutoExit()
+      /*
+       * ⚠️ **先进编辑态、再设选中**，顺序不能反。
+       *    宿主那边"选中文本框 = 直接进编辑态"，所以先 setSelected 的话，
+       *    编辑会话会由**选中**那条路开启（它不知道这是新建，会把整段编辑
+       *    又记一条历史）；随后这次带 `isNew` 的调用因为"已经在编辑它了"被提前返回，
+       *    于是新建被当成"改动已有框" —— 症状是撤销一次撤不掉这个框。
+       */
+      this.host.beginTextEdit(annot.id, true)
+      this.setSelected(annot.id)
       return
     }
 

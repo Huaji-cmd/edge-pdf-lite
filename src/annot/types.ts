@@ -363,3 +363,55 @@ export function nearestInkWidth(w: unknown): number {
   return best
 }
 
+/**
+ * 文本框字号，三档（pt）。
+ *
+ * ⚠️ 默认档 = 11pt，与加这个功能之前硬编码的值一致 —— 老用户已有的文本框观感不变。
+ * 三档差距取约 1.4×：字号不像线宽，差 1.2× 以内基本看不出来，
+ * 一眼能分辨的最小档距大约就是 1.3× 往上。
+ */
+export const FONT_SIZES: readonly number[] = [8, 11, 16]
+
+/** 三档的名字 */
+export const FONT_SIZE_LABELS: readonly string[] = ['小', '中', '大']
+
+export const DEFAULT_FONT_SIZE: number = 11
+
+export function nearestFontSize(v: unknown): number {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return DEFAULT_FONT_SIZE
+  let best = FONT_SIZES[0]!
+  for (const s of FONT_SIZES) {
+    if (Math.abs(s - v) < Math.abs(best - v)) best = s
+  }
+  return best
+}
+
+/**
+ * 文本框的行高倍数（**唯一取值**）。
+ *
+ * ⚠️ 这里原本是两套：应用内绘制用 1.3、写回 PDF 用 1.25 —— 同一份数据在应用里
+ * 和别的查看器里行距不同，看起来就像"写回之后排版变了"。统一它成本几乎为零，
+ * 于是放在这里，三处（绘制 / 写回 / 断行）都从这一个常量取。
+ */
+export const FREETEXT_LINE_HEIGHT = 1.3
+
+/** 文本框用的字体。应用内绘制、断行测量、写回三处必须一致，否则换行位置对不上 */
+export const FREETEXT_FONT_FAMILY = '"Microsoft YaHei", system-ui, sans-serif'
+
+/**
+ * 文本框可用颜色 = **完整色板**（含黑/白）。
+ *
+ * 与高亮的规矩**故意不同**：高亮靠 Multiply 染背景，黑会把整行乘黑（字消失）、
+ * 白等于没画，所以那套要用 `usableAsHighlight` 过滤掉两端；
+ * 而文本框是**直接画字**，黑色恰恰是正文最常用的颜色。这里不做过滤。
+ */
+export const FREETEXT_SWATCHES: readonly Rgb[] = SWATCHES
+
+/**
+ * 新建文本框的默认宽度（pt）。
+ *
+ * 定在 150pt：A4 正文栏宽大约 400~450pt，150 差不多是三四个词的位置，
+ * 够一眼看出"这是个能打字的框"，又不至于一放下去就压住半页。
+ */
+export const FREETEXT_DEFAULT_WIDTH = 150
+

@@ -29,7 +29,14 @@ import {
 } from './viewer/readingState'
 import type { ViewMode } from './viewer/types'
 import type { ToolKind, ToolColors, PointerMode, Rgb, SelectedInfo } from './annot/types'
-import { defaultToolColors, isColorTool, DEFAULT_INK_WIDTH, nearestInkWidth } from './annot/types'
+import {
+  defaultToolColors,
+  isColorTool,
+  DEFAULT_INK_WIDTH,
+  nearestInkWidth,
+  DEFAULT_FONT_SIZE,
+  nearestFontSize,
+} from './annot/types'
 // ⚠️ 不静态 import：pdf-lib 打包后有 570 KB（gzip 248 KB），
 // 而"打开就为阅读"的用户一条批注都不会画。只有真的点「保存批注」才去拉它。
 const loadWriter = () => import('./annot/writer')
@@ -219,6 +226,34 @@ function pickInkWidth(w: number): void {
     localStorage.setItem(INK_WIDTH_KEY, JSON.stringify(inkWidth.value))
   } catch {
     /* 存不上就算了，不该影响画 */
+  }
+}
+
+/**
+ * 新建文本框的默认字号。
+ *
+ * ⚠️ 它**跟着"最后一次在某个文本框里选的字号"走**（见 `@font-size-change`）：
+ *    Edge 也是这个行为 —— 工具栏是挂在框上的，改完这一档，下一个新框就用这一档。
+ *    不这么做的话，用户在框里调好字号、再建一个又回到最小，会以为设置没生效。
+ */
+const FONT_SIZE_KEY = 'epl:font-size'
+const fontSize = ref(loadFontSize())
+
+function loadFontSize(): number {
+  try {
+    return nearestFontSize(JSON.parse(localStorage.getItem(FONT_SIZE_KEY) ?? 'null'))
+  } catch {
+    /* 坏数据当没配过 */
+  }
+  return DEFAULT_FONT_SIZE
+}
+
+function pickFontSize(size: number): void {
+  fontSize.value = nearestFontSize(size)
+  try {
+    localStorage.setItem(FONT_SIZE_KEY, JSON.stringify(fontSize.value))
+  } catch {
+    /* 同上 */
   }
 }
 
@@ -769,6 +804,15 @@ function downloadBytes(bytes: Uint8Array, name: string): void {
 function onKeydown(e: KeyboardEvent): void {
   const target = e.target as HTMLElement | null
   if (target && /^(INPUT|TEXTAREA)$/.test(target.tagName)) return
+  /*
+   * ⚠️ 就地文本框是 `contenteditable` 的 **div**，不是 INPUT/TEXTAREA ——
+   *    只判 tagName 会漏掉它，于是在框里打字时会同时触发全局快捷键：
+   *      Delete → 删掉选中的批注（正在编辑的这个！）
+   *      Ctrl+Z → 走应用自己的撤销，而不是文本框内的撤销
+   *      Ctrl+C/V → 被应用拦掉，粘贴不进文字
+   *    这一条必须留着，否则"在文本框里改字"这个功能基本没法用。
+   */
+  if (target?.isContentEditable) return
   if (!doc.value) return
 
   const ctrl = e.ctrlKey || e.metaKey
@@ -956,8 +1000,10 @@ onBeforeUnmount(() => {
         :pointer-mode="pointerMode"
         :colors="colors"
         :ink-width="inkWidth"
+        :font-size="fontSize"
         @page-change="(p) => (page = p)"
         @ready="onViewerReady"
+        @font-size-change="pickFontSize"
         @annot-count="onAnnotCount"
         @sel-change="(s) => (selected = s)"
         @history-change="onHistoryChange"

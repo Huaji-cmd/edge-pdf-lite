@@ -710,164 +710,270 @@ try {
 
   // ---------------------------------------------------------------- 4. 文本框
 
-  console.log('\n[4] 文本框：创建 → 自动选中')
+  console.log('\n[4] 文本框：点页面就地出现编辑框（复刻 Edge）')
   check('切到「文字」', await toolbarBtn('文字'))
   await sleep(200)
 
   const ftX = box.x + box.w * 0.3
   const ftY = box.y + Math.min(box.h * 0.65, 560)
   await tap(ftX, ftY)
-  await sleep(300)
-  const modalOpen = await evaluate(`!!document.querySelector('.modal textarea')`)
-  check('弹出输入框', modalOpen)
-  if (modalOpen) {
-    await evaluate(`
-      (() => {
-        const ta = document.querySelector('.modal textarea');
-        ta.value = '测试文本框';
-        ta.dispatchEvent(new Event('input', { bubbles: true }));
-        return true;
-      })()
-    `)
-    await sleep(120)
-    await evaluate(`
-      (() => {
-        const b = [...document.querySelectorAll('.modal .mbtn')].find(x => x.textContent.trim() === '确定');
-        b?.click();
-        return true;
-      })()
-    `)
-    await sleep(400)
-  }
+  await sleep(500)
+
+  // 旧行为（居中模态）必须彻底消失：它是用户明确要求换掉的东西
+  check('不再弹出居中模态输入框', !(await evaluate(`!!document.querySelector('.modal')`)))
+  check('就地出现了编辑框', await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`))
+  check('左边是拖动用的实心条', await evaluate(`!!document.querySelector('[data-tid="te-grip"]')`))
+  check('右边是调宽度的圆圈', await evaluate(`!!document.querySelector('[data-tid="te-widen"]')`))
+  check(
+    '其余三边是虚线（左边被实心条占掉，所以左边无边框）',
+    await evaluate(`(() => {
+      const s = getComputedStyle(document.querySelector('[data-tid="text-edit"]'));
+      return s.borderTopStyle === 'dashed' && s.borderRightStyle === 'dashed'
+          && s.borderBottomStyle === 'dashed' && s.borderLeftStyle === 'none';
+    })()`),
+  )
+  check(
+    '光标已经落在框里（点完就能直接打字，不用再点一次）',
+    await evaluate(`document.activeElement?.dataset?.tid === 'te-input'`),
+  )
+  check(
+    '工具条齐了：字号三档 + 字色 + 删除',
+    (await evaluate(`document.querySelectorAll('[data-tid^="te-size-"]').length`)) === 3 &&
+      (await evaluate(`!!document.querySelector('[data-tid="te-color"]')`)) &&
+      (await evaluate(`!!document.querySelector('[data-tid="te-delete"]')`)),
+  )
+  check(
+    '编辑框背景是透明的（暗色主题下填底色会让字看不清）',
+    /rgba\(0, 0, 0, 0\)|transparent/.test(
+      String(await evaluate(`getComputedStyle(document.querySelector('[data-tid="te-input"]')).backgroundColor`)),
+    ),
+    String(await evaluate(`getComputedStyle(document.querySelector('[data-tid="te-input"]')).backgroundColor`)),
+  )
+  await shot('03-freetext-inline')
+
+  // ---- 直接打字（用真实输入事件，不是直接改 DOM）
+  const TYPED = '测试文本框 hello world，这一句要足够长，才能看出它会不会在框宽用完时自动换行。'
+  await send('Input.insertText', { text: TYPED })
+  await sleep(600)
 
   const ft = (await annots()).find((a) => a.kind === 'freetext')
   check('生成了文本框批注', !!ft, `批注数=${(await annots()).length}`)
   const s4 = await snap()
-  check('新建的框**自动被选中**（接着就能拖动）', s4.sel?.kind === 'freetext', s4.sel ? s4.sel.kind : 'null')
-  await sleep(400) // 等选中框异步算完位置
-  await shot('03-freetext-created')
+  check('新建的框自动被选中', s4.sel?.kind === 'freetext', s4.sel ? s4.sel.kind : 'null')
+  check('打进去的字进了数据', !!ft && String(ft.text).includes('测试文本框'))
 
-  // ---------------------------------------------------------------- 5. 拖动
-
-  console.log('\n[5] 拖动文本框')
-  const g1 = await selGeometry()
-  check('选中框渲染出来了，且有 8 个手柄', !!g1 && g1.handleCount === 8, g1 ? `手柄=${g1.handleCount}` : 'null')
-
-  const beforeRect = ft ? [...ft.rect] : null
-  const MOVE_DX = 70
-  const MOVE_DY = 40
-  await dragOn(g1.cx, g1.cy, g1.cx + MOVE_DX, g1.cy + MOVE_DY)
-
-  const afterMove = (await annots()).find((a) => a.id === ft?.id)
-  const g2 = await selGeometry()
-  check(
-    '数据里的 rect 跟着平移了',
-    !!afterMove &&
-      near(afterMove.rect[0] - beforeRect[0], MOVE_DX / s4.scale, 6) &&
-      near(afterMove.rect[2] - beforeRect[2], MOVE_DX / s4.scale, 6),
-    afterMove
-      ? `Δx=${(afterMove.rect[0] - beforeRect[0]).toFixed(1)}pt（期望≈${(MOVE_DX / s4.scale).toFixed(1)}）`
-      : '找不到',
+  /*
+   * ★ 自动换行是这块的核心诉求之一，判据要能真的抓住：
+   *   ① 数据里必须出现**显式换行**（PDF 内容流没有自动换行，只能靠它）
+   *   ② 每一行都必须**真的在框宽之内** —— 只判"行数 > 1"的话，
+   *      把框宽设成 0 让它疯狂折行也能过，那没意义
+   */
+  const lines = String(ft?.text ?? '').split('\n')
+  check('文字到框宽就自动换行（数据里出现显式换行）', lines.length >= 2, `${lines.length} 行`)
+  const wPt = ft ? ft.rect[2] - ft.rect[0] : 0
+  const maxLine = Number(
+    await evaluate(`(() => {
+      const c = document.createElement('canvas').getContext('2d');
+      c.font = ${JSON.stringify(`${ft?.fontSize ?? 11}px "Microsoft YaHei", system-ui, sans-serif`)};
+      return Math.max(...${JSON.stringify(lines)}.map((l) => c.measureText(l).width));
+    })()`),
   )
   check(
-    '宽高没变（拖动不是缩放）',
+    '每一行都没超出框宽',
+    maxLine <= wPt,
+    `最宽行 ${maxLine.toFixed(1)}pt / 框宽 ${wPt.toFixed(1)}pt`,
+  )
+  await shot('03b-freetext-typed')
+
+  // ---- 字号三档
+  const sizeBefore = ft?.fontSize
+  const hBefore = ft ? ft.rect[3] - ft.rect[1] : 0
+  await evaluate(`document.querySelector('[data-tid="te-size-2"]')?.click()`) // 大
+  await sleep(400)
+  const ftBig = (await annots()).find((a) => a.id === ft?.id)
+  check('点「大」档 → 数据里的 fontSize 变大', ftBig && ftBig.fontSize > (sizeBefore ?? 0), `${sizeBefore} → ${ftBig?.fontSize}`)
+  check(
+    '字号变大后按新字号**重新断行**（行数或行高跟着变）',
+    !!ftBig && ftBig.rect[3] - ftBig.rect[1] >= hBefore,
+    `高 ${hBefore.toFixed(1)} → ${(ftBig ? ftBig.rect[3] - ftBig.rect[1] : 0).toFixed(1)}pt`,
+  )
+  check(
+    '换行仍然没超框',
+    Number(
+      await evaluate(`(() => {
+        const c = document.createElement('canvas').getContext('2d');
+        c.font = ${JSON.stringify('16px "Microsoft YaHei", system-ui, sans-serif')};
+        return Math.max(...${JSON.stringify(String(ftBig?.text ?? '').split('\n'))}.map((l) => c.measureText(l).width));
+      })()`),
+    ) <= (ftBig ? ftBig.rect[2] - ftBig.rect[0] : 0),
+  )
+  await shot('03c-freetext-big')
+
+  // ---- 字色（用框自带工具条）
+  await evaluate(`document.querySelector('[data-tid="te-color"]')?.click()`)
+  await sleep(250)
+  const teSwatchCount = await evaluate(`document.querySelectorAll(".te-swatches .te-sw").length`)
+  check("字色色板展开了，且是完整色板（含黑/白 —— 文字必须能用黑色）", teSwatchCount === 10, `${teSwatchCount} 色`)
+  await evaluate(`document.querySelectorAll('.te-swatches .te-sw')[8]?.click()`) // 黑
+  await sleep(300)
+  const ftBlack = (await annots()).find((a) => a.id === ft?.id)
+  check(
+    '选黑色 → 数据里的 color 变黑',
+    !!ftBlack && ftBlack.color[0] < 0.1 && ftBlack.color[1] < 0.1 && ftBlack.color[2] < 0.1,
+    ftBlack ? `color=[${ftBlack.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
+  )
+  await shot('03d-freetext-black')
+  // 改回蓝色，后面几张截图好看一点
+  await evaluate(`document.querySelector('[data-tid="te-color"]')?.click()`)
+  await sleep(200)
+  await evaluate(`document.querySelectorAll('.te-swatches .te-sw')[5]?.click()`)
+  await sleep(300)
+
+  // ---------------------------------------------------------------- 5. 拖动（左实心条）
+
+  console.log('\n[5] 拖左边那条实心条 = 移动文本框')
+
+  /** 就地编辑框上两个把手在屏幕上的坐标 */
+  const textHandleAt = async (tid) =>
+    JSON.parse(
+      await evaluate(`(() => {
+        const el = document.querySelector('[data-tid="${tid}"]');
+        if (!el) return JSON.stringify(null);
+        const r = el.getBoundingClientRect();
+        return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2 });
+      })()`),
+    )
+
+  // ⚠️ 必须**现在**重新读：上面改过字号，`ft` 那份快照的高度已经过期了
+  const ftNow = (await annots()).find((a) => a.id === ft?.id)
+  const beforeRect = [...(ftNow ? ftNow.rect : [0, 0, 0, 0])]
+  const grip = await textHandleAt('te-grip')
+  check('拿到了实心条的屏幕坐标', !!grip)
+  const MOVE_DX = 70
+  const MOVE_DY = 40
+  await dragOn(grip.x, grip.y, grip.x + MOVE_DX, grip.y + MOVE_DY)
+
+  const afterMove = (await annots()).find((a) => a.id === ft?.id)
+  check(
+    '数据里的 rect 跟着平移了',
+    !!afterMove && near(afterMove.rect[0] - beforeRect[0], MOVE_DX / s4.scale, 6),
+    afterMove ? `Δx=${(afterMove.rect[0] - beforeRect[0]).toFixed(1)}pt（期望≈${(MOVE_DX / s4.scale).toFixed(1)}）` : '找不到',
+  )
+  check(
+    '宽高没变（拖的是位置，不是尺寸）',
     !!afterMove &&
       near(afterMove.rect[2] - afterMove.rect[0], beforeRect[2] - beforeRect[0], 0.6) &&
       near(afterMove.rect[3] - afterMove.rect[1], beforeRect[3] - beforeRect[1], 0.6),
     afterMove ? `${(afterMove.rect[2] - afterMove.rect[0]).toFixed(1)}×${(afterMove.rect[3] - afterMove.rect[1]).toFixed(1)}pt` : '',
   )
+  const gripAfter = await textHandleAt('te-grip')
   check(
-    '选中框跟着走到了新位置（屏幕坐标）',
-    !!g2 && near(g2.cx - g1.cx, MOVE_DX, 8) && near(g2.cy - g1.cy, MOVE_DY, 8),
-    g2 ? `Δ=(${(g2.cx - g1.cx).toFixed(0)}, ${(g2.cy - g1.cy).toFixed(0)})px` : 'null',
+    '编辑框自己跟着走到了新位置',
+    !!gripAfter && near(gripAfter.x - grip.x, MOVE_DX, 8) && near(gripAfter.y - grip.y, MOVE_DY, 8),
+    gripAfter ? `Δ=(${(gripAfter.x - grip.x).toFixed(0)}, ${(gripAfter.y - grip.y).toFixed(0)})px` : 'null',
   )
   await shot('04-freetext-moved')
 
-  // ---------------------------------------------------------------- 6. 改大小
+  // ---------------------------------------------------------------- 6. 调宽度（右圆圈）
 
-  console.log('\n[6] 拉右下手柄改大小')
-  const g3 = await selGeometry()
-  const RESIZE_DX = 60
-  const RESIZE_DY = 34
-  await dragOn(g3.handles.se.x, g3.handles.se.y, g3.handles.se.x + RESIZE_DX, g3.handles.se.y + RESIZE_DY)
+  console.log('\n[6] 拖右边那个圆圈 = 调文本框宽度')
+  const w0 = afterMove ? afterMove.rect[2] - afterMove.rect[0] : 0
+  const widen = await textHandleAt('te-widen')
+  check('拿到了圆圈的屏幕坐标', !!widen)
+  const WIDEN_DX = 60
+  await dragOn(widen.x, widen.y, widen.x + WIDEN_DX, widen.y)
 
-  const afterResize = (await annots()).find((a) => a.id === ft?.id)
-  const w0 = afterMove.rect[2] - afterMove.rect[0]
-  const w1 = afterResize.rect[2] - afterResize.rect[0]
-  const h1 = afterResize.rect[3] - afterResize.rect[1]
+  const afterWiden = (await annots()).find((a) => a.id === ft?.id)
+  const w1 = afterWiden ? afterWiden.rect[2] - afterWiden.rect[0] : 0
+  check('宽度真的变大了', w1 > w0 + 3, `${w0.toFixed(1)}pt → ${w1.toFixed(1)}pt（屏幕 +${WIDEN_DX}px）`)
   check(
-    '宽度真的变大了',
-    w1 > w0 + 3,
-    `${w0.toFixed(1)}pt → ${w1.toFixed(1)}pt（屏幕 +${RESIZE_DX}px，scale=${s4.scale.toFixed(2)}）`,
+    '变宽之后**重新断行**了（行数减少，或至少没有溢出）',
+    !!afterWiden &&
+      Number(
+        await evaluate(`(() => {
+          const c = document.createElement('canvas').getContext('2d');
+          c.font = ${JSON.stringify('16px "Microsoft YaHei", system-ui, sans-serif')};
+          return Math.max(...${JSON.stringify(String(afterWiden.text).split('\n'))}.map((l) => c.measureText(l).width));
+        })()`),
+      ) <= w1,
   )
-  check('高度也跟着变大了（se 手柄同时改两边）', h1 > afterMove.rect[3] - afterMove.rect[1] + 2, `h=${h1.toFixed(1)}pt`)
-  await shot('05-freetext-resized')
+  await shot('05-freetext-widened')
 
-  // ---------------------------------------------------------------- 7. 撤销 / 重做
+  // ---------------------------------------------------------------- 7. 点空白 → 收起并融合
 
-  console.log('\n[7] 撤销 → 重做')
+  console.log('\n[7] 点空白处 → 收起编辑框，文字与 PDF 融为一体')
+  const vpBox = JSON.parse(
+    await evaluate(`(() => {
+      const r = document.querySelector('.viewport').getBoundingClientRect();
+      return JSON.stringify({ top: r.top, bottom: r.bottom, left: r.left, right: r.right });
+    })()`),
+  )
+  /*
+   * ⚠️ 两个坑都踩过：
+   *   ① 必须点在**视口内** —— 视口外的坐标不会命中页面，点了等于没点；
+   *   ② 必须点在**框外** —— 文本框长高之后，页面下方 88% 处可能已经落在框里，
+   *      那样点下去只是把光标移进框内，编辑态不会结束。
+   * 所以取页面的**左上角空白边距**：既在视口内，又离所有批注都远。
+   */
+  const blankX = box.x + 12
+  const blankY = Math.max(vpBox.top + 12, box.y + 12)
+  await tap(blankX, blankY)
+  await sleep(600)
+
+  check('编辑框已经收起', !(await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`)))
+  const merged = (await annots()).find((a) => a.kind === 'freetext')
+  check('批注本体还在（文字留下来了）', !!merged && String(merged.text).length > 0)
+  check(
+    '画布上只画字、没有底色和边框（"融为一体"的像素证据）',
+    (await colorPixels([255, 255, 255], 6)) < 40000,
+    `纯白像素 ${await colorPixels([255, 255, 255], 6)}`,
+  )
+  await shot('06-freetext-merged')
+
+  // ---- 历史：整段编辑塌成一条（新建的框，撤一次就该整个消失）
+  console.log('\n[7b] 撤销 / 重做（整段编辑 = 一条历史）')
   const s7 = await snap()
   check('有可撤销的历史', s7.canUndo === true)
-
+  console.log('    撤销前 kinds =', JSON.stringify((await annots()).map((a) => a.kind)))
   await UNDO()
-  const u1 = (await annots()).find((a) => a.id === ft?.id)
+  console.log('    撤销后 kinds =', JSON.stringify((await annots()).map((a) => a.kind)))
+  console.log('    撤销后 canRedo =', (await snap()).canRedo)
   check(
-    '撤销一次 = 退回到改大小之前',
-    !!u1 && near(u1.rect[2] - u1.rect[0], w0, 0.6),
-    u1 ? `宽=${(u1.rect[2] - u1.rect[0]).toFixed(1)}pt（改大小前 ${w0.toFixed(1)}）` : '找不到',
+    '撤销一次 = 整个文本框消失（新建 + 打字 + 拖动 + 调宽 塌成一条）',
+    !(await annots()).some((a) => a.kind === 'freetext'),
+    `剩余批注=${(await annots()).length}`,
   )
-  const s7b = await snap()
-  check('撤销之后「重做」可用了', s7b.canRedo === true)
-
-  await UNDO()
-  const u2 = (await annots()).find((a) => a.id === ft?.id)
-  check(
-    '再撤销一次 = 退回到拖动之前',
-    !!u2 && near(u2.rect[0], beforeRect[0], 0.6),
-    u2 ? `x0=${u2.rect[0].toFixed(1)}pt（创建时 ${beforeRect[0].toFixed(1)}）` : '找不到',
-  )
-  await shot('06-undone')
-
   await REDO()
-  const r1 = (await annots()).find((a) => a.id === ft?.id)
+  const back7 = (await annots()).find((a) => a.kind === 'freetext')
   check(
-    '重做一次 = 恢复拖动后的位置',
-    !!r1 && near(r1.rect[0], afterMove.rect[0], 0.6),
-    r1 ? `x0=${r1.rect[0].toFixed(1)}pt（期望 ${afterMove.rect[0].toFixed(1)}）` : '找不到',
-  )
-
-  await REDO()
-  const r2 = (await annots()).find((a) => a.id === ft?.id)
-  check(
-    '再重做一次 = 恢复改大小后的尺寸',
-    !!r2 && near(r2.rect[2] - r2.rect[0], w1, 0.6),
-    r2 ? `宽=${(r2.rect[2] - r2.rect[0]).toFixed(1)}pt（期望 ${w1.toFixed(1)}）` : '找不到',
+    '重做一次 = 文本框连同内容一起回来',
+    !!back7 && String(back7.text).includes('测试文本框'),
   )
   await shot('07-redone')
 
   // ---------------------------------------------------------------- 8. 改选中项颜色
 
-  console.log('\n[8] 选中后改色')
-  // undo / redo 都会清掉选中态（被撤销的那条可能已经不存在了），所以重新点中它
-  const c8 = await centerOf(ft.id)
-  await tap(c8.x, c8.y)
-  const s8b = await snap()
-  check('重新点中了文本框', s8b.sel?.kind === 'freetext', s8b.sel ? s8b.sel.kind : 'null')
-
-  if (s8b.sel) {
+  console.log('\n[8] 选中后改色（改用第 2 节那条手写，避免和文本框的编辑态搅在一起）')
+  const inkForColor = (await annots()).find((a) => a.kind === 'ink')
+  check('找得到之前画的手写批注', !!inkForColor)
+  if (inkForColor) {
+    const c8 = await centerOf(inkForColor.id)
+    await tap(c8.x, c8.y)
+    const s8b = await snap()
+    check('点中了手写批注', s8b.sel?.id === inkForColor.id, s8b.sel ? s8b.sel.kind : 'null')
     await clickSwatch(2) // 红
     await sleep(300)
-    const rf = (await annots()).find((a) => a.id === ft?.id)
+    const rf = (await annots()).find((a) => a.id === inkForColor.id)
     check(
       '选中后点色板 = 改**这一条**的颜色（可撤销）',
       !!rf && near(rf.color[0], 0.9, 0.02) && near(rf.color[1], 0.19, 0.02),
       rf ? `color=[${rf.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
     )
     await UNDO()
-    const back = (await annots()).find((a) => a.id === ft?.id)
+    const back = (await annots()).find((a) => a.id === inkForColor.id)
     check(
       '改色也能被撤销',
-      !!back && near(back.color[2], 0.92, 0.02),
+      !!back && near(back.color[0], 0.13, 0.02) && near(back.color[2], 0.92, 0.02),
       back ? `撤销后 color=[${back.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
     )
     await REDO()
@@ -923,6 +1029,19 @@ try {
   // ---------------------------------------------------------------- 10. 删除所选
 
   console.log('\n[10] 删除所选 + 撤销')
+  /*
+   * ⚠️ 先选中一条**非文本框**的批注。
+   *    文本框被选中时焦点在可编辑区里，`Delete` 归它（那是打字用的），
+   *    应用级快捷键会主动让路 —— 这是刻意的（见 App.vue 里 onKeydown 的注释），
+   *    所以拿"选中文本框 + Delete"来测应用级删除本身就不成立。
+   */
+  const inkForDel = (await annots()).find((a) => a.kind === 'ink')
+  check('找得到一条非文本批注用来测删除', !!inkForDel)
+  if (inkForDel) {
+    const cd = await centerOf(inkForDel.id)
+    await tap(cd.x, cd.y)
+    await sleep(200)
+  }
   const countBefore = (await annots()).length
   await DEL()
   const countAfter = (await annots()).length
