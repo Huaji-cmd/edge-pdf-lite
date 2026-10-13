@@ -710,6 +710,44 @@ try {
 
   // ---------------------------------------------------------------- 4. 文本框
 
+  /** 元素的屏幕中心（真实鼠标点它用） */
+  const centerOfEl = async (sel) =>
+    JSON.parse(
+      await evaluate(`(() => {
+        const e = document.querySelector(${JSON.stringify(sel)});
+        if (!e) return 'null';
+        const r = e.getBoundingClientRect();
+        return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2 });
+      })()`),
+    )
+  /**
+   * 用**真实鼠标**点一个元素。
+   *
+   * 🔴 这条规矩值得单独立一个函数：`el.click()` 只派发 `click`，
+   *    **没有 pointerdown / pointerup**。而"点空白处结束编辑""选中即进编辑"
+   *    这些逻辑全挂在 pointerdown 上 —— 用 `el.click()` 去点就等于把那段代码绕过去了。
+   *    用户报的"选颜色要按两下"就是这么漏掉的（数据那层明明是对的）。
+   */
+  const tapEl = async (sel) => {
+    const c = await centerOfEl(sel)
+    if (!c) throw new Error(`tapEl 找不到元素：${sel}`)
+    await tap(c.x, c.y)
+  }
+  /** 文本框工具条的**界面**状态：色板勾在第几个（-1 没开）+ A 按钮的颜色 */
+  const uiTextColor = async () =>
+    JSON.parse(
+      await evaluate(`(() => {
+        const btn = document.querySelector('[data-tid="te-color"]');
+        const all = [...document.querySelectorAll('.te-swatches .te-sw')];
+        return JSON.stringify({
+          open: all.length > 0,
+          onIndex: all.findIndex((e) => e.classList.contains('on')),
+          btnColor: btn ? getComputedStyle(btn).color : null,
+        });
+      })()`),
+    )
+  const parseRgb = (s) => (String(s).match(/[\d.]+/g) ?? []).map(Number)
+
   console.log('\n[4] 文本框：点页面就地出现编辑框（复刻 Edge）')
   check('切到「文字」', await toolbarBtn('文字'))
   await sleep(200)
@@ -748,6 +786,31 @@ try {
       String(await evaluate(`getComputedStyle(document.querySelector('[data-tid="te-input"]')).backgroundColor`)),
     ),
     String(await evaluate(`getComputedStyle(document.querySelector('[data-tid="te-input"]')).backgroundColor`)),
+  )
+  /*
+   * 实心条**不能压住正文**。
+   *
+   * ⚠️ 这条是用户报上来的："你左边的框挡住了一些字"。
+   *    判据只量几何就行，不用看截图 —— 它压住的是文字，而文字不会因此让位
+   *    （编辑区必须占满整个框宽，否则换行位置就和写回 PDF 的宽度不一致）。
+   *    ⚠️ 也**不能**反过来"把正文往右挤 14px"来避让，那是拿排版一致性换的。
+   */
+  const gripGeo = JSON.parse(
+    await evaluate(`(() => {
+      const g = (s) => { const e = document.querySelector(s); if (!e) return null;
+        const r = e.getBoundingClientRect(); return { l: r.left, r: r.right }; };
+      return JSON.stringify({ grip: g('[data-tid="te-grip"]'), input: g('[data-tid="te-input"]'), box: g('[data-tid="text-edit"]') });
+    })()`),
+  )
+  check(
+    '左实心条在正文**左边**，不遮挡首字符',
+    !!gripGeo.grip && !!gripGeo.input && gripGeo.grip.r <= gripGeo.input.l + 0.5,
+    `实心条右边缘 ${Math.round(gripGeo.grip?.r)} / 正文左边缘 ${Math.round(gripGeo.input?.l)}`,
+  )
+  check(
+    '实心条虽然在框外，但仍挂在编辑框上（跟着一起动）',
+    !!gripGeo.grip && !!gripGeo.box && gripGeo.grip.r <= gripGeo.box.l + 0.5,
+    `实心条右 ${Math.round(gripGeo.grip?.r)} / 框左 ${Math.round(gripGeo.box?.l)}`,
   )
   await shot('03-freetext-inline')
 
@@ -788,10 +851,13 @@ try {
   // ---- 字号三档
   const sizeBefore = ft?.fontSize
   const hBefore = ft ? ft.rect[3] - ft.rect[1] : 0
-  await evaluate(`document.querySelector('[data-tid="te-size-2"]')?.click()`) // 大
-  await sleep(400)
+  await tapEl('[data-tid="te-size-2"]') // 大（真实鼠标，同色板那条道理）
   const ftBig = (await annots()).find((a) => a.id === ft?.id)
   check('点「大」档 → 数据里的 fontSize 变大', ftBig && ftBig.fontSize > (sizeBefore ?? 0), `${sizeBefore} → ${ftBig?.fontSize}`)
+  check(
+    '字号按钮的高亮也一次就跟上（同一个"界面慢一拍"的坑）',
+    await evaluate(`document.querySelector('[data-tid="te-size-2"]')?.classList.contains('on') === true`),
+  )
   check(
     '字号变大后按新字号**重新断行**（行数或行高跟着变）',
     !!ftBig && ftBig.rect[3] - ftBig.rect[1] >= hBefore,
@@ -810,17 +876,32 @@ try {
   await shot('03c-freetext-big')
 
   // ---- 字色（用框自带工具条）
-  await evaluate(`document.querySelector('[data-tid="te-color"]')?.click()`)
-  await sleep(250)
+  await tapEl('[data-tid="te-color"]')
   const teSwatchCount = await evaluate(`document.querySelectorAll(".te-swatches .te-sw").length`)
   check("字色色板展开了，且是完整色板（含黑/白 —— 文字必须能用黑色）", teSwatchCount === 10, `${teSwatchCount} 色`)
-  await evaluate(`document.querySelectorAll('.te-swatches .te-sw')[8]?.click()`) // 黑
-  await sleep(300)
+  await tapEl('.te-swatches .te-sw:nth-child(9)') // 黑（色板里第 9 个）
   const ftBlack = (await annots()).find((a) => a.id === ft?.id)
   check(
     '选黑色 → 数据里的 color 变黑',
     !!ftBlack && ftBlack.color[0] < 0.1 && ftBlack.color[1] < 0.1 && ftBlack.color[2] < 0.1,
     ftBlack ? `color=[${ftBlack.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
+  )
+  /*
+   * ★ 界面必须**一次**就跟上。
+   *
+   * 用户报的是"选择颜色时需要按两下才能正确选中"。根因**不在数据**（画布当场就变了），
+   * 而在 `textEditFree` 这个 computed 还指着旧对象 —— 色板勾选和 A 按钮的颜色慢一拍，
+   * 用户看不到勾，以为没选中就又点一次（第二下之所以"生效"，是那次同步把 ref 追上了）。
+   *
+   * ⚠️ 所以判据必须查**界面**。只查 `annots().color` 的话，这个 bug 永远抓不到 ——
+   *    上一版就是这么漏过去的。
+   */
+  const uiBlack = await uiTextColor()
+  check('一次点击后色板就勾在「黑」上（不用点两下）', uiBlack.onIndex === 8, `勾选索引=${uiBlack.onIndex}`)
+  check(
+    '一次点击后 A 按钮的颜色也跟着变黑',
+    parseRgb(uiBlack.btnColor)[0] < 60,
+    uiBlack.btnColor ?? 'null',
   )
   await shot('03d-freetext-black')
   /*
@@ -830,18 +911,16 @@ try {
    *    「没开才点」—— 无条件点一次 `te-color` 会把它**关掉**，紧接着那次 swatch 点击
    *    就静默失效：截图里字还是黑的，而脚本一声不吭。（第一版就是这么写的。）
    */
-  await evaluate(`(() => {
-    if (!document.querySelector('.te-swatches')) document.querySelector('[data-tid="te-color"]')?.click();
-  })()`)
-  await sleep(200)
-  await evaluate(`document.querySelectorAll('.te-swatches .te-sw')[5]?.click()`)
-  await sleep(300)
+  if (!(await uiTextColor()).open) await tapEl('[data-tid="te-color"]')
+  await tapEl('.te-swatches .te-sw:nth-child(6)') // 蓝
   const backToBlue = (await annots()).find((a) => a.id === ft?.id)
+  const uiBlue = await uiTextColor()
   check(
-    '（截图整理）字色确实改回蓝色了',
-    !!backToBlue && backToBlue.color[2] > 0.8 && backToBlue.color[0] < 0.3,
-    backToBlue ? `color=[${backToBlue.color.map((n) => n.toFixed(2)).join(', ')}]` : '找不到',
+    '（截图整理）字色确实改回蓝色了（数据 + 界面都对）',
+    !!backToBlue && backToBlue.color[2] > 0.8 && backToBlue.color[0] < 0.3 && uiBlue.onIndex === 5,
+    backToBlue ? `color=[${backToBlue.color.map((n) => n.toFixed(2)).join(', ')}] 勾选索引=${uiBlue.onIndex}` : '找不到',
   )
+  await tapEl('[data-tid="te-color"]') // 收起色板，免得挡住后面的拖动
 
   // ---------------------------------------------------------------- 5. 拖动（左实心条）
 
@@ -964,6 +1043,69 @@ try {
     !!back7 && String(back7.text).includes('测试文本框'),
   )
   await shot('07-redone')
+
+  /*
+   * ---- 重新编辑：点回那个已经收起的框
+   *
+   * 用户报的："想修改文字时，点击文本框把原来的文本全部清除了，我需要在原来的文本基础上修改"。
+   * 根因是 `.te-input` 是个**空 div** —— 谁都没往里面写过原文，于是进编辑态看到的是空白，
+   * 一打字整段就被顶掉（数据丢失级）。
+   * ⚠️ 上一版测不到，是因为这条路径（编辑**已有**框）压根没测 —— 全是"新建 + 打字"。
+   */
+  console.log('\n[7c] 重新编辑已有文本框：原文必须还在（在原文基础上改）')
+  const beforeReedit = (await annots()).find((a) => a.kind === 'freetext')
+  const reCenter = await centerOf(beforeReedit.id)
+  await tap(reCenter.x, reCenter.y)
+  await sleep(600)
+  check('点已有文本框 → 又进了编辑态', await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`))
+  const reText = await evaluate(`document.querySelector('[data-tid="te-input"]')?.innerText ?? null`)
+  check(
+    '编辑区里带着**原文**（不是一张白纸）',
+    typeof reText === 'string' && reText.replace(/\n/g, '').length > 0,
+    JSON.stringify(String(reText).slice(0, 24)),
+  )
+  check(
+    '编辑区里的文字和批注数据一致',
+    String(reText ?? '').replace(/\n$/, '') === String(beforeReedit.text ?? ''),
+    `编辑区 ${JSON.stringify(String(reText).slice(0, 16))} / 数据 ${JSON.stringify(String(beforeReedit.text).slice(0, 16))}`,
+  )
+  await shot('07c-reedit-keeps-text')
+
+  /*
+   * 而且在原文基础上**接着打字**应该变成"追加"，不是"替换整段"。
+   * 光标默认落在末尾（见 focusTextEditor），所以这里直接补字。
+   */
+  await send('Input.insertText', { text: '（补一句）' })
+  await sleep(400)
+  const appended = (await annots()).find((a) => a.id === beforeReedit.id)
+  check(
+    '接着打字是**追加**，原句还在',
+    !!appended && String(appended.text).includes('测试文本框') && String(appended.text).includes('（补一句）'),
+    JSON.stringify(String(appended?.text ?? '').slice(0, 30)),
+  )
+
+  /*
+   * 空操作不该进历史：点进框里看看、再点走 —— 撤销栈不该多一条。
+   *
+   * ⚠️ 判据要用**行为**，不要数栈深度（数不出"有没有牙"）：
+   *    如果那一下留了个 before==after 的空记录，下面这次撤销会"白按" ——
+   *    文字里还会带着刚追加的那句。所以直接断言"第一次撤销就把追加退掉了"。
+   */
+  await tap(blankX, blankY)
+  await sleep(500)
+  check('点走之后编辑框收起了', !(await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`)))
+  await UNDO()
+  await sleep(300)
+  const afterNoopUndo = (await annots()).find((a) => a.id === beforeReedit.id)
+  check(
+    '点进框再点走（什么都没改）没留下空历史 —— 一次撤销就退掉了那次追加',
+    !!afterNoopUndo &&
+      String(afterNoopUndo.text).includes('测试文本框') &&
+      !String(afterNoopUndo.text).includes('（补一句）'),
+    JSON.stringify(String(afterNoopUndo?.text ?? '').slice(0, 30)),
+  )
+  await REDO()
+  await sleep(300)
 
   // ---------------------------------------------------------------- 8. 改选中项颜色
 

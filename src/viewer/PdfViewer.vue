@@ -896,6 +896,28 @@ function focusTextEditor(): void {
 }
 
 /**
+ * 把批注里的**原文**灌进可编辑区。进编辑态时调一次。
+ *
+ * 🔴 这个函数是必须的，别以为"编辑区会自己带上文字"：
+ *    模板里的 `.te-input` 是个**空 div**（`contenteditable` 且没有子节点，
+ *    Vue 不管它的内容），谁都没有往里面写过字。于是点一个**已有**的文本框：
+ *    编辑区是**空的** —— 用户看到的是"原文被清除了"，接着一打字，
+ *    整段原文就被新内容顶掉了（数据丢失级）。
+ *    ⚠️ 之前测试没抓到，是因为测的路径全是"新建 + 打字"（新建时本来就该是空的）。
+ *
+ * 用 `textContent` 而不是 `innerText` 写入：后者会按当前排版做一次往返，
+ * 在元素还没布局好时可能把换行吃掉；前者是逐字节的。
+ * ⚠️ 但**读**回来仍然用 `innerText`（见 `onTextInput`）—— 两者对
+ * `white-space: pre-wrap` 的文本是一一对应的。
+ */
+function fillTextEditor(a: FreeTextAnnot): void {
+  const el = textEditEl.value
+  if (!el) return
+  // `text` 存的是**断行后**的文本（\n 分隔），正对着 pre-wrap 的渲染结果
+  el.textContent = a.text
+}
+
+/**
  * 重算编辑框位置。缩放 / 版面变化后必须调，否则框会飘。
  *
  * ⚠️ 坐标是**相对 `.content`** 的，不是相对页槽：页槽是 `overflow: hidden` 的
@@ -925,6 +947,8 @@ async function refreshTextEditBox(): Promise<void> {
   if (textPendingFocus) {
     textPendingFocus = false
     await nextTick()
+    // 顺序不能颠倒：先灌原文，再把光标放到末尾（"在原文本基础上改"）
+    fillTextEditor(a)
     focusTextEditor()
   }
 }
@@ -953,6 +977,25 @@ function rewrap(a: FreeTextAnnot, raw: string): FreeTextAnnot {
   }
 }
 
+/**
+ * 把改动写回正在编辑的那条批注，**并让界面立刻跟上**。
+ *
+ * ⚠️ 只调 `annotStore.replace` 是不够的，这一点很反直觉：
+ *    `textEditFree` 是 computed，依赖的是 `textEditAnnotRef` 这个 shallowRef；
+ *    而 `replace` 换掉的是 **store 里的对象**，ref 还指着**旧的那一份** ——
+ *    computed 的依赖没变，于是缓存不失效，工具条（字号高亮 / 色板勾选 / A 按钮颜色）
+ *    统统慢一拍。用户的观感就是"**选颜色要按两下**"：第一下真的改了色（画布已经变了），
+ *    按钮却还是旧色，他以为没选中，又点一次 —— 第二下之所以"生效"，是因为
+ *    `currentFreeText()` 里那次同步终于把 ref 追上了。
+ *
+ * 所以**所有**改编辑中批注的地方都必须走这里，不要直接 replace。
+ */
+function applyTextEdit(next: Annotation): void {
+  annotStore.replace(next.id, next)
+  syncTextEditAnnot() // ← 就是这一行让界面跟上（别删）
+  onAnnotChanged(next.pageNumber)
+}
+
 /** 输入时：断行 + 回写 + 重绘（走 replace，不进历史 —— 整个编辑过程只记一条） */
 function onTextInput(): void {
   const a = currentFreeText()
@@ -960,8 +1003,7 @@ function onTextInput(): void {
   if (!a || a.kind !== 'freetext' || !el) return
   const raw = el.innerText.replace(/\n$/, '')
   const next = rewrap(a as FreeTextAnnot, raw)
-  annotStore.replace(a.id, next)
-  onAnnotChanged(a.pageNumber)
+  applyTextEdit(next)
   emit('annot-count', annotStore.count())
   void refreshTextEditBox()
 }
@@ -1000,6 +1042,24 @@ function onTextKeydown(e: KeyboardEvent): void {
 }
 
 /** 结束编辑：空文本的框直接删掉（"随手点一下"不该在文档里留个空框） */
+/**
+ * 两个文本框批注是不是"看起来完全一样"（进编辑态前后没改过东西）。
+ *
+ * 用来避免**空操作进历史**：点进一个文本框看看、再点走 —— 什么都没改，
+ * 不该在撤销栈里多出一条"编辑"。多出来的那一下，用户按 Ctrl+Z 会觉得"没反应"。
+ *
+ * 只比对会影响观感与写回的字段：文字、框、颜色、字号。
+ */
+function sameFreeText(x: Annotation, y: Annotation): boolean {
+  if (x.kind !== 'freetext' || y.kind !== 'freetext') return false
+  const r = (a: FreeTextAnnot): string => a.rect.map((n) => n.toFixed(3)).join(',')
+  const c = (a: FreeTextAnnot): string => a.color.map((n) => n.toFixed(3)).join(',')
+  return (
+    x.text === y.text && x.contents === y.contents && r(x) === r(y) && c(x) === c(y) &&
+    x.fontSize === y.fontSize && x.opacity === y.opacity
+  )
+}
+
 function endTextEdit(): void {
   const id = textEditId.value
   if (!id) return
@@ -1031,9 +1091,13 @@ function endTextEdit(): void {
     void annotLayer?.render(a.pageNumber, scale.value)
     return
   }
-  // 有内容：整个编辑过程塌成**一条**历史（编辑途中都走 replace）
-  if (before) annotStore.commitEdit(before, a)
-  else annotStore.collapseNewAnnot(id, a)
+  /*
+   * 有内容：
+   *   · 编辑既有框 → 整个编辑过程塌成**一条** `edit` 历史（途中都走 replace）
+   *   · 新建的框 → 改写那条 `add` 的快照（见 `collapseNewAnnot`）
+   */
+  if (before && !sameFreeText(before, a)) annotStore.commitEdit(before, a)
+  else if (!before) annotStore.collapseNewAnnot(id, a)
   textEditBefore = null
   onAnnotChanged(a.pageNumber)
 }
@@ -1045,8 +1109,7 @@ function setTextFontSize(size: number): void {
   const s = nearestFontSize(size)
   if (s === a.fontSize) return
   const next = rewrap({ ...a, fontSize: s }, String(a.contents ?? a.text))
-  annotStore.replace(a.id, next)
-  onAnnotChanged(a.pageNumber)
+  applyTextEdit(next)
   void refreshTextEditBox()
   // 记成"下一个新框的默认字号"（Edge 也是这个行为：工具栏挂在框上，改完就跟着走）
   emit('font-size-change', s)
@@ -1056,8 +1119,7 @@ function setTextFontSize(size: number): void {
 function setTextColor(c: Rgb): void {
   const a = currentFreeText()
   if (!a) return
-  annotStore.replace(a.id, { ...a, color: [...c] as Rgb } as Annotation)
-  onAnnotChanged(a.pageNumber)
+  applyTextEdit({ ...a, color: [...c] as Rgb } as Annotation)
 }
 
 /** 工具条：删掉这个文本框 */
@@ -1113,14 +1175,13 @@ function onTextHandleMove(e: PointerEvent): void {
   if (textDrag.mode === 'move') {
     // 屏幕 y 向下、页面 y 向上 → dy 取反
     const next = [r[0] + dx, r[1] - dy, r[2] + dx, r[3] - dy] as Rect
-    annotStore.replace(a.id, { ...a, rect: normalizeRect(next) } as Annotation)
+    applyTextEdit({ ...a, rect: normalizeRect(next) } as Annotation)
   } else {
     // 只改宽度；改完必须重新断行，否则文字会溢出或提前换行
     const w = Math.max(24, r[2] - r[0] + dx)
     const wider = { ...(a as FreeTextAnnot), rect: normalizeRect([r[0], r[1], r[0] + w, r[3]]) as Rect }
-    annotStore.replace(a.id, rewrap(wider, String(a.contents ?? a.text)))
+    applyTextEdit(rewrap(wider, String(a.contents ?? a.text)))
   }
-  onAnnotChanged(a.pageNumber)
   void refreshTextEditBox()
 }
 
@@ -1700,12 +1761,32 @@ watch(
   },
 )
 
-// 版面变化（切单/双页、封面对齐）之后必须重新评估一次 ——
-// 否则"本来就在观察范围内、现在变可见"的页永远不会被请求（IO 不会回调）
+/**
+ * 版面变化（切单/双页、封面对齐）之后要**重新锚定到当前页**。
+ *
+ * 🔴 只调 `updateVisibility` 是不够的 —— 那是这版之前的写法，带来一个很显眼的 bug：
+ *    双页一行放两页，内容总高差不多只有单页的一半。版面的 y 坐标全变了，
+ *    而 `scrollTop` 是像素偏移、**不会自己换算**，于是同一个偏移落到别的页上：
+ *      · 单页第 7 页 → 切双页 → 变成第 13 页（偏移变大了一倍）
+ *      · 双页第 13 页 → 切单页 → 变成第 7 页
+ *    用户报的就是后一条："从双页切换成单页时页码会除以 2"。
+ *
+ * 所以这里记住切换前的当前页，等新版面生效后用 `restoreTo` 重新定位 ——
+ * 它可以复用 ANCHOR_GAP 那对成对的换算，不用在这里再写一次。
+ */
 watch(
   () => [props.mode, props.spreadOffset] as const,
   () => {
-    void nextTick(() => updateVisibility())
+    const keep = currentPage.value
+    const doc0 = props.doc
+    void nextTick(() => {
+      // 换文档时 App 也会顺手把 mode/spreadOffset 复位，那不是"用户切换视图" ——
+      // 新文件该走自己的起始位置，别拿旧文档的页码去定位。
+      if (props.doc !== doc0) return
+      const l = layout.value
+      if (!l?.pages.some((p) => p.pageNumber === keep)) return
+      void restoreTo(scale.value, keep)
+    })
   },
 )
 </script>
@@ -2153,11 +2234,20 @@ watch(
   background: transparent;
 }
 
-/* 左边实心把手：拖动整个框（Edge 就是这条蓝条） */
+/*
+ * 左边实心把手：拖动整个框（Edge 就是这条蓝条）。
+ *
+ * 🔴 **必须在框外（负偏移）** —— 放在框内会**压住正文首字符**：
+ *    它视觉上盖住的是文字，而文字并不因此让位（编辑区还是占满整个框宽，
+ *    因为换行位置必须和写回 PDF 的宽度一致）。用户报的现象就是"左边这条挡住了字"。
+ *    ⚠️ 不能改成"把正文往右挤 14px"来避让 —— 那样编辑时的换行位置就和
+ *    写回 PDF 的宽度差 14px，变成"写回之后排版变了"。
+ *    右边那个圆圈同理，本来就是 `right: -6px`。
+ */
 .te-grip {
   pointer-events: auto;
   position: absolute;
-  left: 0;
+  left: -16px;
   top: 0;
   bottom: 0;
   width: 14px;

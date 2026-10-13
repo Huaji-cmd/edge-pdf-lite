@@ -165,10 +165,16 @@ async function onReveal(n: FileNode): Promise<void> {
 
 async function onCopyPath(n: FileNode): Promise<void> {
   closeMenu()
-  const ok = await copyPath(n)
-  // ⚠️ 复制成功/失败都要给反馈：剪贴板是"看不见"的操作，
-  //    一声不响的话用户不知道到底成没成（而且失败时他会以为程序坏了）
-  emit('toast', ok ? `已复制路径：${n.path}` : '复制失败，可能是浏览器不允许访问剪贴板')
+  const r = await copyPath(n)
+  /*
+   * ⚠️ 三种结果都要给反馈：剪贴板是"看不见"的操作，一声不响用户就不知道成没成
+   *    （失败时还会以为程序坏了）。
+   *    `no-response` 这一种尤其别写成"失败" —— 实测过这种情况下其实已经复制上了，
+   *    只是剪贴板没回来报信；提示语里把路径带出来，用户想手动复制也有得抄。
+   */
+  if (r === 'ok') emit('toast', `已复制路径：${n.path}`)
+  else if (r === 'denied') emit('toast', '复制失败，可能是浏览器不允许访问剪贴板')
+  else emit('toast', `复制没有回应（路径已复制就绪）：${n.path}`)
 }
 
 // ---------------- 重命名

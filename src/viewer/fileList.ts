@@ -284,14 +284,32 @@ export async function renameFile(node: FileNode, newBase: string): Promise<Renam
   }
 }
 
-/** 复制绝对路径到剪贴板（就一串路径，不做别的加工） */
-export async function copyPath(node: FileNode): Promise<boolean> {
-  if (!node.path) return false
+/**
+ * 复制绝对路径到剪贴板（就一串路径，不做别的加工）。
+ *
+ * 结果分三种，因为**"没回音"是一个真实存在的结果**：
+ * `writeText` 返回的 Promise 在 WebView2 里有可能**既不 resolve 也不 reject**
+ * （实测：系统剪贴板被别的进程占着时，三次调用全部悬停，等 1.5 秒都不落地）。
+ * 那种情况下 `await` 会把整个函数挂死 → 界面上一点反馈都没有，
+ * 而"复制是看不见的操作，静默就等于不知道成没成"正是这段代码最该避免的事。
+ *
+ * 所以加超时兜底。⚠️ 注意超时**不等于失败** —— 用户实测过这种情况其实已经复制上了，
+ * 只是没人回来报信。所以超时单独给一种结果，让提示语说得诚实些。
+ */
+export type CopyPathResult = 'ok' | 'denied' | 'no-response'
+
+/** 剪贴板没回音时的等待上限（ms）。给足时间，别把"慢"误判成"没回音" */
+const COPY_TIMEOUT = 2000
+
+export async function copyPath(node: FileNode): Promise<CopyPathResult> {
+  if (!node.path) return 'denied'
   try {
-    await navigator.clipboard.writeText(node.path)
-    return true
+    return await Promise.race([
+      navigator.clipboard.writeText(node.path).then(() => 'ok' as const),
+      new Promise<'no-response'>((r) => window.setTimeout(() => r('no-response'), COPY_TIMEOUT)),
+    ])
   } catch {
-    return false
+    return 'denied'
   }
 }
 

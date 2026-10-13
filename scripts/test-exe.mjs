@@ -769,11 +769,21 @@ check(
 await ctxOnFile()
 await sleep(320)
 await evaluate(`document.querySelector('[data-tid="file-copy-path"]').click()`)
-await sleep(600)
-const cpToast = await evaluate(`(document.querySelector('.toast') || {}).textContent || ''`)
+/*
+ * ⚠️ **必须轮询，不能"等够时间再读"** —— 提示条只显示 2.6 秒（`showToast`），
+ *    而复制有两种节奏：顺利时几乎立刻出提示、剪贴板没回音时要等 2 秒兜底（见 copyPath）。
+ *    写死一个 sleep 必然踩在两种节奏的缝里：第一版等 2.6 秒，正好卡在提示条过期上，
+ *    于是"功能明明是好的，测试却红"。
+ */
+let cpToast = ''
+for (let i = 0; i < 14; i++) {
+  cpToast = await evaluate(`(document.querySelector('.toast') || {}).textContent || ''`)
+  if (cpToast) break
+  await sleep(300)
+}
 check(
   '复制路径给了反馈（剪贴板是看不见的操作，静默=不知道成没成）',
-  /已复制路径|复制失败/.test(cpToast),
+  /已复制路径|复制失败|复制没有回应/.test(cpToast),
   cpToast.replace(/\s+/g, ' ').slice(0, 80),
 )
 

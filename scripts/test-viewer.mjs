@@ -449,6 +449,52 @@ try {
   )
   await shot('07-dual')
 
+  /*
+   * ---------------------------------------------------------------- 7b. 切模式不换页
+   *
+   * 用户报的："从双页切换成单页时页码会除以 2，这是不对的，切换时保持页码不变"。
+   *
+   * 根因：双页一行放两页，内容总高差不多只有单页的一半 —— 版面的 y 坐标全变了，
+   * 而 `scrollTop` 是像素偏移、不会自己换算。保持同一个偏移，落在的页就变了：
+   *   双页第 13 页 → 切单页 → 第 7 页（正好一半）。
+   * ⚠️ 判据必须**跟切换前那一页比**，不能跟"最初那页"比 —— 我第一版就是这么写错的：
+   *   单页7 → 双页13 → 单页7 会"看起来对"，其实来回都被换了一次页。
+   */
+  console.log('\n[7b] 切单/双页：当前页保持不变')
+  const pageNow = async () => Number(await evaluate(`document.querySelector('.page-input').value`))
+  const jumpTo = async (n) => {
+    await evaluate(`(() => {
+      const i = document.querySelector('.page-input');
+      i.value = '${n}';
+      i.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`)
+    await sleep(900)
+    return pageNow()
+  }
+  const setMode = async (m) => {
+    await evaluate(`document.querySelector('[data-tid="mode-${m}"]')?.click()`)
+    await sleep(1100)
+    return pageNow()
+  }
+
+  await setMode('single')
+  const p7 = await jumpTo(7)
+  check('先回到单页第 7 页', p7 === 7, `第 ${p7} 页`)
+  const afterDual = await setMode('dual')
+  check('单页 7 → 切双页：还是第 7 页', afterDual === 7, `第 ${afterDual} 页`)
+
+  const p13 = await jumpTo(13)
+  check('双页下跳到第 13 页', p13 === 13, `第 ${p13} 页`)
+  const afterSingle = await setMode('single')
+  check(
+    '双页 13 → 切单页：还是第 13 页（不是 7）',
+    afterSingle === 13,
+    `第 ${afterSingle} 页`,
+  )
+  const snapAfter = JSON.parse(await evaluate(`JSON.stringify(globalThis.__eplViewer.snapshot())`))
+  check('滚动位置与记录的当前页一致（不是只改了显示）', snapAfter.page === 13, `snapshot.page=${snapAfter.page}`)
+  await shot('07b-mode-switch-keeps-page')
+
   // ---------------------------------------------------------------- 8. 文本层
   console.log('\n[8] 文本层（可选中 / 复制 / 查找）')
   const textInfo = JSON.parse(
