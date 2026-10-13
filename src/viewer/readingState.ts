@@ -79,3 +79,69 @@ export function listReadingStates(): string[] {
   }
   return out
 }
+
+// ---------------------------------------------------------------- 上次打开的文档
+
+/**
+ * 上次打开的那份文档。
+ *
+ * **为什么不能只靠上面那套阅读位置**：位置是按**内容指纹**存的 ——
+ * 指纹能证明"是同一份内容"，但**找不回文件**。重开应用时没有任何东西
+ * 告诉我们该去读哪个文件，所以"记住读到哪一页"和"记住是哪一本"是两件事，
+ * 必须各存一份。用户的原话就是这个：*"上次阅读的位置记录下来了，
+ * 但是上次阅读的 pdf 没有记录下来"*。
+ *
+ * ⚠️ 只有桌面端存得了：浏览器拿不到真实路径（`<input type=file>` 只给一个临时
+ *    File 对象），存了也没法重开 —— 那边界面上已经写明"不能跨会话记住"。
+ */
+export interface LastDocument {
+  /** 真实路径（桌面端） */
+  path: string
+  /** 文件名，恢复失败时好让用户知道是哪一个 */
+  name: string
+  updatedAt: number
+}
+
+const LAST_KEY = 'epl:last-doc'
+
+export function saveLastDocument(path: string, name: string): void {
+  if (!path) return
+  try {
+    localStorage.setItem(
+      LAST_KEY,
+      JSON.stringify({ path, name, updatedAt: Date.now() } satisfies LastDocument),
+    )
+  } catch {
+    /* 存不上就算了，不该影响阅读 */
+  }
+}
+
+export function loadLastDocument(): LastDocument | null {
+  try {
+    const raw = localStorage.getItem(LAST_KEY)
+    if (!raw) return null
+    const o = JSON.parse(raw) as Partial<LastDocument>
+    if (typeof o.path !== 'string' || !o.path) return null
+    return {
+      path: o.path,
+      name: typeof o.name === 'string' && o.name ? o.name : o.path,
+      updatedAt: typeof o.updatedAt === 'number' ? o.updatedAt : 0,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 忘掉"上次打开的文档"。
+ *
+ * ⚠️ 文件不在了就**一定要清掉**：不然每次启动都会去读一个不存在的路径，
+ *    既白费一次 IO，也会让用户反复看到同一条提示。
+ */
+export function clearLastDocument(): void {
+  try {
+    localStorage.removeItem(LAST_KEY)
+  } catch {
+    /* ignore */
+  }
+}

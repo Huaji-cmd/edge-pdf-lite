@@ -65,6 +65,10 @@ export const TID = {
   toolRect: 'tool-rect',
   toolFreetext: 'tool-freetext',
   toolEraser: 'tool-eraser',
+  // 手写笔尖粗细（三档；**只在手写工具激活时**才出现在 DOM 里）
+  inkWidthThin: 'ink-width-0',
+  inkWidthMid: 'ink-width-1',
+  inkWidthThick: 'ink-width-2',
 
   // 历史与保存
   undo: 'undo',

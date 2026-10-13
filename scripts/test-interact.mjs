@@ -18,7 +18,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { clickByTidExpr } from './testids.mjs'
+import { clickByTidExpr, TID } from './testids.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const SHOTS = resolve(ROOT, 'interact-shots')
@@ -341,6 +341,45 @@ try {
    * ⚠️ 别用"创建时点击的那一点"当中心：文本框是从点击处**向左上**长出来的，
    * 点下的那一点是框的右下角，拿它当中心会点空。
    */
+  /**
+   * 在批注浮层上量"一条横线有多**厚**"。
+   *
+   * 判据取**该列 alpha 的总和**，而不是"数有几行不透明"：
+   * 细笔在 150% 缩放下只有 1~2 个设备像素，抗锯齿会把边界摊成半透明，
+   * 数行数会出现"1 行 vs 2 行"这种一像素之差 —— 渲染参数一变就假红。
+   * alpha 总和正比于墨量，三档之间是 1 : 2 : 4 的量级差，稳定得多。
+   *
+   * ⚠️ 两层 canvas 都要扫（under=高亮 / over=其余），笔迹在 over 那层。
+   *    只查第一张会量到空的 under 层 → 恒为 0。
+   */
+  const strokeInk = async (screenX, screenY, winPx = 22) =>
+    Number(
+      await evaluate(`
+        (() => {
+          const layers = [...document.querySelectorAll('.page-slot .annot-layer')];
+          let best = 0;
+          for (const layer of layers) {
+            const r = layer.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) continue;
+            if (${screenX} < r.left || ${screenX} > r.right) continue;
+            if (${screenY} < r.top || ${screenY} > r.bottom) continue;
+            const sx = layer.width / r.width, sy = layer.height / r.height;
+            const cx = Math.round((${screenX} - r.left) * sx);
+            const cy = Math.round((${screenY} - r.top) * sy);
+            const half = Math.round(${winPx} * sy);
+            const y0 = Math.max(0, cy - half);
+            const y1 = Math.min(layer.height, cy + half);
+            if (y1 <= y0) continue;
+            const d = layer.getContext('2d').getImageData(cx, y0, 1, y1 - y0).data;
+            let sum = 0;
+            for (let i = 3; i < d.length; i += 4) sum += d[i];
+            if (sum > best) best = sum;
+          }
+          return best;
+        })()
+      `),
+    )
+
   const centerOf = async (id) =>
     JSON.parse(
       await evaluate(`
@@ -489,6 +528,79 @@ try {
   check('画布上真的出现蓝色像素', bluePx > 200, `blue=${bluePx}px`)
   check('画布上没有默认红的墨迹', redPx < 50, `red=${redPx}px`)
   await shot('01-ink-blue')
+
+  // ---------------------------------------------------------------- 2b. 笔尖粗细
+
+  console.log('\n[2b] 手写笔尖粗细：三档')
+  const widthBtns = async () =>
+    Number(await evaluate(`document.querySelectorAll('[data-tid^="ink-width-"]').length`))
+  check('手写工具激活时出现 3 个笔尖档位', (await widthBtns()) === 3, `按钮数=${await widthBtns()}`)
+
+  const activeIdx = Number(
+    await evaluate(
+      `[...document.querySelectorAll('[data-tid^="ink-width-"]')].findIndex(b => b.classList.contains('on'))`,
+    ),
+  )
+  // 与加这个功能之前的线宽（1.6pt）一致，老用户手感不变
+  check('默认停在「中」档（1.6pt）', activeIdx === 1, `index=${activeIdx}`)
+
+  // 三档各画一条**水平**短线，再量它有多厚
+  const band = JSON.parse(
+    await evaluate(`
+      (() => {
+        const p = document.querySelector('.page-slot[data-page="1"]').getBoundingClientRect();
+        const v = document.querySelector('.viewport').getBoundingClientRect();
+        const top = Math.max(p.top, v.top), bottom = Math.min(p.bottom, v.bottom);
+        const left = Math.max(p.left, v.left), right = Math.min(p.right, v.right);
+        return JSON.stringify({ top, bottom, left, right });
+      })()
+    `),
+  )
+  const h = band.bottom - band.top
+  check('页面可视区域够高，能画三条互不干扰的线', h > 260, `高=${Math.round(h)}px`)
+
+  const ys = [0.18, 0.48, 0.78].map((f) => band.top + h * f)
+  const lx0 = band.left + 40
+  const lx1 = Math.min(band.right - 40, lx0 + 160)
+  const tids = [TID.inkWidthThin, TID.inkWidthMid, TID.inkWidthThick]
+  const names = ['细', '中', '粗']
+  const inkSums = []
+  for (let i = 0; i < 3; i++) {
+    check(
+      `点「${names[i]}」档`,
+      await evaluate(
+        `(() => { const b = document.querySelector('[data-tid="${tids[i]}"]'); if (!b) return false; b.click(); return true; })()`,
+      ),
+    )
+    await sleep(200)
+    await mouseAt('mousePressed', lx0, ys[i], 1)
+    for (let k = 1; k <= 10; k++) {
+      await mouseAt('mouseMoved', lx0 + ((lx1 - lx0) * k) / 10, ys[i], 1)
+      await sleep(8)
+    }
+    await mouseAt('mouseReleased', lx1, ys[i], 0)
+    await sleep(350)
+    inkSums.push(await strokeInk((lx0 + lx1) / 2, ys[i]))
+  }
+  const fmt = (n) => Math.round(n)
+  // ★ 像素判据：数据对了但没画粗，只有这条能抓（画布上墨量必须真的递增）
+  check(
+    '画布上墨量递增：细 < 中 < 粗',
+    inkSums[0] < inkSums[1] && inkSums[1] < inkSums[2],
+    inkSums.map(fmt).join(' < '),
+  )
+  check(
+    '粗笔至少是细笔的 2 倍墨量（档位差别要看得见）',
+    inkSums[2] >= inkSums[0] * 2,
+    `${fmt(inkSums[0])} → ${fmt(inkSums[2])}`,
+  )
+  const inkWidths = (await annots()).filter((a) => a.kind === 'ink').map((a) => a.lineWidth)
+  check(
+    '写进数据的是三档实际线宽 0.8 / 1.6 / 3.2',
+    [0.8, 1.6, 3.2].every((w) => inkWidths.some((v) => Math.abs(v - w) < 0.01)),
+    inkWidths.join(', '),
+  )
+  await shot('02-ink-widths')
 
   // ---------------------------------------------------------------- 3. 高亮改色
 

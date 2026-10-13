@@ -66,3 +66,6 @@ Thumbs.db
 secrets.*
 *credentials*
 tauri.conf.local.json
+
+# 个人操作笔记（用户明确说不追踪；放在仓库根目录，靠这条挡住 git add -A）
+git检查隐私.md

@@ -335,6 +335,77 @@ for (let i = 0; i < 60; i++) {
 }
 check('点列表里的文件真的打开了（Rust 读字节这条路通）', openedFromList)
 
+// ---------------------------------------------------------------- 5b. 上次打开的文档
+console.log('\n[5b] 重开后自动打开上次那篇 PDF')
+
+/*
+ * 用户的原始诉求："我看了一篇 pdf 之后关闭了软件，重新打开需要我重新打开本来的 pdf。
+ * 上次阅读的位置记录下来了，但是上次阅读的 pdf 没有记录下来。"
+ *
+ * 所以这里要验**两件事**，缺一不可：
+ *   ① 打开文件时把路径记下来了（不然重开就无从下手）
+ *   ② 重开之后**不用手点**，那篇真的自己打开了，而且渲染出来了
+ *      —— 光看文件名对不够，"只是设了个名字、画布是空的"也得判红
+ *
+ * ⚠️ 用整页重载模拟"关掉软件再打开"：WebView2 的 profile 不丢，
+ *    localStorage 和真实文件系统都还是原样，跟进程重启的效果等价。
+ */
+const lastDoc = JSON.parse((await evaluate(`localStorage.getItem('epl:last-doc')`)) ?? 'null')
+check(
+  '从列表打开文件时记住了路径',
+  !!lastDoc?.path && /1706/.test(String(lastDoc.path)),
+  String(lastDoc?.path ?? '(没记)'),
+)
+
+await send('Page.reload')
+await sleep(3000)
+
+let restoredName = ''
+for (let i = 0; i < 60; i++) {
+  restoredName = String(
+    await evaluate(`(document.querySelector('[data-tid="file-name"]')||{}).textContent||''`),
+  )
+  if (restoredName.includes('1706')) break
+  await sleep(400)
+}
+check(
+  '重开后**不用手点**就打开了上次那篇 PDF',
+  restoredName.includes('1706'),
+  `当前=${restoredName || '(空)'}`,
+)
+
+const canvasesAfterReload = await evaluate(`document.querySelectorAll('.pdf-page-canvas').length`)
+check(
+  '而且真的渲染出来了（不是只挂了个文件名）',
+  canvasesAfterReload > 0,
+  `画布=${canvasesAfterReload}`,
+)
+
+const pageAfterReload = await evaluate(
+  `Number(document.querySelector('[data-tid="page-input"]')?.value ?? 0)`,
+)
+check('页码也恢复了（阅读位置记忆没被这次改动破坏）', pageAfterReload >= 1, `page=${pageAfterReload}`)
+
+// 文件不在了的时候不能卡住，也不能每次都白试
+const ghost = join(TDIR, 'definitely-not-here.pdf')
+await evaluate(
+  `localStorage.setItem('epl:last-doc', JSON.stringify({ path: ${JSON.stringify(ghost)}, name: '不存在.pdf', updatedAt: Date.now() }))`,
+)
+await send('Page.reload')
+await sleep(3000)
+const backToWelcome = await evaluate(`!!document.querySelector('.welcome')`)
+check(
+  '路径失效时回到欢迎页，不会卡在空白',
+  backToWelcome,
+  `#app 子节点=${await evaluate(`document.querySelector('#app').children.length`)}`,
+)
+const ghostLeft = await evaluate(`localStorage.getItem('epl:last-doc')`)
+check(
+  '并且把失效记录清掉了（不会每次启动都白试一遍）',
+  !ghostLeft || ghostLeft === 'null',
+  String(ghostLeft),
+)
+
 // ---------------------------------------------------------------- 6. 保存批注
 console.log('\n[6] 保存批注：另存到指定目录 / 覆盖原文件（含自动 .bak）')
 

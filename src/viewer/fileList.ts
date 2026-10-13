@@ -186,12 +186,21 @@ export async function loadChildren(node: FileNode): Promise<void> {
   }
 }
 
+/**
+ * 按**真实路径**读一份 PDF（桌面端）。
+ *
+ * 单独抽出来是因为它有两个调用方：文件列表里的条目，以及
+ * 「上次打开的文档」启动恢复（那个只有路径、没有 FileNode）。两条路必须读同一份实现，
+ * 否则改 Rust 命令名时容易只改一边。
+ */
+export async function readBytesByPath(path: string): Promise<Uint8Array> {
+  const bytes = await invoke<number[]>('read_pdf_bytes', { path })
+  return new Uint8Array(bytes)
+}
+
 /** 读一个文件的字节。桌面端走 Rust，浏览器端读 File 对象 */
 export async function readPdfBytes(node: FileNode): Promise<Uint8Array> {
-  if (node.path) {
-    const bytes = await invoke<number[]>('read_pdf_bytes', { path: node.path })
-    return new Uint8Array(bytes)
-  }
+  if (node.path) return readBytesByPath(node.path)
   if (node.file) return new Uint8Array(await node.file.arrayBuffer())
   throw new Error('这个条目既没有路径也没有文件，读不了')
 }
@@ -203,6 +212,22 @@ export async function stillExists(node: FileNode): Promise<boolean> {
     return await invoke<boolean>('path_exists', { path: node.path })
   } catch {
     return true
+  }
+}
+
+/**
+ * 只按路径问"还在不在"。
+ *
+ * ⚠️ 与 `stillExists` 的失败语义**故意相反**：
+ *    那个是"查不了就直接试"（用户主动点的文件，试一下没坏处）；
+ *    这个是**启动时自动恢复**，查不了就不该自作主张打开一个来路不明的路径。
+ */
+export async function pathExists(path: string): Promise<boolean> {
+  if (!IS_TAURI || !path) return false
+  try {
+    return await invoke<boolean>('path_exists', { path })
+  } catch {
+    return false
   }
 }
 

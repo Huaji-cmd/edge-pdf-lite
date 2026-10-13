@@ -29,6 +29,8 @@ const props = defineProps<{
   pointerMode: PointerMode
   /** 各工具的当前配色（用户在色板上选的） */
   colors: ToolColors
+  /** 手写笔尖粗细（pt）—— 工具栏三档之一，改了立刻对下一笔生效 */
+  inkWidth: number
 }>()
 
 /** scale 用 v-model 双向绑定：父组件（工具栏）也能改 */
@@ -1089,6 +1091,7 @@ function makeEditor(layer: AnnotLayer, doc: PdfDocument): AnnotEditor {
     eraserTolerance: () => 8 / Math.max(scale.value, 0.01),
     // 兜一层：localStorage 里可能留着旧版本存的黑/白高亮色
     colorFor: (kind) => sanitizeToolColor(kind, props.colors[kind]),
+    inkWidth: () => props.inkWidth,
     requestText: (_pn, _x, _y, initial) => openTextModal(initial ?? ''),
     onChange: (pn) => onAnnotChanged(pn),
     onSelectionChange: (id) => {
@@ -1181,6 +1184,10 @@ onMounted(() => {
           rect: [...a.rect] as number[],
           color: [...a.color] as number[],
           contentInsideRect,
+          // 外观标量。测试要能判"工具栏选的档位真的落进数据了" ——
+          // 只看渲染像素能发现"粗细没变"，但定位不到是数据没写进去还是绘制没读它。
+          lineWidth: a.kind === 'ink' || a.kind === 'rect' ? a.lineWidth : undefined,
+          fontSize: a.kind === 'freetext' ? a.fontSize : undefined,
         }
       }),
   }

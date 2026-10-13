@@ -335,3 +335,31 @@ export const DEFAULT_LINE_WIDTH: Record<'ink' | 'rect', number> = {
   rect: 1.4,
 }
 
+/**
+ * 手写笔尖粗细，三档（pt）。
+ *
+ * ⚠️ 存的是**实际线宽**，不是档位索引 —— `InkAnnot.lineWidth` 本来就是 pt，
+ *    这样老数据里的任意线宽照样能画，也省掉"索引 → 宽度"一层映射
+ *    （少一层映射就少一处改档位时忘记同步的地方）。
+ *
+ * 三档的比例取 1 : 2 : 4 —— 相邻两档在屏幕上要**一眼看出差别**，
+ * 差别太小的档位等于没有（跟色板同一个道理：要的是"一眼认出"而不是精度）。
+ */
+export const INK_WIDTHS: readonly number[] = [0.8, 1.6, 3.2]
+
+/** 三档的名字 */
+export const INK_WIDTH_LABELS: readonly string[] = ['细', '中', '粗']
+
+/** 默认档位 = 中间那档（1.6pt，与加这个功能之前的线宽一致，老用户手感不变） */
+export const DEFAULT_INK_WIDTH: number = 1.6
+
+/** 把任意线宽吸附到最近的档位（读 localStorage 时用，防止存进来越界的值） */
+export function nearestInkWidth(w: unknown): number {
+  if (typeof w !== 'number' || !Number.isFinite(w)) return DEFAULT_INK_WIDTH
+  let best = INK_WIDTHS[0]!
+  for (const v of INK_WIDTHS) {
+    if (Math.abs(v - w) < Math.abs(best - w)) best = v
+  }
+  return best
+}
+

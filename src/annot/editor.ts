@@ -63,6 +63,13 @@ export interface EditorHost {
   eraserTolerance(): number
   /** 当前工具对应的颜色（用户在工具栏色板上选的） */
   colorFor(kind: AnnotKind): Rgb
+  /**
+   * 当前手写笔尖粗细（pt）—— 工具栏三档之一。
+   *
+   * 和 `colorFor` 同一个路子：取值来自宿主（App 的响应式状态 + localStorage），
+   * 编辑器只负责"用"，不负责"存"。不这么做的话，用户改了粗细要重新选工具才生效。
+   */
+  inkWidth(): number
   /** 弹文本框；用户取消返回 null */
   requestText(pageNumber: number, cssX: number, cssY: number, initial?: string): Promise<TextRequestResult | null>
   /** 批注增删后通知宿主（重绘 + 更新计数） */
@@ -293,11 +300,11 @@ export class AnnotEditor {
         kind: 'ink',
         id: newAnnotId(),
         pageNumber: s.pageNumber,
-        rect: bboxOfPoints(pts, DEFAULT_LINE_WIDTH.ink / 2 + 0.5),
+        rect: bboxOfPoints(pts, this.host.inkWidth() / 2 + 0.5),
         color: this.host.colorFor('ink'),
         opacity: 1,
         strokes: [pts],
-        lineWidth: DEFAULT_LINE_WIDTH.ink,
+        lineWidth: this.host.inkWidth(),
         created: nowIso(),
         modified: nowIso(),
       } satisfies InkAnnot
@@ -637,7 +644,7 @@ export class AnnotEditor {
         color: this.host.colorFor('ink'),
         opacity: 1,
         strokes: [s.points.slice()],
-        lineWidth: DEFAULT_LINE_WIDTH.ink,
+        lineWidth: this.host.inkWidth(),
         created: nowIso(),
         modified: nowIso(),
       }

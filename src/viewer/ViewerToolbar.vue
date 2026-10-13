@@ -14,7 +14,7 @@ import { computed, ref, onMounted, onBeforeUnmount } from 'vue'
 import Icon from './Icon.vue'
 import type { ViewMode } from './types'
 import type { ToolKind, ToolColors, PointerMode, Rgb } from '@/annot/types'
-import { swatchesFor, POINTER_MODES, isColorTool } from '@/annot/types'
+import { swatchesFor, POINTER_MODES, isColorTool, INK_WIDTHS, INK_WIDTH_LABELS } from '@/annot/types'
 import type { SelectedInfo } from '@/annot/types'
 import { rgbCss } from '@/annot/draw'
 
@@ -38,6 +38,8 @@ const props = defineProps<{
   pointerMode: PointerMode
   /** 各工具的当前配色 */
   colors: ToolColors
+  /** 手写笔尖粗细（pt）—— 三档之一 */
+  inkWidth: number
   /** 选中的批注；null = 没有选中 */
   selected: SelectedInfo | null
   canUndo: boolean
@@ -58,6 +60,8 @@ const emit = defineEmits<{
   'set-pointer-mode': [mode: PointerMode]
   /** 点色板。有选中项时改选中项，否则改当前工具的默认色 */
   'pick-color': [color: Rgb]
+  /** 点笔尖粗细档位（只对手写生效，改完立刻对下一笔起作用） */
+  'pick-ink-width': [width: number]
   undo: []
   redo: []
   'delete-selected': []
@@ -89,6 +93,24 @@ function onPageInput(e: Event): void {
   const v = Number((e.target as HTMLInputElement).value)
   if (Number.isFinite(v)) emit('go-to', Math.min(Math.max(1, Math.round(v)), props.numPages || 1))
 }
+
+// ---------------------------------------------------------------- 笔尖粗细
+
+/**
+ * 手写笔尖的档位选择器。
+ *
+ * 只在**手写工具激活时**才出现在工具栏里：
+ * 功能区总宽本来就紧（见文件头那段），常驻三个按钮会挤掉别的；
+ * 而"粗不粗"这件事只在正要落笔时有意义。
+ *
+ * 三档用**大小递增的圆点**表示，不用文字 —— 图标化之后这个工具栏上
+ * 一个汉字都没有，突然冒出「细中粗」三个字会很突兀。
+ */
+const inkWidthIndex = computed(() => {
+  const i = INK_WIDTHS.indexOf(props.inkWidth)
+  // 理论上构造时就吸附过档位，这里兜一层：万一没有，默认高亮中间那档
+  return i >= 0 ? i : 1
+})
 
 // ---------------------------------------------------------------- 颜色
 
@@ -329,6 +351,23 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
       >
         <Icon name="pen" />
       </button>
+      <!--
+        笔尖粗细：只在手写工具激活时出现。
+        圆点直径就是粗细的视觉映射 —— 不点也能预判选哪档会画出多粗的线。
+      -->
+      <span v-if="tool === 'ink'" class="ink-width" title="笔尖粗细（改完对下一笔生效）">
+        <button
+          v-for="(w, i) in INK_WIDTHS"
+          :key="w"
+          class="iw"
+          :class="{ on: i === inkWidthIndex }"
+          :data-tid="`ink-width-${i}`"
+          :title="`笔尖${INK_WIDTH_LABELS[i]}（${w}pt）`"
+          @click="emit('pick-ink-width', w)"
+        >
+          <span class="iw-dot" :style="{ width: `${5 + i * 4}px`, height: `${5 + i * 4}px` }" />
+        </button>
+      </span>
       <button
         class="rb"
         :class="{ on: tool === 'area' }"
@@ -656,5 +695,50 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
 }
 .sw.on {
   border-color: var(--on-accent);
+}
+
+/*
+ * 笔尖粗细选择器。
+ *
+ * ⚠️ 故意做小（24×28）而不是三个 40px 的标准按钮：功能区总宽是按约 1290px 卡的
+ *    （见文件头），这里每多占 10px 都可能把「未保存」标记压成竖排文字。
+ *    圆点直径直接映射线宽，所以三档的视觉差异本身就在说明"选它会画多粗"。
+ */
+.ink-width {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px;
+  margin: 0 2px;
+  border-left: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  align-self: center;
+}
+.iw {
+  width: 24px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+  padding: 0;
+}
+.iw:hover {
+  background: var(--hover);
+}
+.iw.on {
+  background: var(--btn);
+  border-color: var(--line-strong);
+}
+.iw-dot {
+  display: block;
+  border-radius: 50%;
+  background: var(--fg-2);
+}
+.iw.on .iw-dot {
+  background: var(--accent);
 }
 </style>

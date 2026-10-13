@@ -10,6 +10,8 @@ import { initTheme, resolveSaveDir, settings } from './viewer/settings'
 import {
   useFileList,
   readPdfBytes,
+  readBytesByPath,
+  pathExists,
   stillExists,
   restoreList,
   pruneMissing,
@@ -18,10 +20,16 @@ import type { FileNode } from './viewer/fileList'
 import { IS_TAURI } from './platform'
 import type { PageSize, SidePanelKind } from './viewer/types'
 import type { OutlineNode } from './viewer/outline'
-import { loadReadingState, saveReadingState } from './viewer/readingState'
+import {
+  loadReadingState,
+  saveReadingState,
+  loadLastDocument,
+  saveLastDocument,
+  clearLastDocument,
+} from './viewer/readingState'
 import type { ViewMode } from './viewer/types'
 import type { ToolKind, ToolColors, PointerMode, Rgb, SelectedInfo } from './annot/types'
-import { defaultToolColors, isColorTool } from './annot/types'
+import { defaultToolColors, isColorTool, DEFAULT_INK_WIDTH, nearestInkWidth } from './annot/types'
 // ⚠️ 不静态 import：pdf-lib 打包后有 570 KB（gzip 248 KB），
 // 而"打开就为阅读"的用户一条批注都不会画。只有真的点「保存批注」才去拉它。
 const loadWriter = () => import('./annot/writer')
@@ -184,6 +192,33 @@ function saveColors(): void {
     localStorage.setItem(COLOR_KEY, JSON.stringify(colors.value))
   } catch {
     /* 隐私模式下 localStorage 会抛异常，配色丢了也不该影响阅读 */
+  }
+}
+
+/**
+ * 手写笔尖粗细。和配色一样存 localStorage —— 换文档、重开应用都还是上次那档。
+ *
+ * ⚠️ 读进来要**吸附到最近的档位**：localStorage 里可能留着老版本写的任意数值，
+ *    不吸附的话工具栏三个按钮会一个都不高亮，看着像"没有任何档位被选中"。
+ */
+const INK_WIDTH_KEY = 'epl:ink-width'
+const inkWidth = ref(loadInkWidth())
+
+function loadInkWidth(): number {
+  try {
+    return nearestInkWidth(JSON.parse(localStorage.getItem(INK_WIDTH_KEY) ?? 'null'))
+  } catch {
+    /* 坏数据当没配过 */
+  }
+  return DEFAULT_INK_WIDTH
+}
+
+function pickInkWidth(w: number): void {
+  inkWidth.value = nearestInkWidth(w)
+  try {
+    localStorage.setItem(INK_WIDTH_KEY, JSON.stringify(inkWidth.value))
+  } catch {
+    /* 存不上就算了，不该影响画 */
   }
 }
 
@@ -447,6 +482,40 @@ async function openFromList(node: FileNode): Promise<void> {
   if (await openBytes(bytes, node.name)) {
     currentFileId.value = node.id
     currentSourcePath.value = node.path ?? ''
+    // 记住"上次打开的是这一本" —— 下次启动会自动打开它（见 restoreLastDocument）
+    if (node.path) saveLastDocument(node.path, node.name)
+  }
+}
+
+/**
+ * 启动时自动打开上次那篇 PDF（只有桌面端有路径可存）。
+ *
+ * 用户的原话：*"我看了一篇 pdf 之后关闭了软件，重新打开需要我重新打开本来的 pdf"*。
+ * 阅读位置本来就记住了（按内容指纹），缺的只是"上次读的是哪个文件"这一步。
+ *
+ * ⚠️ 文件不在了就**必须把记录清掉**再提示 —— 否则每次启动都会读到同一个死路径，
+ *    用户会反复看到同一条提示，还以为是坏了。
+ */
+async function restoreLastDocument(): Promise<void> {
+  const last = loadLastDocument()
+  // doc 已有值说明用户手快已经打开了别的，别抢
+  if (!last || doc.value) return
+  if (!(await pathExists(last.path))) {
+    clearLastDocument()
+    showToast(`上次打开的《${last.name}》已经不在原来的位置了`)
+    return
+  }
+  try {
+    const bytes = await readBytesByPath(last.path)
+    if (await openBytes(bytes, last.name)) {
+      currentSourcePath.value = last.path
+      // 文件列表里已经有这一条的话，顺手把高亮也切过去
+      currentFileId.value = fileNodes.value.find((n) => n.path === last.path)?.id ?? null
+    }
+  } catch (e) {
+    // 读不出来（权限/损坏）也清掉，免得每次启动都白试一遍
+    clearLastDocument()
+    console.warn('[last-doc] 恢复上次打开的文档失败：', e)
   }
 }
 
@@ -774,6 +843,8 @@ onMounted(() => {
   if (IS_TAURI) {
     restoreList()
     void pruneMissing()
+    // 再把上次看的那一本直接打开 —— 用户要的是"重开还是那篇 PDF"
+    void restoreLastDocument()
   }
 
   // 桌面端：同步最大化状态，并跟着窗口变化更新（标题栏的图标要靠它切换）
@@ -829,6 +900,7 @@ onBeforeUnmount(() => {
       :unsaved="unsaved"
       :pointer-mode="pointerMode"
       :colors="colors"
+      :ink-width="inkWidth"
       :selected="selected"
       :can-undo="canUndo"
       :can-redo="canRedo"
@@ -843,6 +915,7 @@ onBeforeUnmount(() => {
       @set-tool="setTool"
       @set-pointer-mode="setPointerMode"
       @pick-color="pickColor"
+      @pick-ink-width="pickInkWidth"
       @undo="viewerRef?.undoAnnot()"
       @redo="viewerRef?.redoAnnot()"
       @delete-selected="deleteSelected"
@@ -882,6 +955,7 @@ onBeforeUnmount(() => {
         :tool="tool"
         :pointer-mode="pointerMode"
         :colors="colors"
+        :ink-width="inkWidth"
         @page-change="(p) => (page = p)"
         @ready="onViewerReady"
         @annot-count="onAnnotCount"
