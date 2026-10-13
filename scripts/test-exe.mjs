@@ -61,20 +61,48 @@ console.log(`PDF: ${PDF}\n`)
  *
  * 用 rename 而不是删除：删除整个目录在部分环境下会触发批量删除护栏。
  */
+/**
+ * 把数据目录挪走（测试要从零开始），**并记下挪到哪了** —— 测完必须原样换回来。
+ *
+ * 🔴 曾经是"只挪不还"：跑一次 exe 测试，用户的文件列表就被搬进临时目录、再也不回来，
+ *    他下次打开应用发现**书单没了**（用户真的踩到了）。测试**不许改用户数据**。
+ */
 function clearWebViewData() {
   const base = process.env.LOCALAPPDATA
-  if (!base) return
+  const moved = []
+  if (!base) return moved
   for (const id of ['com.edge-pdf-lite.desktop', 'com.edge-pdf-lite.app']) {
     const p = join(base, id)
     if (!existsSync(p)) continue
     try {
-      renameSync(p, join(tmpdir(), `epl-wv-${Date.now()}-${Math.random().toString(36).slice(2)}`))
+      const dest = join(tmpdir(), `epl-wv-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+      renameSync(p, dest)
+      moved.push({ from: p, to: dest })
     } catch {
-      /* 清不掉就算了，只是可能影响这次测试 */
+      /* 挪不走就算了，只是可能影响这次测试 */
+    }
+  }
+  return moved
+}
+
+/** 把测试前挪走的那份换回来（测试产生的 profile 挪到一边留底，不删） */
+function restoreWebViewData(moved) {
+  for (const { from, to } of moved) {
+    if (!existsSync(to)) continue
+    try {
+      if (existsSync(from)) {
+        renameSync(from, join(tmpdir(), `epl-wv-test-${Date.now()}-${Math.random().toString(36).slice(2)}`))
+      }
+      renameSync(to, from)
+    } catch (e) {
+      console.error(`⚠️ 没能把数据目录还回去：${from}（原数据在 ${to}）`, String(e))
     }
   }
 }
-clearWebViewData()
+
+const stashedData = clearWebViewData()
+// 兜底：不管怎么退出（成功/失败/抛异常）都要把用户那份还回去
+process.on('exit', () => restoreWebViewData(stashedData))
 
 // ---------------------------------------------------------------- 启动 exe
 const proc = spawn(EXE, [], {
@@ -798,4 +826,31 @@ console.log(`==================================================\n`)
 
 ws.close()
 shutdown()
+
+/*
+ * 收尾：**等应用彻底退出再把用户那份数据换回来**。
+ *
+ * ⚠️ 不能只靠 `process.on('exit')` 那个兜底：进程退出前 WebView2 的子进程还可能
+ *    攥着目录句柄，rename 会 EPERM 失败 —— 实测就是这么失败的（测试全绿，但用户的
+ *    书单没还回去）。所以先轮询等目录解锁，再还。
+ */
+async function restoreUserData() {
+  const base = process.env.LOCALAPPDATA
+  if (!base) return
+  for (let i = 0; i < 40; i++) {
+    const live = join(base, 'com.edge-pdf-lite.desktop')
+    if (!existsSync(live)) break
+    try {
+      const probe = live + '.probe'
+      renameSync(live, probe)
+      renameSync(probe, live)
+      break // 能改名 = 句柄放开了
+    } catch {
+      await sleep(400)
+    }
+  }
+  restoreWebViewData(stashedData)
+}
+await restoreUserData()
+
 process.exit(fail ? 1 : 0)

@@ -46,16 +46,36 @@ if (!existsSync(EXE)) {
 }
 await mkdir(SHOTS, { recursive: true })
 
-/** 把数据目录挪走（不删除，避开批量删除护栏） */
+/**
+ * 把数据目录挪走（测试要从零开始），**返回挪到哪了** —— 结束时必须换回来。
+ *
+ * 🔴 这里也犯过"只挪不还"的错：跑一遍自愈测试，用户的文件列表就被永久搬进临时目录
+ *    （用户下次打开发现书单没了）。**测试不许改用户数据。**
+ */
 function stashProfile(tag) {
-  if (!existsSync(PROFILE)) return
+  if (!existsSync(PROFILE)) return null
   try {
-    renameSync(
-      PROFILE,
-      join(tmpdir(), `epl-heal-${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}`),
-    )
+    const dest = join(tmpdir(), `epl-heal-${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+    renameSync(PROFILE, dest)
+    return dest
   } catch {
-    /* ignore */
+    return null
+  }
+}
+
+/** 把测试前挪走的那份换回来（测试自己产生的 profile 挪到一边留底，不删） */
+function restoreProfile(stash) {
+  if (!stash || !existsSync(stash)) return
+  try {
+    if (existsSync(PROFILE)) {
+      renameSync(
+        PROFILE,
+        join(tmpdir(), `epl-heal-test-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+      )
+    }
+    renameSync(stash, PROFILE)
+  } catch (e) {
+    console.error(`⚠️ 没能把 profile 还回去：原数据在 ${stash}`, String(e))
   }
 }
 
@@ -161,7 +181,9 @@ async function shutdown({ proc, ws }) {
 
 console.log(`exe: ${EXE}`)
 console.log(`profile: ${PROFILE}\n`)
-stashProfile('before')
+const stashed = stashProfile('before')
+// 兜底：不管成功、失败还是抛异常，都要把用户原来那份还回去
+process.on('exit', () => restoreProfile(stashed))
 
 // ---------------------------------------------------------------- 1. 干净启动
 console.log('[1] 干净状态启动')
@@ -349,6 +371,9 @@ check(
   '第一个实例仍在渲染',
 )
 await shutdown(app)
+
+// 收尾：把测试前挪走的那份换回来（`shutdown` 已经等到 profile 解锁，rename 才做得成）
+restoreProfile(stashed)
 
 console.log(`\n==================================================`)
 console.log(`结果：${pass} 通过 / ${fail} 失败`)
