@@ -245,6 +245,20 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
     <button class="rb" data-tid="zoom-out" title="缩小 (Ctrl+-)" @click="stepZoom(-1)">
       <Icon name="minus" />
     </button>
+    <!--
+      百分比夹在「缩小 / 放大」中间：它就是这个减号的读数，
+      夹在中间才看得出来"点一下会从这儿开始变"。点它回 100%。
+      ⚠️ `min-width: 52px`（.pct）不能省 —— 否则 9% → 100% 会让左右两个按钮
+      跟着横跳，鼠标悬停的位置会跑掉。
+    -->
+    <button
+      class="rb pct"
+      data-tid="zoom"
+      title="当前缩放，点一下回到 100%"
+      @click="emit('set-scale', 1)"
+    >
+      {{ Math.round(scale * 100) }}%
+    </button>
     <button class="rb" data-tid="zoom-in" title="放大 (Ctrl++)" @click="stepZoom(1)">
       <Icon name="plus" />
     </button>
@@ -253,14 +267,6 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
     </button>
     <button class="rb" data-tid="fit-page" title="适应整页" @click="emit('fit-page')">
       <Icon name="fitp" />
-    </button>
-    <button
-      class="rb pct"
-      data-tid="zoom"
-      title="当前缩放，点一下回到 100%"
-      @click="emit('set-scale', 1)"
-    >
-      {{ Math.round(scale * 100) }}%
     </button>
 
     <!-- 展开批注时收起这两组，给批注工具腾地方 -->
