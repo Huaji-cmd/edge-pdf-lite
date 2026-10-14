@@ -1456,16 +1456,60 @@ async function fitPage(): Promise<void> {
  * 实测恢复出来会落到别的页（要求第 10 页，结果停在第 7 页）。
  * 恢复场景下我们要的是**准确定位**，不是保持什么中心，所以直接按版面算。
  */
-async function restoreTo(nextScale: number, pageNumber: number): Promise<void> {
+/*
+ * 「正在做显式恢复」的闸门 —— 给下面那个"单双页切换要锚定当前页"的 watch 让路。
+ *
+ * 🔴 为什么非有不可（实测出来的）：
+ *    App 恢复上次阅读位置时先设 `mode`（比如从单页切到双页），这会触发那个 watch，
+ *    而它用的是 `currentPage` —— 此刻**还是 1** —— 于是它 `restoreTo(scale, 1)`
+ *    和真正的恢复**抢同一个滚动位置**，并且经常后落地 → 把恢复整个覆盖掉。
+ *    日志证据：saved={"page":50,"scale":0.96,"mode":"dual"} →
+ *    `landed=false scaleAfter=1.5 pageAfter=1`（存 50 页/96%，打开停在第 1 页/150%）。
+ *    用户报的"记录了页数但停在第一页"就是这个。
+ *
+ * 语义上也对：模式变化只有在**用户切换视图**时才该"锚定当前页"；
+ * 恢复阅读位置时的模式变化不是用户操作，该由恢复逻辑自己定位。
+ */
+let explicitRestore = false
+function beginExplicitRestore(): void {
+  explicitRestore = true
+}
+function endExplicitRestore(): void {
+  explicitRestore = false
+}
+
+async function restoreTo(nextScale: number, pageNumber: number): Promise<boolean> {
   scale.value = Math.min(MAX_SCALE, Math.max(MIN_SCALE, nextScale))
   await nextTick()
 
-  const apply = () => {
+  /*
+   * 🔴 版面还没建好时**不能直接 return**。
+   *
+   * 原来那版就是 `if (!vp || !l) return` —— 于是"恢复位置"静默失败，
+   * 而调用方拿不到任何信号，照样弹一句「已回到上次的阅读位置：第 N 页」。
+   * 用户看到的就是**提示说第 N 页、画面却停在第一页**。
+   *
+   * `layout` 是从 `baseSizes` 算出来的 computed，通常一两帧就有；
+   * 这里最多等 20 帧，等不到就返回 false，让调用方别吹牛。
+   */
+  for (let i = 0; i < 20 && !layout.value; i++) await nextTick()
+  const l = layout.value
+  if (!l?.pages.length) return false
+
+  /*
+   * 🔴 目标页可能不在版面里 —— 存下来的页码超出了当前文档的页数
+   * （这份 PDF 被换成页数更少的版本时就会这样）。
+   * 原来这里写的是 `?? l.pages[0]`，也就是**默默退回第 1 页**，
+   * 而调用方那边页码照旧显示存下来的值 —— "记录对、画面在第一页"就是这么来的。
+   * 现在退到"能落到的最近一页"（超出范围就是最后一页），至少页码和画面一致。
+   */
+  const idx = Math.min(Math.max(0, Math.round(pageNumber) - 1), l.pages.length - 1)
+  const target = l.pages.find((p) => p.pageNumber === pageNumber) ?? l.pages[idx]
+  if (!target) return false
+
+  const apply = (): void => {
     const vp = viewportRef.value
-    const l = layout.value
-    if (!vp || !l) return
-    const target = l.pages.find((p) => p.pageNumber === pageNumber) ?? l.pages[0]
-    if (!target) return
+    if (!vp) return
     vp.scrollLeft = 0
     vp.scrollTop = Math.max(0, target.y * scale.value - GAP)
   }
@@ -1476,6 +1520,17 @@ async function restoreTo(nextScale: number, pageNumber: number): Promise<void> {
   await nextTick()
   apply()
   updateVisibility()
+
+  /*
+   * 返回值 = **真的落到了没有**。
+   * `updateVisibility` 会由 scrollTop 反算出 `currentPage` 并 emit —— 拿它跟目标比。
+   *
+   * ⚠️ 双页模式下"当前页"是每行的**左页**，所以目标如果是本行的右页
+   *    （比如目标第 50 页、本行是 [49,50]），反算出来是 49 而不是 50 ——
+   *    那是**正确**落位，不能判成失败。判据因此看"落点所在的那一行里有没有目标页"。
+   */
+  const landedRow = l.pages.find((p) => p.pageNumber === currentPage.value)
+  return landedRow != null && l.pages.some((p) => p.y === landedRow.y && p.pageNumber === target.pageNumber)
 }
 
 defineExpose({
@@ -1490,6 +1545,9 @@ defineExpose({
   fitWidth,
   fitPage,
   restoreTo,
+  /** 显式恢复期间让"模式切换自动锚定"让路（App 的 onViewerReady 用） */
+  beginExplicitRestore,
+  endExplicitRestore,
   currentPage,
   undoAnnot,
   redoAnnot,
@@ -1777,6 +1835,9 @@ watch(
 watch(
   () => [props.mode, props.spreadOffset] as const,
   () => {
+    // 显式恢复（App 的 onViewerReady）会自己定位 —— 这里抢会把结果覆盖掉，
+    // 因为此刻 currentPage 还是恢复前的 1。见 beginExplicitRestore 的说明。
+    if (explicitRestore) return
     const keep = currentPage.value
     const doc0 = props.doc
     void nextTick(() => {

@@ -350,16 +350,41 @@ async function onViewerReady(): Promise<void> {
   if (!saved) return
 
   restoring = true
+  /*
+   * 🔴 先把「显式恢复」闸门拉起来，再动 `mode`。
+   *
+   * 顺序不能反：设 `mode` 会触发 PdfViewer 里"单双页切换要锚定当前页"那个 watch，
+   * 而它用的是**恢复前的** `currentPage`（还是 1）→ 它会去定位第 1 页，
+   * 和下面这次恢复抢同一个滚动位置，经常后落地 → 把恢复整个覆盖掉
+   * （实测：存 {page:50, scale:0.96, mode:dual}，打开后停在第 1 页 / 150%）。
+   */
+  viewerRef.value?.beginExplicitRestore()
   try {
     mode.value = saved.mode
     spreadOffset.value = saved.spreadOffset
     await nextTick()
-    // 用 restoreTo 一次性定位。分开调用 applyScale + goToPage 会因为
-    // 各自的"保持视口中心"逻辑互相抵消，落不到目标页（实测差了好几页）。
-    await viewerRef.value?.restoreTo(saved.scale, saved.page)
-    page.value = Math.min(Math.max(1, saved.page), d.numPages)
-    showToast(`已回到上次的阅读位置：第 ${page.value} 页`)
+    /*
+     * ⚠️ 先把页码**夹进当前文档的范围**再恢复。存下来的值可能超出页数
+     *    （这份 PDF 换成页数更少的版本时就会这样），而 `restoreTo` 拿到
+     *    范围外的页码时找不到目标页。
+     * 用 restoreTo 一次性定位。分开调用 applyScale + goToPage 会因为
+     * 各自的"保持视口中心"逻辑互相抵消，落不到目标页（实测差了好几页）。
+     */
+    const want = Math.min(Math.max(1, Math.round(saved.page)), d.numPages)
+    const landed = (await viewerRef.value?.restoreTo(saved.scale, want)) === true
+    /*
+     * 🔴 这里**不再给 `page.value` 赋值**。
+     *
+     * 原来那行 `page.value = Math.min(Math.max(1, saved.page), d.numPages)` 是把
+     * "我们想去的页码"直接写成了现实 —— 恢复没成功时，工具栏就显示一个从没到过的页码，
+     * 看起来像"记录生效了但没跳过去"。实际上 `restoreTo` 里的 `updateVisibility()`
+     * 会 emit('page-change')，页面上的页码**已经是实际落点**了，不需要也不该再覆盖。
+     *
+     * 提示同理：只有真的落到了才说"已回到"。说不出实话就别说。
+     */
+    if (landed) showToast(`已回到上次的阅读位置：第 ${page.value} 页`)
   } finally {
+    viewerRef.value?.endExplicitRestore()
     // 等一帧再解除，避免恢复引发的 watch 立刻回写
     void nextTick(() => {
       restoring = false

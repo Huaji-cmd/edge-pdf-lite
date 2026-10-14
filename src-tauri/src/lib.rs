@@ -588,8 +588,16 @@ fn list_dir(allowed: State<Allowed>, path: String) -> Result<Vec<DirEntry>, Stri
 }
 
 /// 整个 PDF 的字节 —— 前端拿到交给 pdf.js。
+///
+/// 🔴 返回 `tauri::ipc::Response`（**原始字节**），不要改回 `Vec<u8>`：
+///    `Vec<u8>` 会被 Tauri 按 JSON 序列化成**数字数组**（`[37,80,68,70,…]`），
+///    前端再 `JSON.parse` 回一个 JS 数组。一份 98 MB 的 PDF 实测：
+///    **webview 的 JS 堆从 10 MB 涨到 1638 MB**（约 17 倍文件大小）——
+///    在 8 GB 的机器上打开就明显卡、开始换页。走 Response 是二进制直传，
+///    堆上只多一份和文件等大的 ArrayBuffer。
+///    （前端 `readBytesByPath` 拿到的是 `ArrayBuffer`，两种形态都兼容。）
 #[tauri::command]
-fn read_pdf_bytes(allowed: State<Allowed>, path: String) -> Result<Vec<u8>, String> {
+fn read_pdf_bytes(allowed: State<Allowed>, path: String) -> Result<tauri::ipc::Response, String> {
     // 闸门 ①：路径必须在这一层放行范围内
     allowed.check(&path)?;
     let p = Path::new(&path);
@@ -600,7 +608,8 @@ fn read_pdf_bytes(allowed: State<Allowed>, path: String) -> Result<Vec<u8>, Stri
         .map_err(|e| format!("读不了 {}: {}", path, e))?
         .len();
     ensure_size(len)?;
-    std::fs::read(p).map_err(|e| format!("读不了 {}: {}", path, e))
+    let bytes = std::fs::read(p).map_err(|e| format!("读不了 {}: {}", path, e))?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// 打开文件时判断：这个路径还在不在（上次记住的文件可能被删了）。

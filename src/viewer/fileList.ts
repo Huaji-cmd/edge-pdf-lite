@@ -197,8 +197,17 @@ export async function loadChildren(node: FileNode): Promise<void> {
  * 否则改 Rust 命令名时容易只改一边。
  */
 export async function readBytesByPath(path: string): Promise<Uint8Array> {
-  const bytes = await invoke<number[]>('read_pdf_bytes', { path })
-  return new Uint8Array(bytes)
+  /*
+   * ⚠️ `read_pdf_bytes` 现在回的是**原始字节**（Tauri 的 `ipc::Response` → ArrayBuffer），
+   *    不是 JSON 数字数组。改这条是为了内存：98 MB 的 PDF 走数字数组时
+   *    webview 的 JS 堆会从 10 MB 涨到 1638 MB（实测），二进制直传只多一份等大的 buffer。
+   *
+   *    两种形态都接住 —— 万一以后有人把 Rust 那边改回 `Vec<u8>`，
+   *    这里不会静默拿到一堆数字当成字节用。
+   */
+  const res = await invoke<ArrayBuffer | number[]>('read_pdf_bytes', { path })
+  if (res instanceof ArrayBuffer) return new Uint8Array(res)
+  return new Uint8Array(res)
 }
 
 /** 读一个文件的字节。桌面端走 Rust，浏览器端读 File 对象 */
