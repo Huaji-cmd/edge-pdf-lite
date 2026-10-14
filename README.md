@@ -1,16 +1,55 @@
 # edge-pdf-lite
 
-轻量 PDF 阅读 + 批注编辑器，面向**低配 Windows**（8 GB 内存那档）。
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-0078D6.svg)](#)
+[![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB.svg)](https://v2.tauri.app/)
+[![Vue](https://img.shields.io/badge/Vue-3-4FC08D.svg)](https://vuejs.org/)
+[![pdf.js](https://img.shields.io/badge/pdf.js-6.x-red.svg)](https://mozilla.github.io/pdf.js/)
 
-一句话定位：**不比 Edge 差，但只在必须付的时候付一次**；并且做 Edge 没有的几件事
-（双页并排、阅读位置记忆、批注写回 PDF）。
+轻量 PDF 阅读 + 批注编辑器，面向**低配 Windows**（8 GB 内存那一档）。
 
-- 网页版：浏览器里直接打开就能用
-- 桌面版（Tauri v2）：能拿到文件真实路径，所以文件列表能记住、能覆盖原文件
+> **定位**：不比 Edge 差，但**只在必须付的时候付一次**；并且做 Edge 没有的几件事
+> —— 双页并排、阅读位置记忆、批注写回 PDF。
+
+![阅读界面](docs/images/reader.png)
+
+- **网页版**：浏览器里直接打开就能用。
+- **桌面版**（Tauri v2）：能拿到文件真实路径，所以文件列表能记住、能覆盖原文件。
 
 ---
 
-## 它有什么
+## 目录
+
+- [为什么做这个](#为什么做这个)
+- [功能特性](#功能特性)
+- [快速开始](#快速开始)
+- [常用命令](#常用命令)
+- [它是怎么守住"轻量"的](#它是怎么守住轻量的)
+- [已知限制](#已知限制)
+- [常见问题：启动出来一个"乱码错误页"](#常见问题启动出来一个乱码错误页)
+- [技术栈](#技术栈)
+- [验证方式](#验证方式)
+- [安全](#安全)
+- [项目结构](#项目结构)
+- [参与贡献](#参与贡献)
+- [许可证](#许可证)
+
+---
+
+## 为什么做这个
+
+低配 Windows 上打开一份几十 MB、每页是一整张大图的 PDF，Edge 也会卡。但"卡"的
+原因不是内核差，而是**首次打开一页要解码一整张图**——这是硬成本，谁都省不掉。
+
+所以这个项目的目标不是"比 Edge 快"，而是：
+
+1. **不重复付费** —— 翻回去看过的页立刻出来，滚动保持满帧；
+2. **补齐 Edge 缺的** —— 双页并排、按内容指纹记住阅读位置、批注写回 PDF；
+3. **严守 scope** —— 不做 OCR、不做页面操作（删页 / 合并）、不改 PDF 原有文字。
+
+---
+
+## 功能特性
 
 | | 说明 |
 |---|---|
@@ -27,13 +66,20 @@
 | **保存** | 另存到指定目录（默认文档库），或直接覆盖原文件（**自动留 `.bak`**）；保存后提示完整路径并可一键打开文件夹 |
 | **外观** | 日间 / 夜间 / 跟随系统 |
 
+就地编辑的文本框（字号三档 + 字色，写回后是标准 `/FreeText`）：
+
+![文本框就地编辑](docs/images/freetext.png)
+
 ---
 
 ## 快速开始
 
 ### 直接用
 
-下载 Release 里的 `edge-pdf-lite.exe`（免安装，双击即用），或跑安装包。
+下载 [Release](https://github.com/Huaji-cmd/edge-pdf-lite/releases) 里的
+`edge-pdf-lite.exe`（免安装，双击即用），或安装 NSIS / MSI 安装包。
+
+要求：Windows 10+（自带 WebView2 运行时）。
 
 ### 从源码
 
@@ -57,7 +103,7 @@ npm run testdata:real    # 只取回真实论文语料（arXiv，约 2.2 MB）
   放进仓库等于替别人分发。测试用它是有理由的：合成样本验证不了真实文档的页面构成
   （内嵌字体 + 整页图片 + 上百条既有注释），好几个决定性结论都只能在它上面测出来。
 
-拿不到 arxiv.org 的时候（公司/校园网常见）：
+拿不到 arxiv.org 的时候（公司 / 校园网常见）：
 
 ```bash
 EPL_REAL_PDF_URL=<镜像地址> npm run testdata:real
@@ -77,8 +123,8 @@ npm run exe                 # 只出裸 exe（免安装）
 npm run tauri -- build      # 含 MSI + NSIS 安装包
 ```
 
-⚠️ Windows 上打包需要 Rust（MSVC 工具链）+ WebView2。`cargo` 不在 PATH 也能跑 ——
-`scripts/tauri.mjs` 会自己找出工具链并注入环境。
+> Windows 上打包需要 Rust（MSVC 工具链）+ WebView2。`cargo` 不在 PATH 也能跑 ——
+> `scripts/tauri.mjs` 会自己找出工具链并注入环境。
 
 ---
 
@@ -86,10 +132,10 @@ npm run tauri -- build      # 含 MSI + NSIS 安装包
 
 ```bash
 npm run dev | build | serve:dist     # 开发 / 构建 / 生产对照
-npm test                             # 八套浏览器端回归（280+ 项，含 CSP）
+npm test                             # 八套浏览器端回归（300+ 项，含 CSP）
 npm run test:csp                     # 只跑 CSP 那条（策略没被放宽 + 0 违规）
-npm run test:exe                     # 打包后 exe 的端到端验证
-npm run test:exe:heal                # 专测 WebView2 profile 自愈
+npm run test:exe                     # 打包后 exe 的端到端验证（45 项）
+npm run test:exe:heal                # 专测 WebView2 profile 自愈（17 项）
 npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截图做对照
 ```
 
@@ -114,11 +160,13 @@ npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截
 **能承诺**：不重复付费、滚动不卡、缩放不逐帧重渲染、Edge 没有的功能。
 **不能承诺**：首次打开一页比 Edge 快（解码是硬成本）。
 
-刻意**不做**：OCR、页面操作（删页/合并）、修改 PDF 原有文字 —— 这些一做就不 lite 了。
+刻意**不做**：OCR、页面操作（删页 / 合并）、修改 PDF 原有文字 —— 这些一做就不 lite 了。
 
 ---
 
-## 已知限制（诚实清单）
+## 已知限制
+
+诚实清单 —— 开源项目的信誉靠这个，藏起来只会让人踩坑后更失望。
 
 | 限制 | 说明 |
 |---|---|
@@ -127,12 +175,12 @@ npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截
 | **写回在主线程** | 20–50 MB 的文件会感觉到一下卡顿，这部分该搬到 Worker |
 | **大文件增量写入未测** | 小文件上增量既不快也不小；它的价值在大文件（峰值内存），但大文件还没实测 |
 | **无边框窗口** | 换来了自绘标题栏，代价是失去系统"拖到边缘自动分屏" |
-| **网页版没有真实路径** | 浏览器拿不到文件路径，所以文件列表不能跨会话记住、不能覆盖原文件、**也不会自动打开上次那篇**（界面上会明确说明）|
-| **位置记忆** | 按内容指纹存，同一份文件改名/移动都认；但文件被大改后指纹变化会丢失记忆 |
+| **网页版没有真实路径** | 浏览器拿不到文件路径，所以文件列表不能跨会话记住、不能覆盖原文件、**也不会自动打开上次那篇**（界面上会明确说明） |
+| **位置记忆** | 按内容指纹存，同一份文件改名 / 移动都认；但文件被大改后指纹变化会丢失记忆 |
 
 ---
 
-## 万一启动出来一个"乱码错误页"
+## 常见问题：启动出来一个"乱码错误页"
 
 这是一个**不用重装**的问题，而且现在已经能自愈。
 
@@ -146,8 +194,8 @@ npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截
 1. **什么都不用做，直接再打开一次** —— 应用会自己发现"上次没启动成功"，把 WebView2 的
    profile 清掉重建（`%LOCALAPPDATA%\com.edge-pdf-lite.desktop\EBWebView`）。
    **你的文件列表和设置不会被清掉**（它们单独放在 `Default\Local Storage` 里）。
-2. 想手动来一遍也行：把上面那个 `EBWebView` 目录整个删掉再启动。代价是文件列表/设置在
-   `Local Storage` 里，会一起没 —— 所以只在第 1 条不管用时再用。
+2. 想手动来一遍也行：把上面那个 `EBWebView` 目录整个删掉再启动。代价是文件列表 / 设置在
+   `Local Storage` 里会一起没 —— 所以只在第 1 条不管用时再用。
 
 **已经做了哪些防范**：
 
@@ -160,16 +208,30 @@ npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截
 
 ---
 
+## 技术栈
+
+| 层 | 选型 |
+|---|---|
+| 渲染 | **pdf.js 6.x**（现代构建 + 自带 ES2025 polyfill，见 `docs/在另一台机器上测试.md`） |
+| 界面 | **Vue 3** `<script setup>` + TypeScript + Pinia |
+| 构建 | **Vite**（rolldown 版） |
+| 桌面外壳 | **Tauri v2**（Rust，WebView2） |
+| PDF 写回 | **pdf-lib**（`@cantoo/pdf-lib` 分支，支持增量更新） |
+| 测试 | 零框架：Node 22 内置 WebSocket + **CDP** 驱动真实浏览器 / WebView2 |
+
+---
+
 ## 验证方式
 
 端到端测试全部用 **CDP**（headless Edge / WebView2 的调试端口），零测试框架依赖：
 
 - **发真实事件**（`Input.dispatchMouseEvent` / `dispatchTouchEvent`），不是直接调函数 ——
-  这样能顺带验证指针捕获这类只有真实交互才暴露的问题
+  这样能顺带验证指针捕获这类只有真实交互才暴露的问题。
 - **判据要求"有牙"**：每条断言都要能抓住对应的失败。
   比如判"批注写进去了"用的是 pdf-lib 直查 `/Annots` 且要求**恰好 +1**
-  （测试样本本来就带 113 条批注，写成"大于 0"的话 writer 一行不写也照样绿）
-- `npm test` 八套 280+ 项；`npm run test:exe` 覆盖打包后的桌面端专有能力
+  （测试样本本来就带 113 条批注，写成"大于 0"的话 writer 一行不写也照样绿）。
+- 新判据一律做**变异测试**：把修复注回去，确认测试真的变红，再还原。
+- `npm test` 八套 300+ 项；`npm run test:exe` 覆盖打包后的桌面端专有能力。
 
 ---
 
@@ -177,8 +239,7 @@ npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截
 
 - **CSP 锁到 `'self'`**（`src-tauri/tauri.conf.json`）：没有 `'unsafe-inline'`、
   没有 `unsafe-eval`，`object-src` / `base-uri` / `form-action` / `frame-ancestors` 全为 `'none'`。
-  这是**实测可用**的策略，不是照抄模板 —— 里面 `connect-src` 的 IPC 源、`font-src` 的 `data:`
-  都是踩过才知道必须有的。完整推导见 `docs/M13-打包成exe.md` 第七节。
+  这是**实测可用**的策略，不是照抄模板 —— 完整推导见 `docs/M13-打包成exe.md` 第七节。
 - CSP 设错的症状**不是报错**，是"某个功能悄悄没了"（worker 被拦 → pdf.js 静默退回主线程，
   页面照常显示只是卡）。所以有独立的 `npm run test:csp`：**主动监听 `securitypolicyviolation`**，
   并断言"0 违规"同时"内容真的画上去了"，避免白屏时的假绿。
@@ -187,7 +248,7 @@ npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截
 
 ---
 
-## 目录结构
+## 项目结构
 
 ```
 src/
@@ -202,6 +263,15 @@ scripts/                 构建、测试、样本生成
 ```
 
 各阶段的完整推导在 `docs/` 里 —— 本 README 只给结论。
+
+---
+
+## 参与贡献
+
+欢迎提 Issue / PR。请留意两条项目约定：
+
+- **测试红了要真修**，不要放宽断言或改判据去迁就实现。
+- **性能结论必须来自测量**，并且要有对照组；"看起来快了"不算数。
 
 ---
 

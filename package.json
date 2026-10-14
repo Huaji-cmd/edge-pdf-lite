@@ -5,6 +5,13 @@
   "description": "轻量 PDF 阅读 + 批注编辑器（面向低配 Windows）",
   "license": "MIT",
   "keywords": ["pdf", "reader", "annotation", "tauri", "vue", "pdfjs"],
+  "author": "Huaji-cmd",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Huaji-cmd/edge-pdf-lite.git"
+  },
+  "homepage": "https://github.com/Huaji-cmd/edge-pdf-lite#readme",
+  "bugs": "https://github.com/Huaji-cmd/edge-pdf-lite/issues",
   "scripts": {
     "postinstall": "node scripts/copy-pdfjs-assets.mjs",
     "pdfjs-assets": "node scripts/copy-pdfjs-assets.mjs",

@@ -4,9 +4,9 @@
 name = "edge-pdf-lite"
 version = "0.2.0"
 description = "轻量 PDF 阅读 + 批注编辑器"
-authors = ["you"]
-license = ""
-repository = ""
+authors = ["Huaji-cmd"]
+license = "MIT"
+repository = "https://github.com/Huaji-cmd/edge-pdf-lite"
 edition = "2024"
 rust-version = "1.90"
 
