@@ -75,6 +75,42 @@ export class PdfDocument {
   }
 
   /**
+   * 释放某一页在 pdf.js 里占的资源（operator list + 页面对象）。
+   *
+   * ⚠️ 为什么必须有这一步：`getPage()` 返回的 `PDFPageProxy` 会**一直握着**
+   * 该页的 operator list（渲染指令）。实测每页约 **0.22 MB**，滑过 650 页就是
+   * 157 MB 的页面 JS 堆 —— 而且只要不主动清，它就再也不放（我们自己也缓存了
+   * 那个 Promise，等于双重持有）。720 页的书滑一遍约 160 MB。
+   *
+   * 由 `PageRenderer.release()` 在页面离开预取窗口时调用 —— 那是唯一正确的时机
+   * （正在看的页不该清，否则来回滑会反复重新解析）。
+   *
+   * ⚠️ `cleanup()` 在**有渲染还在飞行中时会自己延后**（返回 false），
+   *    不会破坏渲染 —— 所以这里补一次重试。
+   */
+  releasePage(pageNumber: number): void {
+    const p = this.pagePromises.get(pageNumber)
+    if (!p) return
+    p.then((page) => {
+      try {
+        if (!page.cleanup()) {
+          setTimeout(() => {
+            try {
+              page.cleanup()
+            } catch {
+              /* 页已经被销毁了 */
+            }
+          }, 60)
+        }
+      } catch {
+        /* 页已经被销毁了 */
+      }
+    }).catch(() => {
+      /* 这页本来就没取到 */
+    })
+  }
+
+  /**
    * 文档指纹（pdf.js 按文件内容算的）。
    * 拿它当"阅读位置记忆"的键 —— 比文件名可靠，重命名/移动目录都还认得出来。
    */

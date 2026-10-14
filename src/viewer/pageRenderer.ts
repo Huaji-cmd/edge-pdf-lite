@@ -108,6 +108,12 @@ export class PageRenderer {
       slot.canvas.width = slot.canvas.height = 0
       slot.canvas = null
     }
+    /*
+     * 位图清掉了，**pdf.js 那一侧的 operator list 也要一起放** ——
+     * 不然滑过几百页会攒下上百 MB（实测 0.22 MB/页），而且再也放不掉。
+     * 见 `PdfDocument.releasePage` 的注释。
+     */
+    this.doc.releasePage(pageNumber)
     // 文本层同样要收掉 —— 每页几百个 span，不留着占内存和 DOM
     slot.textToken++
     slot.textEl?.remove()
