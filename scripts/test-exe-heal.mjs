@@ -27,8 +27,23 @@ import { fileURLToPath } from 'node:url'
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const EXE = resolve(ROOT, 'src-tauri/target/release/edge-pdf-lite.exe')
 const PORT = 9335
-const IDENT = 'com.edge-pdf-lite.desktop'
-const PROFILE = join(process.env.LOCALAPPDATA ?? '', IDENT, 'EBWebView')
+
+/*
+ * 🔴 数据目录整个跑在沙箱里，**绝不碰用户的真实 profile**。
+ *
+ * 这个脚本测的就是"清 profile 自愈"，以前它把 `%LOCALAPPDATA%\<identifier>\EBWebView`
+ * 挪来挪去、测完再还 —— 而 WebView2 的子进程经常还攥着句柄，还原失败率很高，
+ * 用户下次打开就发现书单没了。测自愈的脚本本身把用户数据搞坏，说不过去。
+ *
+ * `WEBVIEW2_USER_DATA_FOLDER` 是 WebView2 自己的环境变量（实测有效），
+ * 而且我们 Rust 侧的 `data_root()` 读的是同一个变量 → 自愈、标记文件、白名单
+ * 全都跟着进沙箱，不会出现"WebView2 用沙箱、自愈却去动真实目录"的错位。
+ */
+const SANDBOX = join(tmpdir(), 'epl-heal-test-sandbox')
+await rm(SANDBOX, { recursive: true, force: true }).catch(() => {})
+await mkdir(SANDBOX, { recursive: true })
+
+const PROFILE = join(SANDBOX, 'EBWebView')
 const STAMP = join(PROFILE, '.epl-profile')
 const SHOTS = resolve(ROOT, 'exe-shots')
 
@@ -45,39 +60,6 @@ if (!existsSync(EXE)) {
   process.exit(1)
 }
 await mkdir(SHOTS, { recursive: true })
-
-/**
- * 把数据目录挪走（测试要从零开始），**返回挪到哪了** —— 结束时必须换回来。
- *
- * 🔴 这里也犯过"只挪不还"的错：跑一遍自愈测试，用户的文件列表就被永久搬进临时目录
- *    （用户下次打开发现书单没了）。**测试不许改用户数据。**
- */
-function stashProfile(tag) {
-  if (!existsSync(PROFILE)) return null
-  try {
-    const dest = join(tmpdir(), `epl-heal-${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}`)
-    renameSync(PROFILE, dest)
-    return dest
-  } catch {
-    return null
-  }
-}
-
-/** 把测试前挪走的那份换回来（测试自己产生的 profile 挪到一边留底，不删） */
-function restoreProfile(stash) {
-  if (!stash || !existsSync(stash)) return
-  try {
-    if (existsSync(PROFILE)) {
-      renameSync(
-        PROFILE,
-        join(tmpdir(), `epl-heal-test-${Date.now()}-${Math.random().toString(36).slice(2)}`),
-      )
-    }
-    renameSync(stash, PROFILE)
-  } catch (e) {
-    console.error(`⚠️ 没能把 profile 还回去：原数据在 ${stash}`, String(e))
-  }
-}
 
 /**
  * 等 Vue 真的挂上去。
@@ -100,7 +82,12 @@ async function waitRendered(app, timeoutMs = 30000) {
 async function launch() {
   const proc = spawn(EXE, [], {
     stdio: 'ignore',
-    env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT}` },
+    env: {
+      ...process.env,
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT}`,
+      // 数据目录进沙箱（理由见文件头）
+      WEBVIEW2_USER_DATA_FOLDER: SANDBOX,
+    },
   })
 
   let target = null
@@ -180,10 +167,7 @@ async function shutdown({ proc, ws }) {
 }
 
 console.log(`exe: ${EXE}`)
-console.log(`profile: ${PROFILE}\n`)
-const stashed = stashProfile('before')
-// 兜底：不管成功、失败还是抛异常，都要把用户原来那份还回去
-process.on('exit', () => restoreProfile(stashed))
+console.log(`沙箱 profile: ${PROFILE}\n`)
 
 // ---------------------------------------------------------------- 1. 干净启动
 console.log('[1] 干净状态启动')
@@ -346,7 +330,12 @@ console.log('\n[4] 第二次启动不会去抢同一个 profile（单实例保�
 app = await launch()
 await waitRendered(app)
 
-const second = spawn(EXE, [], { stdio: 'ignore' })
+// ⚠️ 也要给沙箱变量：自愈跑在**单实例判断之前**，不带这个变量的话
+//    这第二个进程会先去动真实 profile 的目录。不带调试端口是故意的（模拟一次普通双击）
+const second = spawn(EXE, [], {
+  stdio: 'ignore',
+  env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: SANDBOX },
+})
 const secondExit = await new Promise((res) => {
   const t = setTimeout(() => res(null), 10_000)
   second.on('exit', (code) => {
@@ -372,8 +361,9 @@ check(
 )
 await shutdown(app)
 
-// 收尾：把测试前挪走的那份换回来（`shutdown` 已经等到 profile 解锁，rename 才做得成）
-restoreProfile(stashed)
+// 收尾：**没有"还数据目录"这一步了** —— 整个 profile 跑在沙箱里，真实那份从没被碰过。
+// 沙箱留在临时目录里不删，想看现场（标记文件、白名单、localStorage）随时能翻。
+console.log(`\n沙箱（测试用过的数据目录）：${SANDBOX}`)
 
 console.log(`\n==================================================`)
 console.log(`结果：${pass} 通过 / ${fail} 失败`)

@@ -50,16 +50,19 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   return core.invoke<T>(cmd, args)
 }
 
-/** 弹系统文件/文件夹对话框，返回选中的**路径** */
+/**
+ * 弹系统文件/文件夹对话框，返回选中的**路径**。
+ *
+ * 🔴 这一步必须走**我们自己的 Rust 命令**，不能用 `plugin-dialog` 的 JS 接口。
+ *
+ * 原因：选中的路径得在 **Rust 侧**登记进「允许访问」白名单，前端只负责拿结果。
+ * 反过来做（前端拿到路径、再调一个 `allow_path(任意路径)` 登记）等于没做 ——
+ * 能在这套前端里跑 JS 的人自己登记 `C:\Users\你\.ssh` 就绕过去了。
+ * 所以 `capabilities/default.json` 里 `dialog:allow-open` 也一并撤掉了：
+ * 前端连"自己弹窗"的能力都不留。
+ */
 async function pickPaths(directory: boolean): Promise<string[]> {
-  const dlg = await import('@tauri-apps/plugin-dialog')
-  const picked = await dlg.open({
-    directory,
-    multiple: !directory,
-    filters: directory ? undefined : [{ name: 'PDF', extensions: ['pdf'] }],
-  })
-  if (!picked) return []
-  return Array.isArray(picked) ? picked : [picked]
+  return invoke<string[]>(directory ? 'pick_folder' : 'pick_pdfs')
 }
 
 function baseName(p: string): string {

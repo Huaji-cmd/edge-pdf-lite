@@ -129,13 +129,19 @@ export async function resolveSaveDir(): Promise<string> {
   }
 }
 
-/** 让用户挑一个目录（桌面端才有；网页上返回 null） */
+/**
+ * 让用户挑一个目录（桌面端才有；网页上返回 null）。
+ *
+ * 🔴 走 Rust 侧的 `pick_folder`，不是 `plugin-dialog` 的 JS 接口 ——
+ *    选中的目录要在 Rust 侧登记进"允许写入"白名单（否则选了也存不进去）。
+ *    理由详见 fileList.ts 里 pickPaths 上方的说明。
+ */
 export async function pickSaveDir(): Promise<string | null> {
   if (!IS_TAURI) return null
   try {
-    const { open } = await import('@tauri-apps/plugin-dialog')
-    const picked = await open({ directory: true, multiple: false, title: '选择一个保存目录' })
-    return typeof picked === 'string' ? picked : null
+    const { invoke } = await import('@tauri-apps/api/core')
+    const picked = await invoke<string[]>('pick_folder')
+    return picked[0] ?? null
   } catch {
     return null
   }

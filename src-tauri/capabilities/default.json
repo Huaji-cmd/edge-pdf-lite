@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Baseline + window control. 无边框窗口（decorations:false）之后，最小化/最大化/关闭都得自己调 API，这几条不在 core:default 里，必须显式开 —— 少一条的表现都是「点了没反应」，极难查。",
+  "description": "Baseline + window control. 无边框窗口（decorations:false）之后，最小化/最大化/关闭都得自己调 API，这几条不在 core:default 里，必须显式开 —— 少一条的表现都是「点了没反应」，极难查。\n\n⚠️ 这里的每一条都是**前端能直接调用的能力**，所以按最小必要给。\n   `dialog:allow-open` 是**刻意没有**的：文件/文件夹选择改走我们自己的 Rust 命令\n   （pick_pdfs / pick_folder），因为选中的路径必须在 Rust 侧登记进访问白名单。\n   给前端留一个自己弹窗的接口，等于把那道闸门的第一道门交给它自己把守。",
   "windows": [
     "main"
   ],
@@ -13,7 +13,6 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
     "core:window:allow-is-maximized",
-    "core:window:allow-start-dragging",
-    "dialog:allow-open"
+    "core:window:allow-start-dragging"
   ]
 }

@@ -2,10 +2,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 // `get_webview_window` / `config()` 这些是 trait 方法，不 import 就调不到
 // （编译器会提示 "trait Manager which provides ... is implemented but not in scope"）
-use tauri::Manager;
+use tauri::{Manager, State};
+
+// `app.dialog()` 由这个扩展 trait 提供，不 import 连 `.file()` 都写不出来
+use tauri_plugin_dialog::{DialogExt, FilePath};
 
 /*
  * 关于下面这段"自愈"代码的来龙去脉 —— 这是用户实际踩到、且很难自己查的问题。
@@ -34,6 +38,35 @@ use tauri::Manager;
 const PROFILE_STAMP: &str = "2";
 
 /**
+ * 应用的数据根目录。
+ *
+ * 默认 `%LOCALAPPDATA%\<identifier>`；但如果 `WEBVIEW2_USER_DATA_FOLDER` 有值就用它。
+ *
+ * 为什么要认这个变量：它是 **WebView2 自己的**环境变量（实测有效：设了之后 profile
+ * 真的搬到那个目录，真实那份一个字节都没动）。它指向的是"根"，profile 是它下面的
+ * `EBWebView` —— 跟我们默认的布局完全一致。
+ *
+ * 🔴 关键点是**两边必须用同一个变量**。端到端测试要一份完全隔离的数据目录，
+ *    否则"测自愈"这件事本身就会去清用户的真实 profile（这条真的踩过：测试脚本
+ *    把整个 `%LOCALAPPDATA%\<identifier>` 搬来搬去，还原经常失败，用户的文件列表
+ *    就这么没了）。让 WebView2 和我们的自愈/标记/白名单都从这一个变量取，
+ *    就不可能出现"WebView2 用了沙箱、自愈却去动真实目录"这种错位。
+ *
+ * ⚠️ `dirs::data_local_dir()` 走的是 `SHGetKnownFolderPath`，**不读 LOCALAPPDATA
+ *    环境变量** —— 所以想隔离只能靠这个变量，改 LOCALAPPDATA 是没用的（实测过）。
+ */
+fn data_root(identifier: &str) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("WEBVIEW2_USER_DATA_FOLDER") {
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|local| PathBuf::from(local).join(identifier))
+}
+
+/**
  * 「上次跑挂之后，隔多久才允许再自愈一次」。
  *
  * 目的是**防连环清**：如果清了也修不好（或者根因根本不是 profile），
@@ -55,12 +88,9 @@ const HEAL_COOLDOWN_SECS: u64 = 120;
  */
 #[tauri::command]
 fn app_ready(app: tauri::AppHandle) {
-    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+    let Some(root) = data_root(&app.config().identifier).map(|r| r.join("EBWebView")) else {
         return;
     };
-    let root: PathBuf = PathBuf::from(&local)
-        .join(app.config().identifier.clone())
-        .join("EBWebView");
     mark(&root.join(".epl-profile"), &format!(
         "{}|{}",
         PROFILE_STAMP,
@@ -134,10 +164,9 @@ fn another_instance_running() -> bool {
 }
 
 fn heal_webview_profile(identifier: &str) {
-    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+    let Some(root) = data_root(identifier).map(|r| r.join("EBWebView")) else {
         return;
     };
-    let root: PathBuf = PathBuf::from(&local).join(identifier).join("EBWebView");
     if !root.is_dir() {
         // 全新安装：WebView2 还没建这个目录，没什么可修的
         // （标记由前端跑起来之后的 `app_ready` 补写，所以第二次启动不会再白清一遍）
@@ -267,6 +296,238 @@ fn heal_webview_profile(identifier: &str) {
     );
 }
 
+// ============================================================================
+// 路径闸门
+// ============================================================================
+/*
+ * ## 这层是干什么的
+ *
+ * 这个 App 会把 PDF 文件交给 pdf.js 解析，而**文件是别人给的**。也就是说
+ * 它天生在"处理不可信输入"这条路上。
+ *
+ * 而下面的命令（`read_pdf_bytes` / `write_pdf_b64` / `list_dir` …）都能**直接
+ * 读写磁盘**。它们本身没有错 —— 错的是"**只靠前端自觉**"：命令收什么路径就照做。
+ * 于是「能在前端跑起一段 JS」就等价于「能读写这个用户能碰到的任意文件」。
+ *
+ * 现在并没有已知的 JS 注入路径（CSP 是严的、pdf.js 没开 enableScripting、
+ * 前端没有 innerHTML/eval）。但"没有已知的送进来"和"送进来也走不远"是两回事：
+ * 前者依赖"pdf.js 永远不出 XSS"这种不该依赖的东西，后者才是可验证的。
+ *
+ * ## 判据
+ *
+ * 只放行**用户亲手选过的位置**：
+ *   · 用户点「添加文件」选的那几个文件   → 每条只放行它自己去（文件粒度）
+ *   · 用户点「添加文件夹」选的目录       → 放行它以及它下面的一切（目录粒度）
+ *   · 用户点「选择保存目录」选的目录     → 同上
+ *   · 默认另存目录（文档库/edge-pdf-lite/save）→ 由 default_save_dir 自己登记
+ *
+ * ⚠️ **登记只发生在 Rust 侧**（见 `register_picked`）。这一条是整层设计的关键：
+ *    如果反过来让前端调一个 `allow_path(任意路径)`，那这道闸门就形同虚设 ——
+ *    拿到 JS 执行的人自己登记 `C:\Users\你\.ssh` 就绕过去了。
+ *    所以文件选择必须由 Rust 弹窗、Rust 登记，前端只拿结果。
+ *
+ * ⚠️ 放行列表会**落盘**（`%LOCALAPPDATA%\<identifier>\allowed-paths.txt`），
+ *    否则重启之后"上次打开的文件"和整个文件列表全都读不了 —— 那是功能退化，
+ *    不是安全。落盘位置刻意放在 `EBWebView` **外面**：自愈会清 profile，
+ *    但不该顺手把用户选过的路径一起清掉。
+ */
+const MAX_PDF_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// 允许被访问的路径。判定规则统一是 `路径 == 条目 || 路径.starts_with(条目)`：
+/// `starts_with` 是**按路径分量**比对的，所以"文件条目"天然只命中它自己
+/// （`D:\a\b.pdf` 不可能是 `D:\a\b.pdf\…` 的前缀，那种路径不存在）。
+struct Allowed {
+    /// 会被落盘的那部分：只由对话框登记 + default_save_dir
+    persisted: Mutex<Vec<PathBuf>>,
+    /// `EPL_ALLOW_ROOTS` 给的（分号分隔）。**只对本次运行有效、不落盘** ——
+    /// 留给端到端测试和"临时给某个目录开个口"用。JS 改不了环境变量，所以它不是后门。
+    env: Vec<PathBuf>,
+    /// 落盘位置；拿不到（没有 LOCALAPPDATA）就只在内存里活着
+    store: Option<PathBuf>,
+}
+
+impl Allowed {
+    fn load(store: Option<PathBuf>) -> Self {
+        let mut persisted: Vec<PathBuf> = Vec::new();
+        if let Some(f) = &store {
+            if let Ok(text) = std::fs::read_to_string(f) {
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let p = PathBuf::from(line);
+                    // ⚠️ 只收绝对路径。相对路径没有意义，而且 `..` 这种
+                    //    一旦进了列表就是"放行本级以上的任意东西"。
+                    if p.is_absolute() {
+                        persisted.push(p);
+                    }
+                }
+            }
+        }
+        let env = std::env::var("EPL_ALLOW_ROOTS")
+            .map(|raw| {
+                raw.split(';')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| resolveish(Path::new(s)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Self {
+            persisted: Mutex::new(persisted),
+            env,
+            store,
+        }
+    }
+
+    /// 登记一个路径（**只由对话框命令和 default_save_dir 调用**），并立刻落盘
+    fn add(&self, path: PathBuf) {
+        {
+            let mut list = self.persisted.lock().unwrap_or_else(|e| e.into_inner());
+            if list.iter().any(|e| *e == path) {
+                return;
+            }
+            list.push(path);
+        }
+        self.save();
+    }
+
+    fn save(&self) {
+        let Some(f) = &self.store else { return };
+        let text = {
+            let list = self.persisted.lock().unwrap_or_else(|e| e.into_inner());
+            let mut t = String::new();
+            for e in list.iter() {
+                t.push_str(&e.to_string_lossy());
+                t.push('\n');
+            }
+            t
+        };
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // 写坏了也只是"少几条"，下次 add 会补回来 —— 失败方向是保守的，不用原子写
+        let _ = std::fs::write(f, text);
+    }
+
+    fn hit(&self, want: &Path) -> bool {
+        let list = self.persisted.lock().unwrap_or_else(|e| e.into_inner());
+        list.iter()
+            .chain(self.env.iter())
+            .any(|e| want == e.as_path() || want.starts_with(e))
+    }
+
+    /// 把前端给的路径解析成真实路径，并确认它在放行范围内。
+    /// **任何一步不成立都返回错误** —— 失败一律拒绝，不放行。
+    fn check(&self, path: &str) -> Result<PathBuf, String> {
+        let want = resolveish(Path::new(path))
+            .ok_or_else(|| format!("路径不可用（要么不存在，要么不是绝对路径）：{}", path))?;
+        if self.hit(&want) {
+            return Ok(want);
+        }
+        Err(format!(
+            "拒绝访问：{} 不在允许范围内。\n\
+             只允许用户通过「添加文件 / 添加文件夹 / 选择保存目录」亲手选过的位置。",
+            want.display()
+        ))
+    }
+}
+
+/// 解析成"真实路径"（软链接展开、`..` 归一、大小写统一成实际磁盘上的写法）。
+///
+/// ⚠️ 目标**还不存在**时（另存一份新文件）`canonicalize()` 会整个失败 ——
+///    所以退一步：规范化**父目录**再拼回文件名。
+///    这顺带堵住了"用一串不存在的目录名把路径挪到别处"：
+///    父目录必须真实存在，`check` 才有意义。
+fn resolveish(p: &Path) -> Option<PathBuf> {
+    if let Ok(c) = p.canonicalize() {
+        return Some(c);
+    }
+    let name = p.file_name()?;
+    let parent = p.parent()?;
+    if parent.as_os_str().is_empty() {
+        // 相对路径（没有父目录可规范化）—— 一律不收
+        return None;
+    }
+    Some(parent.canonicalize().ok()?.join(name))
+}
+
+/// 只收 `.pdf`。这是 PDF 阅读器，别的文件没有理由走到这几个命令上。
+fn ensure_pdf_ext(p: &Path) -> Result<(), String> {
+    let ok = p
+        .extension()
+        .map(|e| e.to_string_lossy().eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("只处理 .pdf 文件：{}", p.display()))
+    }
+}
+
+/// 单个文件的大小上限。
+///
+/// ⚠️ 这道闸门的**唯一目的是"别被一个离谱的输入拖死"**，不是"防合法大文件"：
+///    它挡住的是"一个 30 GB 的东西被改名成 .pdf"这种 —— 没有它，命令会一头
+///    扎进去读，界面看起来就是卡死，还不报错。
+///    2 GiB 是刻意放很宽的（用户确实有几百 MB 的书）。
+fn ensure_size(len: u64) -> Result<(), String> {
+    if len <= MAX_PDF_BYTES {
+        Ok(())
+    } else {
+        Err(format!(
+            "文件太大（{} GB），上限是 {} GB",
+            len / (1 << 30),
+            MAX_PDF_BYTES / (1 << 30)
+        ))
+    }
+}
+
+/// 把对话框返回的路径**在 Rust 侧**登记进白名单，再把字符串回给前端。
+/// 🔴 登记必须发生在这里，理由见本节开头的说明（前端不能有登记能力）。
+fn register_picked(picked: Vec<FilePath>, allowed: &Allowed) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in picked {
+        let Ok(p) = f.into_path() else { continue };
+        let Some(real) = resolveish(&p) else { continue };
+        allowed.add(real.clone());
+        out.push(real.to_string_lossy().into_owned());
+    }
+    out
+}
+
+/// 弹系统对话框选 PDF（可多选）。返回**已经登记过的**真实路径。
+#[tauri::command]
+async fn pick_pdfs(app: tauri::AppHandle, allowed: State<'_, Allowed>) -> Result<Vec<String>, String> {
+    let mut dlg = app
+        .dialog()
+        .file()
+        .set_title("选择 PDF")
+        .add_filter("PDF", &["pdf"]);
+    // 带上父窗口才是"模态于主窗口"的对话框（不加会跑到窗口后面去，像没反应）
+    #[cfg(desktop)]
+    if let Some(win) = app.get_webview_window("main") {
+        dlg = dlg.set_parent(&win);
+    }
+    Ok(register_picked(
+        dlg.blocking_pick_files().unwrap_or_default(),
+        &allowed,
+    ))
+}
+
+/// 弹系统对话框选文件夹（单选）。返回一个元素的数组（没选就是空数组）。
+#[tauri::command]
+async fn pick_folder(app: tauri::AppHandle, allowed: State<'_, Allowed>) -> Result<Vec<String>, String> {
+    let mut dlg = app.dialog().file().set_title("选择文件夹");
+    #[cfg(desktop)]
+    if let Some(win) = app.get_webview_window("main") {
+        dlg = dlg.set_parent(&win);
+    }
+    let picked: Vec<FilePath> = dlg.blocking_pick_folder().into_iter().collect();
+    Ok(register_picked(picked, &allowed))
+}
+
 /// 目录里的一项（前端文件树用）
 #[derive(serde::Serialize)]
 struct DirEntry {
@@ -286,7 +547,10 @@ struct DirEntry {
  * 混进一堆 docx 只会让列表变噪音）。
  */
 #[tauri::command]
-fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
+fn list_dir(allowed: State<Allowed>, path: String) -> Result<Vec<DirEntry>, String> {
+    // 闸门：只允许扫用户选过的目录（或其子目录）
+    allowed.check(&path)?;
+
     let mut out: Vec<DirEntry> = Vec::new();
 
     let entries = std::fs::read_dir(&path).map_err(|e| format!("读不了目录 {}: {}", path, e))?;
@@ -325,14 +589,29 @@ fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
 
 /// 整个 PDF 的字节 —— 前端拿到交给 pdf.js。
 #[tauri::command]
-fn read_pdf_bytes(path: String) -> Result<Vec<u8>, String> {
-    std::fs::read(&path).map_err(|e| format!("读不了 {}: {}", path, e))
+fn read_pdf_bytes(allowed: State<Allowed>, path: String) -> Result<Vec<u8>, String> {
+    // 闸门 ①：路径必须在这一层放行范围内
+    allowed.check(&path)?;
+    let p = Path::new(&path);
+    // 闸门 ②：只收 .pdf —— 光有路径放行还不够，别让它变成"通用读文件"
+    ensure_pdf_ext(p)?;
+    // 闸门 ③：大小。先 stat 再 read，别为了拒绝一个 30 GB 的东西先把它读进内存
+    let len = std::fs::metadata(p)
+        .map_err(|e| format!("读不了 {}: {}", path, e))?
+        .len();
+    ensure_size(len)?;
+    std::fs::read(p).map_err(|e| format!("读不了 {}: {}", path, e))
 }
 
-/// 打开文件时判断：这个路径还在不在（上次记住的文件可能被删了）
+/// 打开文件时判断：这个路径还在不在（上次记住的文件可能被删了）。
+///
+/// ⚠️ 返回 `Result` 而不是 `bool` 是**故意的**：被闸门拒绝和"文件真的不在"必须能分开。
+///    前端那边两者的处理正好相反（见 fileList.ts 里 stillExists / pathExists 的注释）——
+///    要是把"拒绝"混成 `false`，用户会看到自己列表里的条目**被静默删掉**。
 #[tauri::command]
-fn path_exists(path: String) -> bool {
-    Path::new(&path).exists()
+fn path_exists(allowed: State<Allowed>, path: String) -> Result<bool, String> {
+    allowed.check(&path)?;
+    Ok(Path::new(&path).exists())
 }
 
 /*
@@ -345,11 +624,17 @@ fn path_exists(path: String) -> bool {
  * 目录顺手建好：用户第一次保存时不该遇到"目录不存在"。
  */
 #[tauri::command]
-fn default_save_dir() -> Result<String, String> {
+fn default_save_dir(allowed: State<Allowed>) -> Result<String, String> {
     let docs = dirs_next().ok_or_else(|| "找不到文档库目录".to_string())?;
     let dir = Path::new(&docs).join("edge-pdf-lite").join("save");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("建不了保存目录 {}: {}", dir.display(), e))?;
+    // 自己把自己登记了 —— 这个目录是"我们定的、用户没挑过"，
+    // 不登记的话第一次另存就会被闸门拦掉。登记的是**规范化后**的路径，
+    // 跟 check() 里的规范化方式保持一致（否则比对会永远差一个 \\?\ 前缀）。
+    if let Some(real) = resolveish(&dir) {
+        allowed.add(real);
+    }
     Ok(dir.to_string_lossy().into_owned())
 }
 
@@ -380,8 +665,21 @@ fn dirs_next() -> Option<String> {
  *    这是不可逆操作唯一的后悔药，由调用方按"是不是覆盖原文件"决定。
  */
 #[tauri::command]
-fn write_pdf_b64(path: String, b64: String, make_backup: bool) -> Result<String, String> {
+fn write_pdf_b64(
+    allowed: State<Allowed>,
+    path: String,
+    b64: String,
+    make_backup: bool,
+) -> Result<String, String> {
+    // 闸门 ①：写到哪里必须在放行范围内（覆盖原文件 = 那个文件本身；
+    //          另存 = 保存目录之内。两种都被白名单覆盖得到）
+    allowed.check(&path)?;
+    // 闸门 ②：只写 .pdf
+    ensure_pdf_ext(Path::new(&path))?;
+
     let bytes = decode_base64(&b64).map_err(|e| format!("数据解码失败：{}", e))?;
+    // 闸门 ③：大小（在解码之后判，才是真实字节数）
+    ensure_size(bytes.len() as u64)?;
 
     // 父目录可能不存在（用户手填了一个路径）
     if let Some(parent) = Path::new(&path).parent() {
@@ -433,7 +731,11 @@ fn backup_path(path: &str) -> std::path::PathBuf {
  * ⚠️ 目标已存在时不覆盖 —— 那会静默毁掉另一个文件。
  */
 #[tauri::command]
-fn rename_file(path: String, new_name: String) -> Result<String, String> {
+fn rename_file(allowed: State<Allowed>, path: String, new_name: String) -> Result<String, String> {
+    // 闸门：源文件必须在放行范围内。
+    // 目标不用再单独查 —— 它是下面从"已放行的源文件"的父目录拼出来的。
+    allowed.check(&path)?;
+
     let p = Path::new(&path);
     let old_ext = p
         .extension()
@@ -445,6 +747,21 @@ fn rename_file(path: String, new_name: String) -> Result<String, String> {
         .unwrap_or_default();
     if old_ext != new_ext {
         return Err(format!("不能改后缀（{} → {}）", old_ext, new_ext));
+    }
+
+    /*
+     * 🔴 `new_name` 里只要有分隔符或 `..`，下面的 `dir.join()` 就会拼到**目录外面**去，
+     *    于是"改名"能变成"把文件挪到任意位置"。前端输入框确实挡了一层，
+     *    但边界上的校验不能依赖调用方 —— 挡住这一整类事情才是闸门存在的意义。
+     */
+    if new_name.is_empty()
+        || new_name != new_name.trim()
+        || new_name.contains(['\\', '/'])
+        || new_name.contains(':')
+        || new_name == "."
+        || new_name == ".."
+    {
+        return Err(format!("新文件名不合法：{:?}", new_name));
     }
 
     let dir = p
@@ -462,7 +779,10 @@ fn rename_file(path: String, new_name: String) -> Result<String, String> {
 
 /// 在文件管理器里选中这个文件（Windows 自带 explorer，不用额外插件）
 #[tauri::command]
-fn reveal_in_folder(path: String) -> Result<(), String> {
+fn reveal_in_folder(allowed: State<Allowed>, path: String) -> Result<(), String> {
+    // 闸门：explorer 的参数来自这个字符串。不加这一条，它就成了
+    // "让系统去打开任意路径"的入口（也是给人看的一份路径存在性回显）。
+    allowed.check(&path)?;
     // explorer 的 /select, 开关后面直接跟路径，逗号不能分开
     std::process::Command::new("explorer")
         .args(["/select,", &path])
@@ -506,9 +826,18 @@ pub fn run() {
      * 放到 Builder 之前是**唯一绝对干净**的时机：这时进程里还没有任何 WebView2。
      */
     let context = tauri::generate_context!();
-    heal_webview_profile(&context.config().identifier);
+    let identifier = context.config().identifier.clone();
+    heal_webview_profile(&identifier);
+
+    /*
+     * 路径白名单的状态在这里建、交给 Tauri 托管（命令用 `State<Allowed>` 取）。
+     * ⚠️ 落盘位置刻意放在 `EBWebView` **外面**：上面那句自愈会清 profile，
+     *    但不该顺手把"用户选过哪些位置"一起清掉（清了等于文件列表全废）。
+     */
+    let allowed_store = data_root(&identifier).map(|root| root.join("allowed-paths.txt"));
 
     tauri::Builder::default()
+        .manage(Allowed::load(allowed_store))
         /*
          * 🔴 **单实例保护，必须是第一个注册的插件**（插件文档要求）。
          *
@@ -541,10 +870,7 @@ pub fn run() {
              *   · 白屏（JS 从没执行 → 没人写 `.epl-ok`）
              *   · 用户看到白屏就关掉了（哪怕只开了一秒，`.epl-bad` 已经记下了）
              */
-            if let Ok(local) = std::env::var("LOCALAPPDATA") {
-                let root = PathBuf::from(&local)
-                    .join(app.config().identifier.clone())
-                    .join("EBWebView");
+            if let Some(root) = data_root(&app.config().identifier).map(|r| r.join("EBWebView")) {
                 mark(&root.join(".epl-bad"), "started, waiting for app_ready");
             }
             if cfg!(debug_assertions) {
@@ -565,7 +891,9 @@ pub fn run() {
             write_pdf_b64,
             reveal_in_folder,
             rename_file,
-            app_ready
+            app_ready,
+            pick_pdfs,
+            pick_folder
         ])
         .run(context)
         .expect("error while building tauri application");

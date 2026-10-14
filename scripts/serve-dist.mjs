@@ -7,8 +7,14 @@
  *
  * 用法：
  *   npm run build
- *   npm run serve:dist            # 默认端口 4173
+ *   npm run serve:dist            # 默认端口 4173，**只监听本机回环**
  *   npm run serve:dist -- 8080    # 指定端口
+ *   npm run serve:dist -- --lan   # 允许同网段的其它机器连过来（跨机测试用）
+ *
+ * ⚠️ **默认不监听 `0.0.0.0`**。以前默认就是全开，等于每次跑这个命令都把 4173 端口
+ *    和 dist 目录暴露给同一个网络里的所有人（校园网 / 咖啡厅 WiFi 都算）。
+ *    那点在"我需要用另一台机器测"的时候是必要代价，但不该是默认值 ——
+ *    所以改成要跨机就显式加 `--lan`。
  */
 import { createServer } from 'node:http'
 import { createReadStream } from 'node:fs'
@@ -21,8 +27,11 @@ import { createSocket } from 'node:dgram'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
-const PORT = Number(process.argv[2] ?? process.env.PORT ?? 4173)
-const HOST = '0.0.0.0'
+/** 端口：从参数里挑第一个纯数字的（这样 `--lan` 和端口号可以任意顺序） */
+const PORT = Number(process.argv.slice(2).find((a) => /^\d+$/.test(a)) ?? process.env.PORT ?? 4173)
+/** 只有显式 `--lan` 才对外开；否则只监听回环 */
+const LAN = process.argv.includes('--lan')
+const HOST = LAN ? '0.0.0.0' : '127.0.0.1'
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -148,6 +157,21 @@ function primaryIPv4() {
 }
 
 server.listen(PORT, HOST, async () => {
+  const line = '─'.repeat(58)
+  console.log(`\n┌${line}┐`)
+  console.log('│ 服务已经跑起来了。注意：这个命令只在这台【开发机】上跑。')
+  console.log(`└${line}┘`)
+
+  if (!LAN) {
+    console.log(`\n  地址：http://localhost:${PORT}/`)
+    console.log('  只监听本机回环 —— 别的设备连不上（这是默认值）。')
+    console.log('  要在另一台机器上测，重跑并加 --lan：')
+    console.log('      npm run serve:dist -- --lan')
+    console.log('  ⚠️ 那时同网段的**所有人**都能访问这个端口，别在公共 WiFi 上开。')
+    console.log('\n  按 Ctrl+C 停止服务\n')
+    return
+  }
+
   const primary = await primaryIPv4()
   const others = []
   for (const list of Object.values(networkInterfaces())) {
@@ -158,10 +182,7 @@ server.listen(PORT, HOST, async () => {
     }
   }
 
-  const line = '─'.repeat(58)
-  console.log(`\n┌${line}┐`)
-  console.log('│ 服务已经跑起来了。注意：这个命令只在这台【开发机】上跑。')
-  console.log(`└${line}┘`)
+  console.log('\n  ⚠️ --lan：已经对同网段开放。别在公共 WiFi / 校园网上这样跑。')
   console.log('\n  ▼ 在【另一台机器】上，只用浏览器打开下面这个地址：\n')
   if (primary) console.log(`      http://${primary}:${PORT}/      ← 用这个`)
   else console.log(`      http://<本机IP>:${PORT}/`)

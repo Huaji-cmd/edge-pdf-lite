@@ -17,7 +17,7 @@
  * 然后用 CDP 连上去，塞一个 PDF 进去，数画布。
  */
 import { spawn } from 'node:child_process'
-import { existsSync, renameSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve, dirname, join } from 'node:path'
@@ -28,6 +28,18 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const EXE = resolve(ROOT, 'src-tauri/target/release/edge-pdf-lite.exe')
 const PDF = resolve(ROOT, 'public/testdata/real-1706.03762.pdf')
 const PORT = 9333
+
+/** 测试用到的两个目录，提前定义 —— 下面启动 exe 时要拿它们拼白名单 */
+const TESTDATA_DIR = resolve(ROOT, 'public/testdata')
+const SAVE_DIR = resolve(ROOT, 'exe-shots', 'save-test')
+/*
+ * 路径白名单（见 src-tauri/src/lib.rs 的「路径闸门」一节）。
+ *
+ * 端到端测试没法操作系统对话框，所以用这个环境变量**在启动 exe 之前**把测试要碰的
+ * 目录预先放行。注意它不是后门：环境变量是**启动进程的人**给的，前端 JS 改不了它 ——
+ * 能改它的人本来就能直接换掉 exe。反过来，它也让"闸门真的生效"这件事可测了。
+ */
+const ALLOW_ROOTS = [TESTDATA_DIR, SAVE_DIR].join(';')
 
 let pass = 0
 let fail = 0
@@ -50,67 +62,41 @@ if (!existsSync(PDF)) {
 console.log(`exe: ${EXE}`)
 console.log(`PDF: ${PDF}\n`)
 
-/**
- * ⚠️ 启动前必须清掉 WebView2 的数据目录。
+/*
+ * 数据目录隔离 —— **测试绝不碰用户的真实 profile**。
  *
- * WebView2 会**缓存 index.html**。更新应用后如果旧的那份还在缓存里，
- * 它会引用**已经不存在**的 chunk（构建产物的 hash 变了）→ 页面白屏、
- * 而且**控制台一个错都不报**（请求返回的是 SPA fallback 的 index.html）。
- * 我在这个问题上绕了好几圈，最后靠对比"exe 里嵌的文件名 vs 运行时请求的
- * 文件名"才定位到 —— 两者的 hash 根本不一样。
+ * 🔴 以前这里是"把 `%LOCALAPPDATA%\<identifier>` 整个 rename 到临时目录、跑完再还"。
+ *    两个问题：
+ *      1. WebView2 的子进程常还攥着目录句柄 → **还原经常失败**（现场留了几十份副本），
+ *         用户下次打开就发现**书单没了**。测试不许改用户数据。
+ *      2. 它还往 localStorage **整条覆盖** `epl:file-list` —— 就算还回去了，内容也已经被测试顶掉。
  *
- * 用 rename 而不是删除：删除整个目录在部分环境下会触发批量删除护栏。
+ * 现在的做法：`WEBVIEW2_USER_DATA_FOLDER` 是 **WebView2 自己的**环境变量（实测有效：
+ * 设了之后 profile 真的落在那个目录，真实那份一个字节都没动）。
+ * 关键是我们 Rust 侧的 `data_root()` **也读同一个变量**，所以自愈、标记文件、
+ * 路径白名单全都跟着进沙箱，不会出现"WebView2 用沙箱、自愈却去动真实目录"这种错位。
+ *
+ * 每次从零开始（删掉重建）—— 这样连"WebView2 缓存了旧 index.html"那个老坑也一并躲开。
  */
-/**
- * 把数据目录挪走（测试要从零开始），**并记下挪到哪了** —— 测完必须原样换回来。
- *
- * 🔴 曾经是"只挪不还"：跑一次 exe 测试，用户的文件列表就被搬进临时目录、再也不回来，
- *    他下次打开应用发现**书单没了**（用户真的踩到了）。测试**不许改用户数据**。
- */
-function clearWebViewData() {
-  const base = process.env.LOCALAPPDATA
-  const moved = []
-  if (!base) return moved
-  for (const id of ['com.edge-pdf-lite.desktop', 'com.edge-pdf-lite.app']) {
-    const p = join(base, id)
-    if (!existsSync(p)) continue
-    try {
-      const dest = join(tmpdir(), `epl-wv-${Date.now()}-${Math.random().toString(36).slice(2)}`)
-      renameSync(p, dest)
-      moved.push({ from: p, to: dest })
-    } catch {
-      /* 挪不走就算了，只是可能影响这次测试 */
-    }
-  }
-  return moved
-}
-
-/** 把测试前挪走的那份换回来（测试产生的 profile 挪到一边留底，不删） */
-function restoreWebViewData(moved) {
-  for (const { from, to } of moved) {
-    if (!existsSync(to)) continue
-    try {
-      if (existsSync(from)) {
-        renameSync(from, join(tmpdir(), `epl-wv-test-${Date.now()}-${Math.random().toString(36).slice(2)}`))
-      }
-      renameSync(to, from)
-    } catch (e) {
-      console.error(`⚠️ 没能把数据目录还回去：${from}（原数据在 ${to}）`, String(e))
-    }
-  }
-}
-
-const stashedData = clearWebViewData()
-// 兜底：不管怎么退出（成功/失败/抛异常）都要把用户那份还回去
-process.on('exit', () => restoreWebViewData(stashedData))
+const SANDBOX = join(tmpdir(), 'epl-exe-test-sandbox')
+await rm(SANDBOX, { recursive: true, force: true }).catch(() => {})
+await mkdir(SANDBOX, { recursive: true })
 
 // ---------------------------------------------------------------- 启动 exe
+// ⚠️ 先把它建出来：白名单里的路径是在 exe 启动那一刻解析的，
+//    目录不存在虽然也能解析（拿父目录拼回来），但没必要让测试依赖这条兜底路径
+await mkdir(SAVE_DIR, { recursive: true })
+
 const proc = spawn(EXE, [], {
   stdio: 'ignore',
   env: {
     ...process.env,
     // ⚠️ 没有这个环境变量，WebView2 不会开调试端口，CDP 连不上去
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT}`,
+    // 把整个数据目录（profile + 白名单 + 自愈标记）挪进沙箱，真实那份完全不动
+    WEBVIEW2_USER_DATA_FOLDER: SANDBOX,
+    // 预先放行测试要碰的目录（理由见文件头附近 ALLOW_ROOTS 的说明）
+    EPL_ALLOW_ROOTS: ALLOW_ROOTS,
   },
 })
 const shutdown = () => {
@@ -314,7 +300,7 @@ console.log('\n[5] 文件列表：真实路径 + 持久化 + 懒加载')
  * 改测**更有价值的两件事**：列表能不能跨会话记住、点开文件夹是不是只扫一层。
  * 做法：直接往 localStorage 里写一份"上次记住的列表"，重载看它回不回得来。
  */
-const TDIR = resolve(ROOT, 'public/testdata')
+const TDIR = TESTDATA_DIR
 await evaluate(`
   localStorage.setItem('epl:file-list', JSON.stringify([
     { name: 'testdata', path: ${JSON.stringify(TDIR)}, kind: 'folder' },
@@ -480,7 +466,7 @@ check(
 )
 
 // ---- 6b. 另存一份到指定目录
-const SAVE_DIR = resolve(ROOT, 'exe-shots', 'save-test')
+// （SAVE_DIR 定义在文件顶部 —— 启动 exe 时要拿它拼白名单）
 // 每次重跑都要先清空：否则上一轮的 .bak 还在，Rust 会往后排成 .bak2
 await rm(SAVE_DIR, { recursive: true, force: true }).catch(() => {})
 await mkdir(SAVE_DIR, { recursive: true })
@@ -815,6 +801,124 @@ check(
   cpToast.replace(/\s+/g, ' ').slice(0, 80),
 )
 
+// ---------------------------------------------------------------- 7b. 路径闸门
+console.log('\n[7b] 路径闸门：白名单之外一律拒绝')
+/*
+ * 为什么这一段值得单独存在：
+ *
+ * 上面所有功能都建立在"前端没被攻破"这个前提上 —— 而那是**我们控制不了的**
+ * （pdf.js 将来出个 XSS、或者某次改动引进了注入点，谁都不好说）。
+ * 路径闸门是唯一一道**不依赖那个前提**的墙：即使有人能在这套前端里跑任意 JS，
+ * `read_pdf_bytes` 也读不到白名单之外的东西、`write_pdf_b64` 也写不进去。
+ *
+ * 所以判据必须是"**拒绝**"，而不是"没读到" —— 而且每一次都要有阳性对照，
+ * 免得把该放行的也挡了（那种"安全"是坏的）。
+ */
+
+/**
+ * 调一个命令，并分辨"被拒绝了"和"成功了" —— 这一段判的正是这个区别。
+ *
+ * ⚠️ **不把返回值本身带回来**：`read_pdf_bytes` 回的是几十万个数字的数组
+ *    （Tauri 的 IPC 用 JSON 序列化 `Vec<u8>`），经 CDP 的 `returnByValue`
+ *    传回来会把连接搞死 —— 第一版就是这么写，整个脚本挂在中途，
+ *    还连带把用户的数据目录留在了临时目录里没还回去。
+ *    这里只把"长度"和"布尔值"这种小东西带回来，判据够用了。
+ *
+ * ⚠️ 错误信息要取 `String(e)`：被拒绝时 Tauri 抛的是**字符串**（命令返回的 Err(String)），
+ *    不是 Error 对象 —— 只取 `exception.description` 会得到一句没用的
+ *    "Uncaught (in promise)"，于是"拒绝了没有"能判、"拒绝得对不对"判不了。
+ */
+const tryInvoke = async (cmd, args) =>
+  JSON.parse(
+    await evaluate(`(async () => {
+      try {
+        const v = await window.__TAURI_INTERNALS__.invoke(${JSON.stringify(cmd)}, ${JSON.stringify(args ?? {})});
+        return JSON.stringify({
+          ok: true,
+          len: (v != null && v.length !== undefined) ? v.length : null,
+          val: (typeof v === 'boolean') ? v : null,
+        });
+      } catch (e) {
+        return JSON.stringify({ ok: false, err: String(e) });
+      }
+    })()`),
+  )
+
+// 一个**不在**白名单里的真 PDF：先拷过去，保证"被拒绝"只可能是白名单的原因，
+// 而不是"文件不存在"或者"后缀不对"
+const OUTSIDE_DIR = tmpdir()
+const OUTSIDE_PDF = join(OUTSIDE_DIR, 'epl-outside.pdf')
+await copyFile(PDF, OUTSIDE_PDF)
+
+let r = await tryInvoke('read_pdf_bytes', { path: OUTSIDE_PDF })
+check('白名单外的 PDF 读不出来', !r.ok && /拒绝访问/.test(r.err), r.ok ? `竟然读到了 ${r.len} 字节` : r.err)
+
+r = await tryInvoke('list_dir', { path: OUTSIDE_DIR })
+check('白名单外的目录列不出来', !r.ok && /拒绝访问/.test(r.err), r.ok ? `竟然列出了 ${r.len} 项` : '')
+
+// 写入：不仅要拒绝，还要确认磁盘上**真的没多出文件**（证明是"写在前面挡住的"）
+// ⚠️ 先清掉可能的历史残留：否则"没留下文件"这条会被上一轮（比如变异测试）留下的垃圾误判成红
+const OUTSIDE_OUT = join(OUTSIDE_DIR, 'epl-write-test.pdf')
+await rm(OUTSIDE_OUT, { force: true }).catch(() => {})
+r = await tryInvoke('write_pdf_b64', {
+  path: OUTSIDE_OUT,
+  b64: Buffer.from('%PDF-1.4\n').toString('base64'),
+  makeBackup: false,
+})
+check('白名单外写不进去', !r.ok && /拒绝访问/.test(r.err), r.ok ? '竟然写进去了' : '')
+check('被拒绝的写入没有在磁盘上留下文件', !existsSync(OUTSIDE_OUT))
+
+/*
+ * ⚠️ 这一条看着吹毛求疵，实际是在防**数据丢失**：
+ *    前端区分"被拒绝"和"文件不在了"的方式正好相反（拒绝→保留条目，
+ *    不在了→从列表里删掉）。闸门要是回 `false` 而不是报错，
+ *    用户一开软件就会看到自己的文件列表被静默清空。
+ */
+r = await tryInvoke('path_exists', { path: OUTSIDE_PDF })
+check('白名单外的 path_exists 是**报错**而不是回 false', !r.ok, r.ok ? `回了 ${r.val}` : '')
+
+// `..` 穿越：前端递过来的是**没归一化**的字符串，Rust 侧必须自己解析出真实路径
+const ESCAPE = `${TESTDATA_DIR}\\..\\..\\..\\epl-escape.pdf`
+r = await tryInvoke('read_pdf_bytes', { path: ESCAPE })
+check('带 .. 的路径也穿越不出白名单', !r.ok && /拒绝访问/.test(r.err), r.ok ? '竟然读到了' : '')
+
+/*
+ * 重命名不能变成"把文件挪到任意位置"。
+ * ⚠️ 拿**副本**去试，不碰真样本 —— 万一哪天这条判据失效（比如变异测试），
+ *    被挪走的是一份随时可再生成的拷贝，不是那个要求逐字节稳定的语料。
+ */
+const PROBE = join(TESTDATA_DIR, 'epl-rename-probe.pdf')
+await copyFile(PDF, PROBE)
+r = await tryInvoke('rename_file', { path: PROBE, newName: '..\\epl-evil.pdf' })
+check('重命名不接受带路径分隔符的新名字', !r.ok && /不合法/.test(r.err), r.err)
+check('被拒绝的重命名没动到原文件', existsSync(PROBE))
+await rm(PROBE, { force: true }).catch(() => {})
+// 万一（变异测试时）真的成功了，把这坨垃圾清掉，别留在仓库外面
+await rm(resolve(TESTDATA_DIR, '..', '..', '..', 'epl-evil.pdf'), { force: true }).catch(() => {})
+
+// ---- 阳性对照：闸门不能把该放行的也挡掉
+r = await tryInvoke('read_pdf_bytes', { path: PDF })
+check('（对照）放行目录里的 PDF 照常读得到', r.ok && r.len > 1000, r.ok ? `${r.len} 字节` : r.err)
+r = await tryInvoke('list_dir', { path: TESTDATA_DIR })
+check('（对照）放行目录照常列得出来', r.ok && r.len > 0, r.ok ? `${r.len} 项` : r.err)
+
+// 后缀那一道：路径放行 ≠ 什么文件都能读
+const NOT_PDF = join(TESTDATA_DIR, 'not-a-pdf.txt')
+await writeFile(NOT_PDF, 'hello\n')
+r = await tryInvoke('read_pdf_bytes', { path: NOT_PDF })
+check('（对照）放行目录里的非 .pdf 仍然读不了（后缀那一道）', !r.ok && /只处理/.test(r.err), r.ok ? '竟然读到了' : r.err)
+await rm(NOT_PDF, { force: true }).catch(() => {})
+
+// 放行列表要能跨重启活着，否则"上次打开的文件"和整个文件列表下次全读不了
+// （路径在沙箱里 —— 测试不碰用户的真实数据目录）
+const WHITELIST = join(SANDBOX, 'allowed-paths.txt')
+const wl = existsSync(WHITELIST) ? await readFile(WHITELIST, 'utf8') : ''
+check(
+  '放行列表落盘了（否则重启后文件列表全废）',
+  wl.includes('edge-pdf-lite'),
+  existsSync(WHITELIST) ? WHITELIST : '文件不存在',
+)
+
 // ---------------------------------------------------------------- 8. 控制台
 console.log('\n[8] 控制台')
 const real = errors.filter((e) => !/favicon/i.test(e))
@@ -828,29 +932,10 @@ ws.close()
 shutdown()
 
 /*
- * 收尾：**等应用彻底退出再把用户那份数据换回来**。
- *
- * ⚠️ 不能只靠 `process.on('exit')` 那个兜底：进程退出前 WebView2 的子进程还可能
- *    攥着目录句柄，rename 会 EPERM 失败 —— 实测就是这么失败的（测试全绿，但用户的
- *    书单没还回去）。所以先轮询等目录解锁，再还。
+ * 收尾：**没有"把用户数据换回来"这一步了** —— 数据目录整个跑在沙箱里
+ * （`WEBVIEW2_USER_DATA_FOLDER`），真实 profile 从头到尾没被碰过。
+ * 沙箱留在临时目录里不删，想看现场（localStorage、白名单、标记文件）随时能翻。
  */
-async function restoreUserData() {
-  const base = process.env.LOCALAPPDATA
-  if (!base) return
-  for (let i = 0; i < 40; i++) {
-    const live = join(base, 'com.edge-pdf-lite.desktop')
-    if (!existsSync(live)) break
-    try {
-      const probe = live + '.probe'
-      renameSync(live, probe)
-      renameSync(probe, live)
-      break // 能改名 = 句柄放开了
-    } catch {
-      await sleep(400)
-    }
-  }
-  restoreWebViewData(stashedData)
-}
-await restoreUserData()
+console.log(`沙箱（测试用过的数据目录）：${SANDBOX}`)
 
 process.exit(fail ? 1 : 0)
