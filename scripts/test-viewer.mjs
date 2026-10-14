@@ -114,6 +114,15 @@ try {
         'EXCEPTION: ' + (m.params.exceptionDetails?.exception?.description ?? '').slice(0, 300),
       )
     }
+    /*
+     * ⚠️ 有未保存批注时，应用注册了 `beforeunload` —— 重载页面会弹确认框，
+     *    而**弹窗期间 CDP 命令会一直等**：套件不是失败，是整个卡死
+     *    （实测卡了 7 分钟，什么都看不到）。测试里一律确认 ——
+     *    "丢掉未保存的批注"正是我们想要的。
+     */
+    if (m.method === 'Page.javascriptDialogOpening') {
+      send('Page.handleJavaScriptDialog', { accept: true }).catch(() => {})
+    }
   })
   const send = (method, params = {}) =>
     new Promise((res, rej) => {
@@ -720,8 +729,28 @@ try {
     if (st.page === beforeReload.page) break
   }
   console.log(`     重新打开后：第 ${afterReload?.page} 页 · ${afterReload?.zoom} · 双页=${afterReload?.dualOn}`)
-  check('恢复了阅读页码', afterReload?.page === beforeReload.page, `${afterReload?.page} vs ${beforeReload.page}`)
+  /*
+   * 🔴 这条判据以前是**假绿**：它断言 `afterReload.page === beforeReload.page`，
+   *    而当时 App 里有一行 `page.value = saved.page` 会把"想去的页码"直接写成工具栏页码 ——
+   *    于是**恢复根本没发生**（画面停在第 1 页）也能过。实测就是这么骗过去的。
+   *
+   * 现在按真实语义判：
+   *   · 双页模式下"当前页"是每行的**左页**（设计取舍），所以记 9 恢复回来可能是 8
+   *   · 真正的回归是"停在第 1 页" —— 那说明恢复整个没生效
+   */
+  const wantPage = Number(beforeReload.page)
+  const gotPage = Number(afterReload?.page)
+  check(
+    `恢复了阅读页码（第 ${wantPage} 页或它所在行的左页，总之不能是第 1 页）`,
+    (gotPage === wantPage || gotPage === wantPage - 1) && gotPage !== 1,
+    `恢复后=${gotPage}（修复前这里是 1：工具栏显示 ${wantPage}、画面却在第一页）`,
+  )
   check('恢复了双页模式', afterReload?.dualOn === beforeReload.dualOn)
+  check(
+    '恢复了缩放（这条以前也是坏的：存 96% 打开变 150%）',
+    afterReload?.zoom === beforeReload.zoom,
+    `${afterReload?.zoom} vs ${beforeReload.zoom}`,
+  )
   await shot('09-restored')
 
   // ---------------------------------------------------------------- 10. 批注
@@ -1004,6 +1033,73 @@ try {
     await shot('11-paging')
     await toolbarBtn('单页')
     await sleep(400)
+  }
+
+  /*
+   * ---------------------------------------------------------------- 11b. 阅读位置恢复
+   *
+   * 用户报的："记录下来了上次读到的页数，但打开时停在第一页。"
+   * 根因是这条路上有两处**静默失败**：
+   *   ① `restoreTo` 找不到目标页时 `?? l.pages[0]` —— 默默退回第 1 页；
+   *   ② 版面还没就绪时 `if (!vp || !l) return` —— 什么都不做。
+   * 两者的共同后果：调用方照旧把"想去的页码"写成工具栏页码 →
+   * 出现"页码说第 N 页、画面在第一页"，提示还跟着一起撒谎。
+   *
+   * 判据要比"不是第 1 页"更强：直接要求工具栏和**内部反算的页**都等于最后一页
+   * （越界时退到最近的一页才算诚实），并且提示说的页码必须和实际一致。
+   *
+   * ⚠️ 注入越界值必须在**没有文档打开**的时候做：应用在换文档/卸载时会
+   *    把当前页 flushSave 落盘，先把值塞进去会被它覆盖掉。
+   */
+  console.log('\n[11b] 阅读位置恢复（越界页码不许偷偷回到第 1 页）')
+  {
+    // 先开一次，好知道这份文档的 reading 键名（键是内容指纹，事先猜不到）
+    await send('Page.reload')
+    await sleep(2500)
+    const d1 = await send('DOM.getDocument', { depth: -1 })
+    const q1 = await send('DOM.querySelector', { nodeId: d1.root.nodeId, selector: 'input[type=file]' })
+    await send('DOM.setFileInputFiles', { files: [PDF], nodeId: q1.nodeId })
+    await sleep(2500)
+    const key = await evaluate(`Object.keys(localStorage).find((k) => k.startsWith('epl:reading:')) ?? ''`)
+    check('打开文档后写下了阅读位置记录', /^epl:reading:/.test(key), key || '(没有)')
+
+    // 重载 → 此刻**没有文档**，可以安全地注入越界页码
+    await send('Page.reload')
+    await sleep(2500)
+    await evaluate(`localStorage.setItem(${JSON.stringify(key)}, JSON.stringify({
+      page: 9999, scale: 1.5, mode: 'single', spreadOffset: 0, updatedAt: Date.now(),
+    }))`)
+    const d2 = await send('DOM.getDocument', { depth: -1 })
+    const q2b = await send('DOM.querySelector', { nodeId: d2.root.nodeId, selector: 'input[type=file]' })
+    await send('DOM.setFileInputFiles', { files: [PDF], nodeId: q2b.nodeId })
+    await sleep(3000)
+
+    const r = JSON.parse(
+      await evaluate(`JSON.stringify({
+        toolbar: Number(document.querySelector('[data-tid="page-input"]')?.value ?? 0),
+        inner: globalThis.__eplViewer?.snapshot().page ?? 0,
+        total: Number(document.querySelector('[data-tid="page-input"]')?.max ?? 0),
+        scrollTop: Math.round(globalThis.__eplViewer?.snapshot().scrollTop ?? -1),
+        toast: (document.querySelector('.toast') || {}).textContent || '',
+      })`),
+    )
+    console.log(
+      `     越界页码恢复后：工具栏=${r.toolbar} 内部=${r.inner} 总页数=${r.total} scrollTop=${r.scrollTop}`,
+    )
+    check(
+      '越界页码退到「最后一页」，而不是默默回到第 1 页',
+      r.total > 1 && r.inner === r.total,
+      `内部=${r.inner} 总页数=${r.total}（修复前这里会是 1）`,
+    )
+    check('工具栏页码 == 内部反算的页码（页码和画面对得上）', r.toolbar === r.inner, `工具栏=${r.toolbar} 内部=${r.inner}`)
+    check('真的滚下去了（不是停在页顶）', r.scrollTop > 100, `scrollTop=${r.scrollTop}`)
+    check(
+      '提示里说的页码就是实际落到的页码（提示不许说谎）',
+      r.toast === '' || r.toast.includes(`第 ${r.inner} 页`),
+      r.toast || '(没有提示)',
+    )
+    // 收尾：清掉这件人造的记录，别影响后面的用例
+    await evaluate(`localStorage.removeItem(${JSON.stringify(key)})`)
   }
 
   console.log('\n[12] 控制台')

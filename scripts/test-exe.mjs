@@ -835,7 +835,14 @@ const tryInvoke = async (cmd, args) =>
         const v = await window.__TAURI_INTERNALS__.invoke(${JSON.stringify(cmd)}, ${JSON.stringify(args ?? {})});
         return JSON.stringify({
           ok: true,
-          len: (v != null && v.length !== undefined) ? v.length : null,
+          // ⚠️ read_pdf_bytes 回的是**原始字节**（ArrayBuffer）→ 它没有 .length，
+          //    要看 .byteLength。只判 .length 的话这里会静默变成 null，
+          //    "读到了多少字节"这条对照就会假红。
+          //    （注意：这段是模板字符串里的代码，注释里**不能出现反引号** ——
+          //      会把这个模板提前结束掉，报一个莫名其妙的 SyntaxError。）
+          len: (v != null && v.length !== undefined) ? v.length
+             : (v != null && v.byteLength !== undefined) ? v.byteLength
+             : null,
           val: (typeof v === 'boolean') ? v : null,
         });
       } catch (e) {
