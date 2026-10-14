@@ -1,6 +1,8 @@
 # edge-pdf-lite
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/status-archived%20%2F%20read--only-orange.svg)](#项目状态)
+[![Version](https://img.shields.io/badge/version-v1.1.1-4FC08D.svg)](https://github.com/Huaji-cmd/edge-pdf-lite/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-0078D6.svg)](#)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB.svg)](https://v2.tauri.app/)
 [![Vue](https://img.shields.io/badge/Vue-3-4FC08D.svg)](https://vuejs.org/)
@@ -11,6 +13,10 @@
 > **定位**：不比 Edge 差，但**只在必须付的时候付一次**；并且做 Edge 没有的几件事
 > —— 双页并排、阅读位置记忆、批注写回 PDF。
 
+> 🔒 **本仓库已归档（只读）**：`v1.1.1` 是最后一个版本，不再接受 Issue / PR，也不再有代码改动。
+> 想改请直接 fork（MIT 允许）。公开前做过一轮完整隐私清理：提交元数据 + 全历史文件内容
+> 都扫过并改写过，仓库里不含个人信息 —— 详见 [安全](#安全)。
+
 ![阅读界面](docs/images/reader.png)
 
 - **网页版**：浏览器里直接打开就能用。
@@ -20,6 +26,7 @@
 
 ## 目录
 
+- [项目状态](#项目状态)
 - [为什么做这个](#为什么做这个)
 - [功能特性](#功能特性)
 - [快速开始](#快速开始)
@@ -27,12 +34,30 @@
 - [它是怎么守住"轻量"的](#它是怎么守住轻量的)
 - [已知限制](#已知限制)
 - [常见问题：启动出来一个"乱码错误页"](#常见问题启动出来一个乱码错误页)
+- [下载与校验（防投毒）](#下载与校验防投毒)
 - [技术栈](#技术栈)
 - [验证方式](#验证方式)
 - [安全](#安全)
 - [项目结构](#项目结构)
 - [参与贡献](#参与贡献)
 - [许可证](#许可证)
+
+---
+
+## 项目状态
+
+| 项 | 值 |
+|---|---|
+| **当前版本** | [`v1.1.1`](https://github.com/Huaji-cmd/edge-pdf-lite/releases/tag/v1.1.1)（最后一个版本） |
+| **仓库状态** | 已公开、**已归档**（只读） |
+| **维护** | 不再更新，不再接受 Issue / PR |
+
+归档的理由很实际：这是给自己用的工具，功能已经够用了，继续开着协作入口只会带来两类成本 ——
+一是要持续审查别人的改动，二是**只读本身就是一种保护**：仓库归档后没人能再往里推代码，
+也就不存在"被投毒"的可能（Release 里的 exe 自发布起就不可再更改）。
+
+想继续改，直接 fork 就行（MIT 允许）。`docs/` 里那批实验结论也可以单独拿去参考 ——
+那些"为什么这么定"的推导，比代码本身更有参考价值。
 
 ---
 
@@ -132,9 +157,9 @@ npm run tauri -- build      # 含 MSI + NSIS 安装包
 
 ```bash
 npm run dev | build | serve:dist     # 开发 / 构建 / 生产对照
-npm test                             # 八套浏览器端回归（300+ 项，含 CSP）
+npm test                             # 八套浏览器端回归（329 项，含 CSP）
 npm run test:csp                     # 只跑 CSP 那条（策略没被放宽 + 0 违规）
-npm run test:exe                     # 打包后 exe 的端到端验证（45 项）
+npm run test:exe                     # 打包后 exe 的端到端验证（57 项）
 npm run test:exe:heal                # 专测 WebView2 profile 自愈（17 项）
 npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截图做对照
 ```
@@ -208,6 +233,34 @@ npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截
 
 ---
 
+## 下载与校验（防投毒）
+
+exe **没有做代码签名**（签名证书要花钱，这是个人项目），所以 Windows 会弹
+「Windows 已保护你的电脑 / 未知发布者」—— 点「更多信息」→「仍要运行」即可。
+介意的话可以自己从源码编译。
+
+正因为没有签名，**校验只能靠自己动手**，两步：
+
+1. **只从本仓库的 [Releases](https://github.com/Huaji-cmd/edge-pdf-lite/releases) 页下载。**
+   任何第三方站点的同名 exe 都不能当作本项目产物 —— 归档后 Release 资产不会再变动，
+   所以这里永远是唯一的权威来源。
+2. **下完核对 SHA256**：每个 Release 的说明里都给了三个资产的校验和，
+   本地算出来比对即可：
+
+   ```powershell
+   certutil -hashfile edge-pdf-lite.exe SHA256
+   ```
+
+   或者 Git Bash 里：
+
+   ```bash
+   sha256sum edge-pdf-lite.exe
+   ```
+
+对不上就不要运行，直接删掉。
+
+---
+
 ## 技术栈
 
 | 层 | 选型 |
@@ -231,7 +284,7 @@ npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截
   比如判"批注写进去了"用的是 pdf-lib 直查 `/Annots` 且要求**恰好 +1**
   （测试样本本来就带 113 条批注，写成"大于 0"的话 writer 一行不写也照样绿）。
 - 新判据一律做**变异测试**：把修复注回去，确认测试真的变红，再还原。
-- `npm test` 八套 300+ 项；`npm run test:exe` 覆盖打包后的桌面端专有能力。
+- `npm test` 八套 329 项；`npm run test:exe` 覆盖打包后的桌面端专有能力。
 
 ---
 
@@ -247,8 +300,22 @@ npm run edge:shot <pdf> [页码]       # 用 Edge 内置查看器（PDFium）截
 - **文件读写只放行你亲手选过的路径**：读 / 写 / 列目录 / 重命名这几个命令都会先把路径
   `canonicalize()` 再比对白名单，范围外一律拒绝。登记只发生在 Rust 侧（前端没有"加白名单"
   的接口）—— 即使某天前端被注入脚本，它也读不到、写不进你选过的范围之外。
-- 本仓库的 Git 历史做过隐私清理（提交元数据与文件内容），未包含个人信息。
+- **隐私清理（公开前做过一轮，你可以自己复核）**：
+  - 提交作者 / 提交者邮箱统一是 `Huaji-cmd@users.noreply.github.com`（GitHub 的匿名转发地址，
+    不暴露真实邮箱）；
+  - 全历史（含**已删除的文件**和 **commit message**，不只当前工作区）扫过本机路径、
+    邮箱、手机号、身份证、内网 IP、各类平台 token 与私钥格式 —— **真实命中 0 条**；
+    文档里那些 `C:\Users\你\...` 是占位符，不是真值；
+  - 复核命令（在本仓库里跑）：
+
+    ```bash
+    git log --all --format='%an <%ae>' | sort -u          # 提交身份
+    git log --all --format='%cn <%ce>' | sort -u          # 提交者身份
+    git log --all -p | grep -aiE 'users\\|ghp_|BEGIN [A-Z ]*PRIVATE KEY'
+    ```
+
 - 安全问题的报告方式、以及**为什么本仓库不接收代码补丁**，见 [SECURITY.md](SECURITY.md)。
+  仓库已归档，不再接收报告 —— 发现真实漏洞请 fork 自行修复。
 
 ---
 
@@ -272,7 +339,9 @@ scripts/                 构建、测试、样本生成
 
 ## 参与贡献
 
-欢迎提 Issue / PR。请留意两条项目约定：
+**仓库已归档，不再接受 Issue / PR。** 想要改动，请 fork 成你自己的版本（MIT 允许）。
+
+fork 之后继续开发的话，有两条项目约定值得留着 —— 这个项目能保持可信，靠的就是它们：
 
 - **测试红了要真修**，不要放宽断言或改判据去迁就实现。
 - **性能结论必须来自测量**，并且要有对照组；"看起来快了"不算数。
