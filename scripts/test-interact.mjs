@@ -1290,6 +1290,59 @@ try {
   check('撤销把删掉的那条找回来了', countBack === countBefore, `${countAfter} → ${countBack}`)
   await shot('10-delete-undo')
 
+  /*
+   * 🔴 删掉之后**画布上也不能还留着它**。
+   *
+   * 用户报的原话："选中一个批注点删除，那个批注还是会在那里，但是无法选中，
+   * 刷新一下就消失了" —— 说明 store 里删干净了，**只是浮层没重绘**。
+   * 上面那些用例只查了 `annots()` 的数量，那只能证明数据层对，抓不到这种"视觉残留"。
+   *
+   * 做法：先把它改成**紫色**（色板里没有别的批注用这个色），数画布上的紫色像素；
+   * 删掉之后再数一次 —— 必须归零。
+   */
+  if (inkForDel) {
+    const cd2 = await centerOf(inkForDel.id)
+    await tap(cd2.x, cd2.y)
+    await sleep(200)
+    await clickSwatch(4) // 紫 = [0.55, 0.36, 0.96]
+    await sleep(420)
+    const PURPLE = [140, 92, 245]
+    const pxBefore = await colorPixels(PURPLE, 30)
+    check('删除前画布上确实有这条批注（紫色像素 > 0）', pxBefore > 100, `${pxBefore} px`)
+
+    await DEL()
+    await sleep(600)
+    const pxAfter = await colorPixels(PURPLE, 30)
+    check(
+      '删除后画布上**不能还留着它**（用户报的"删了还在，刷新才消失"）',
+      pxAfter < pxBefore * 0.05,
+      `${pxBefore} → ${pxAfter} px`,
+    )
+    await shot('10-delete-painted')
+    await UNDO() // 把这条找回来，后面的用例还要用
+    await sleep(300)
+
+    /*
+     * 再来一遍，但走**用户真实的那条路**：选中 → 点工具栏的删除按钮。
+     * （上面那条用的是 Delete 键。两条路都进 `deleteSelected()`，但既然用户是点按钮，
+     *   就不能只测键盘那条。）
+     */
+    const cd3 = await centerOf(inkForDel.id)
+    await tap(cd3.x, cd3.y)
+    await sleep(250)
+    const pxBeforeBtn = await colorPixels(PURPLE, 30)
+    await evaluate(`(() => { document.querySelector('[data-tid="delete-selected"]')?.click(); return true })()`)
+    await sleep(600)
+    const pxAfterBtn = await colorPixels(PURPLE, 30)
+    check(
+      '点工具栏「删除」按钮后，画布上也不能留残影',
+      pxAfterBtn < Math.max(20, pxBeforeBtn * 0.05),
+      `${pxBeforeBtn} → ${pxAfterBtn} px`,
+    )
+    await UNDO()
+    await sleep(300)
+  }
+
   // ---------------------------------------------------------------- 11. 高亮：选中后只能删
 
   console.log('\n[11] 选中高亮（markup）：**不能拖、不能缩放**，只能删')
@@ -1356,6 +1409,36 @@ try {
       `sel-box=${boxes}, handles=${handles}`,
     )
     await shot('11-highlight-locked')
+
+    /*
+     * 删掉高亮（**under 层**，multiply 混合）→ 画布上的黄色必须归零。
+     *
+     * [10] 只验了 ink（over 层）。两层是两条独立的绘制路径（`paint` 分别调用），
+     * 删除残留有可能只出现在其中一层，所以得分头查。
+     */
+    /*
+     * ⚠️ 颜色要**从这条批注的数据里取**，不能写死默认黄 ——
+     *    这条高亮的 `color` 是 [0.1, 0.72, 0.55]（绿），
+     *    写死 [255,235,59] 会数出 0，判据就成了"0 → 0"的假绿。
+     */
+    const hlRgb = hl.color.map((c) => Math.round(c * 255))
+    const yBefore = await colorPixels(hlRgb, 24)
+    check(
+      '删除前画布上确实有这条高亮',
+      yBefore > 100,
+      `${yBefore} px（rgb ${hlRgb.join(',')}）`,
+    )
+    await DEL()
+    await sleep(700)
+    const yAfter = await colorPixels(hlRgb, 24)
+    check(
+      '删掉高亮后画布上它的颜色也消失了（under 层同样不能留残影）',
+      yAfter < Math.max(20, yBefore * 0.05),
+      `${yBefore} → ${yAfter} px`,
+    )
+    await shot('11-highlight-deleted')
+    await UNDO()
+    await sleep(300)
   }
 
   // ---------------------------------------------------------------- 12. 控制台

@@ -89,10 +89,31 @@ export class AnnotLayer {
     s[layer] = null
   }
 
-  /** 数据变了：把某页标记为待重绘 */
-  invalidate(pageNumber: number): void {
+  /**
+   * 数据变了：把某页标记为待重绘。
+   *
+   * `clearNow` 给**删除**用：同步把画布清空，不等异步重绘。
+   *
+   * 🔴 为什么需要这个 —— 重绘是 async 的（要先拿 PageTransform），中间有**三处**
+   *    静默 return（拿不到 transform / 被更新的请求顶掉 / slot 已脱离 DOM）。
+   *    只要撞上其中一条，被删掉的那条就会**留在屏幕上**，而 store 里已经没有了：
+   *    用户看到的是「删了还在、点不着、刷新才消失」。
+   *    删除是"只会变少"的确定性事件，先清空再重画是安全的（画布本来就要重画），
+   *    而且用户点下去立刻见效，不用等几十毫秒。
+   */
+  invalidate(pageNumber: number, clearNow = false): void {
     const s = this.slots.get(pageNumber)
-    if (s) s.renderedScale = 0
+    if (!s) return
+    s.renderedScale = 0
+    if (!clearNow) return
+    for (const layer of ['under', 'over'] as const) {
+      const c = s[layer]
+      if (!c) continue
+      const ctx = c.getContext('2d')
+      if (!ctx) continue
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+      ctx.clearRect(0, 0, c.width, c.height)
+    }
   }
 
   invalidateAll(): void {
@@ -131,8 +152,13 @@ export class AnnotLayer {
     }
   }
 
-  /** 重绘一页 */
-  async render(pageNumber: number, scale: number): Promise<void> {
+  /**
+   * 重绘一页。
+   *
+   * `force` 跳过 `renderedScale === scale` 的早退。**删除**时一定要传 ——
+   * 早退本来是省一次重复绘制的优化，但在删除语义下它会变成"该重画却没重画"。
+   */
+  async render(pageNumber: number, scale: number, force = false): Promise<void> {
     const slot = this.slots.get(pageNumber)
     if (!slot) return
 
@@ -145,11 +171,24 @@ export class AnnotLayer {
       slot.renderedScale = 0
       return
     }
-    if (slot.renderedScale === scale) return
+    if (!force && slot.renderedScale === scale) return
 
     const token = ++slot.token
     const tf = await this.transformFor(pageNumber, scale)
-    if (!tf || token !== slot.token) return
+    if (!tf || token !== slot.token) {
+      /*
+       * ⚠️ 拿不到 transform（页面正在回收 / 换缩放）或这次请求已被更新的顶掉时，
+       * **旧图不能就这么留着** —— 数据可能已经变了（尤其是删除）。
+       * 清掉比"继续显示一份过期内容"安全：下一次 render 会补回来。
+       * 只在"自己还是最新请求"时清，避免把新请求刚画好的图擦掉。
+       */
+      if (token === slot.token) {
+        this.drop(slot, 'under')
+        this.drop(slot, 'over')
+        slot.renderedScale = 0
+      }
+      return
+    }
     if (!slot.el.isConnected) return
 
     this.paint(slot, 'under', list.filter((a) => blendGroupOf(a) === 'under'), tf)

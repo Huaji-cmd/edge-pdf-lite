@@ -1101,7 +1101,8 @@ function endTextEdit(): void {
     textEditBefore = null
     emit('annot-count', annotStore.count())
     emit('history-change', { canUndo: annotStore.canUndo(), canRedo: annotStore.canRedo() })
-    void annotLayer?.render(a.pageNumber, scale.value)
+    annotLayer?.invalidate(a.pageNumber, true)
+    void annotLayer?.render(a.pageNumber, scale.value, true)
     return
   }
   /*
@@ -1148,7 +1149,16 @@ function deleteTextAnnot(): void {
   annotEditor?.setSelected(null)
   emit('annot-count', annotStore.count())
   emit('history-change', { canUndo: true, canRedo: false })
-  void annotLayer?.render(pn, scale.value)
+  /*
+   * 🔴 这条路径（文本框工具条上的垃圾桶）测出过一个真 bug：
+   *    原来只调了 `render(pn, scale)`，而 `render` 一开头就有
+   *    `if (slot.renderedScale === scale) return` —— 页面没换过缩放时**直接早退**，
+   *    画布上那行字原样留着。而 `textEditId` 已经清空、store 里也没了，
+   *    于是用户看到"文字还在、点不着、刷新才消失"。
+   *    必须先 `invalidate(pn, true)`（同步清画布）再重绘。
+   */
+  annotLayer?.invalidate(pn, true)
+  void annotLayer?.render(pn, scale.value, true)
 }
 
 // ---- 编辑框上的两个手柄：左实心条（拖动）/ 右圆圈（调宽度）
@@ -1220,11 +1230,21 @@ function pushHistory(): void {
   emit('history-change', { canUndo: canUndo.value, canRedo: canRedo.value })
 }
 
-function onAnnotChanged(pageNumber: number): void {
+function onAnnotChanged(
+  pageNumber: number,
+  action?: 'add' | 'remove' | 'update',
+): void {
   pushAnnotCount()
   validateSelection()
-  annotLayer?.invalidate(pageNumber)
-  void annotLayer?.render(pageNumber, scale.value)
+  /*
+   * 🔴 `remove` 要**同步清画布**（`clearNow`），不能只靠下面那句异步重绘。
+   *    重绘里有三处静默 return（拿不到 transform / 被新请求顶掉 / slot 脱离 DOM），
+   *    撞上任何一条，被删掉的那条就会留在屏幕上 —— 用户报的"删了还在、点不着、
+   *    刷新才消失"就是这个形态。删除只会让内容变少，先清空再重画是安全的。
+   */
+  annotLayer?.invalidate(pageNumber, action === 'remove')
+  // 删除时连 `renderedScale === scale` 的早退也要跳过 —— 见 AnnotLayer.render 的 force
+  void annotLayer?.render(pageNumber, scale.value, action === 'remove')
 }
 
 function undoAnnot(): void {
@@ -1620,7 +1640,7 @@ function makeEditor(layer: AnnotLayer, doc: PdfDocument): AnnotEditor {
     fontSize: () => props.fontSize,
     // ⚠️ 要原样透传 `isNew`（别写成 `=== true`）—— `undefined` 走的是"按内容推断"那条路
     beginTextEdit: (id, isNew) => beginTextEdit(id, isNew),
-    onChange: (pn) => onAnnotChanged(pn),
+    onChange: (pn, action) => onAnnotChanged(pn, action),
     onSelectionChange: (id) => {
       const a = id ? (annotStore.get(id) ?? null) : null
       selId.value = a?.id ?? null
