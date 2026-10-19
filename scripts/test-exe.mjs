@@ -325,6 +325,67 @@ const kidFiles = await evaluate(
 )
 check('点开文件夹才扫出里面的 PDF（懒加载生效）', kidFiles > 0, `扫出 ${kidFiles} 个`)
 
+/*
+ * ---- 5b. 展开状态要跨面板切换记住 -------------------------------------------
+ *
+ * 用户报的："打开大纲之后返回文件列表，又要重新展开一次文件夹。"
+ * 根因：FilesPanel 是 `v-if` 切换的，组件一卸载 `expanded` 这个 ref 就没了。
+ * 现在存进 localStorage（键用真实路径，不用会话内自增的 id）。
+ *
+ * ⚠️ 判据量的是**切回来之后还有几行文件**：没记住的话只剩 1 行（那个文件夹），
+ *    记住了才是 kidFiles 那么多。
+ */
+await evaluate(clickByTidExpr('目录'))
+await sleep(420)
+check(
+  '切到了目录面板（文件面板真的卸载了）',
+  !(await evaluate(`!!document.querySelector('[data-tid="files-panel"]')`)),
+)
+await evaluate(clickByTidExpr('文件'))
+await sleep(1600)
+const rowsBack = Number(
+  await evaluate(
+    `document.querySelectorAll('[data-tid="files-panel"] [data-node-id][data-kind="file"]').length`,
+  ),
+)
+check(
+  '从大纲切回文件面板，文件夹**仍然是展开的**（不用再点一次）',
+  rowsBack === kidFiles && rowsBack > 0,
+  `切走前 ${kidFiles} 行 → 切回 ${rowsBack} 行`,
+)
+
+/*
+ * ---- 5c. 刷新：磁盘上新出现的 PDF 要能扫出来 --------------------------------
+ *
+ * 用户报的："另存一个文件后列表不显示，得重开。"
+ * 做法：真的往被监视的目录里拷一个 PDF，点刷新，看它出不出来。
+ */
+{
+  const probePath = join(TDIR, 'refresh-probe.pdf')
+  await copyFile(PDF, probePath)
+  const before = Number(
+    await evaluate(
+      `document.querySelectorAll('[data-tid="files-panel"] [data-node-id][data-kind="file"]').length`,
+    ),
+  )
+  await evaluate(`document.querySelector('[data-tid="files-refresh"]')?.click()`)
+  await sleep(1600)
+  const after = Number(
+    await evaluate(
+      `document.querySelectorAll('[data-tid="files-panel"] [data-node-id][data-kind="file"]').length`,
+    ),
+  )
+  const sawProbe = await evaluate(
+    `(document.querySelector('[data-tid="files-panel"]')?.textContent || '').includes('refresh-probe')`,
+  )
+  check(
+    '磁盘上新放的 PDF，点刷新就出现在列表里（不用重开应用）',
+    sawProbe && after > before,
+    `${before} → ${after} 行${sawProbe ? '' : '（没看到 refresh-probe）'}`,
+  )
+  await rm(probePath, { force: true })
+}
+
 const listShot = await send('Page.captureScreenshot', { format: 'png' })
 await writeFile(
   resolve(SHOTS, '02-exe-filelist.png'),

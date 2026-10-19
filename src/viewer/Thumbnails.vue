@@ -151,12 +151,36 @@ function reset(): void {
   canvases.clear()
 }
 
+/**
+ * 打开缩略图时**从当前页开始**，而不是永远停在第一页（用户报的问题）。
+ *
+ * ⚠️ 不能用 `offsetTop`：每张缩略图高度不同（按每页宽高比算），而且 `.thumb` 的
+ *    offsetParent 会一路找到 body（这条链上没人 `position: relative`）——
+ *    拿到的数会整体偏一段。统一用 `getBoundingClientRect` 相减 + 当前 scrollTop。
+ * ⚠️ **只在挂载 / 换文档时定位一次**。面板开着的时候用户翻页不该把列表拽走 ——
+ *    他很可能正在缩略图里自己找某一页。
+ */
+function scrollToCurrent(): void {
+  const root = scrollRoot.value
+  const total = props.sizes?.length ?? 0
+  if (!root || !total) return
+  const pn = Math.min(Math.max(props.currentPage, 1), total)
+  const el = root.querySelector<HTMLElement>(`.thumb[data-thumb="${pn}"]`)
+  if (!el) return
+  const top = el.getBoundingClientRect().top - root.getBoundingClientRect().top + root.scrollTop
+  // 留 6px 余量，让当前页不贴着面板顶边
+  root.scrollTop = Math.max(0, top - 6)
+}
+
 watch(
   () => props.sizes,
   async () => {
     reset()
     await nextTick()
     setupObserver()
+    // ⚠️ 必须在 nextTick 之后：`.thumb` 的高度靠 inline style 撑开，
+    //    布局没算完时量出来的位置是不可靠的
+    scrollToCurrent()
   },
   { immediate: true },
 )
@@ -187,6 +211,7 @@ onBeforeUnmount(() => {
         v-for="(s, i) in sizes"
         :key="i"
         class="thumb"
+        :data-thumb="i + 1"
         :class="{ current: currentPage === i + 1 }"
         :style="{ height: Math.round((s.height / s.width) * (width ?? 96)) + 'px' }"
         :title="`跳到第 ${i + 1} 页`"

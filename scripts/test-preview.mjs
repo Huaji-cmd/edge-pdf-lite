@@ -358,12 +358,88 @@ try {
     check(`点第 ${target} 张缩略图跳过去了`, after === target, `${before} → ${after}（期望 ${target}）`)
   }
 
+  /*
+   * 3b-2. 切到别的面板再切回缩略图：必须**停在当前页**。
+   *
+   * 用户报的原话是"只在第一页开始展示，比如当前在 12 页，打开缩略图还是从第 1 页开始"。
+   * 根因：`.thumb-panel` 自己是个滚动容器，挂载时 scrollTop=0；
+   * 而面板是 `v-if` 切换的 —— 每次切回来都是**全新挂载**，滚动位置自然归零。
+   *
+   * ⚠️ 判据必须跳过"当前页正好是第 1 页"的情况，否则 scrollTop=0 也能过，等于没牙。
+   *    上面刚点过 60% 处那张，所以当前页一定不是 1。
+   */
+  {
+    const cur = await pageNow()
+    check('前提：当前页不是第 1 页（否则这条判据没牙）', cur > 1, `当前第 ${cur} 页`)
+
+    await evaluate(
+      `(() => { document.querySelector('[data-tid="side-outline"]')?.click(); return true })()`,
+    )
+    await sleep(280)
+    check('离开缩略图时组件真的卸载了（v-if 切换）', !(await evaluate(`!!document.querySelector('.thumb-panel')`)))
+
+    await evaluate(
+      `(() => { document.querySelector('[data-tid="side-thumbs"]')?.click(); return true })()`,
+    )
+    await sleep(450)
+
+    const pos = JSON.parse(
+      await evaluate(`
+        (() => {
+          const panel = document.querySelector('.thumb-panel');
+          if (!panel) return JSON.stringify(null);
+          const cur = document.querySelector('.thumb.current');
+          if (!cur) return JSON.stringify(null);
+          const pr = panel.getBoundingClientRect();
+          const cr = cur.getBoundingClientRect();
+          return JSON.stringify({
+            scrollTop: panel.scrollTop,
+            offset: cr.top - pr.top,
+            h: cr.height,
+          });
+        })()
+      `),
+    )
+
+    check(
+      `回到缩略图时停在当前页（第 ${cur} 页），而不是又跳回第 1 页`,
+      !!pos && pos.scrollTop > 0 && pos.offset > -10 && pos.offset < pos.h * 0.7,
+      pos
+        ? `scrollTop=${Math.round(pos.scrollTop)}px，当前页顶边偏移=${Math.round(pos.offset)}px（页高 ${Math.round(pos.h)}px）`
+        : '拿不到位置',
+    )
+    await shot('03b-thumbs-current')
+  }
+
   // ---------------------------------------------------------------- 3c. 文件列表 + 搜索
 
   console.log('\n[3c] 文件列表 + 搜索')
   check('切到「文件」面板', await toolbarBtn('文件'))
   await sleep(320)
   check('出现文件面板', await evaluate(`!!document.querySelector('[data-tid="files-panel"]')`))
+  /*
+   * 刷新入口。
+   *
+   * 浏览器版拿不到真实路径，所以按钮必须在、但**禁用**，且 title 说清原因 ——
+   * 一个点了没反应的按钮比没有按钮更让人困惑。
+   * （桌面端"真的能重扫出新文件"那条判据在 `test-exe.mjs` 里，那边才有文件系统。）
+   */
+  {
+    const r = JSON.parse(
+      await evaluate(`
+        (() => {
+          const b = document.querySelector('[data-tid="files-refresh"]');
+          return JSON.stringify(b ? { exists: true, disabled: b.disabled, title: b.title || '' } : { exists: false });
+        })()
+      `),
+    )
+    check('文件面板顶部有「刷新」按钮', r.exists)
+    check(
+      '浏览器版里刷新是禁用的，且 title 说明了原因',
+      r.exists && r.disabled === true && /浏览器/.test(r.title),
+      r.exists ? `disabled=${r.disabled} title=${r.title}` : '按钮不存在',
+    )
+  }
   check(
     '空列表时给出明确提示（而不是一片空白）',
     await evaluate(

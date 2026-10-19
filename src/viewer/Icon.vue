@@ -44,6 +44,7 @@ export type IconName =
   | 'chevron-right'
   | 'chevron-down'
   | 'gear'
+  | 'refresh'
   | 'folder-open'
   | 'sun'
   | 'moon'

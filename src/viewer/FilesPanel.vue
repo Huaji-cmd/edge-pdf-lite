@@ -6,7 +6,7 @@
  *    列表只活在本次会话，刷新就没。原因是 `<input type=file>` 只给临时
  *    File 对象，拿不到真实路径。（打包成 exe 后才有路径，才能持久化）
  */
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import {
   addFiles,
@@ -15,6 +15,7 @@ import {
   addFolderViaDialog,
   copyPath,
   loadChildren,
+  refreshList,
   removeNode,
   renameFile,
   splitExt,
@@ -42,10 +43,38 @@ const emit = defineEmits<{
 
 // ---------------- 展开状态（这是纯 UI 状态，不是"懒加载完成了"）
 
-const expanded = ref<Set<string>>(new Set())
+/**
+ * 展开状态要**跨面板切换、跨会话**记住（用户报的"打开大纲再回来，全塌了"）。
+ *
+ * ⚠️ 存的是 `node.key`（`p:<真实路径>`），**不是 `node.id`**。
+ *    `id` 是会话内自增的 `n1/n2/…`：重启之后同一个文件夹会拿到完全不同的 id，
+ *    存 id 等于每次启动都清空。
+ */
+const EXPAND_KEY = 'epl:files-expanded'
 
-function isOpen(id: string): boolean {
-  return expanded.value.has(id)
+function loadExpanded(): Set<string> {
+  try {
+    const raw = localStorage.getItem(EXPAND_KEY)
+    if (!raw) return new Set()
+    const arr: unknown = JSON.parse(raw)
+    return new Set(Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
+
+const expanded = ref<Set<string>>(loadExpanded())
+
+function saveExpanded(next: Set<string>): void {
+  try {
+    localStorage.setItem(EXPAND_KEY, JSON.stringify([...next]))
+  } catch {
+    /* 存不下就算了，不影响使用 */
+  }
+}
+
+function isOpen(node: FileNode): boolean {
+  return expanded.value.has(node.key)
 }
 
 /**
@@ -57,10 +86,10 @@ function isOpen(id: string): boolean {
 async function toggle(node: FileNode): Promise<void> {
   if (node.kind !== 'folder') return
   const next = new Set(expanded.value)
-  if (next.has(node.id)) {
-    next.delete(node.id)
+  if (next.has(node.key)) {
+    next.delete(node.key)
   } else {
-    next.add(node.id)
+    next.add(node.key)
     // 扫大目录会有一点延迟，不给反馈的话点箭头像"没反应"
     markLoading(node.id, true)
     try {
@@ -71,7 +100,47 @@ async function toggle(node: FileNode): Promise<void> {
   }
   // ⚠️ Set 是引用类型，必须换一个新 Set 才会触发 Vue 更新
   expanded.value = next
+  saveExpanded(next)
 }
+
+/**
+ * 把上次记住的展开状态重新打开。
+ *
+ * 挂载时（=`v-if` 切回文件面板时）跑一遍。`loadChildren` 有 `loaded` 标记，
+ * 所以反复切面板不会反复扫盘。
+ */
+let restoring = false
+
+async function restoreExpanded(): Promise<void> {
+  if (restoring) return
+  restoring = true
+  try {
+    const walk = async (list: readonly FileNode[]): Promise<void> => {
+      for (const n of list) {
+        if (n.kind !== 'folder' || !expanded.value.has(n.key)) continue
+        if (!n.loaded) {
+          markLoading(n.id, true)
+          try {
+            await loadChildren(n)
+          } finally {
+            markLoading(n.id, false)
+          }
+        }
+        await walk(n.children ?? [])
+      }
+    }
+    await walk(props.nodes)
+  } finally {
+    restoring = false
+  }
+}
+
+/*
+ * 监听的是**引用**（不是深度）：`restoreList()` 恢复书单时是整体换数组，
+ * 而"添加文件/文件夹"是往里 push —— 后者不需要重新恢复展开态（用户刚操作完，
+ * 眼前就是展开的），深度监听只会平白多跑几遍扫盘。
+ */
+watch(() => props.nodes, () => void restoreExpanded(), { immediate: true })
 
 /** 正在扫盘的文件夹（显示"…"用） */
 const loading = ref<Set<string>>(new Set())
@@ -80,6 +149,40 @@ function markLoading(id: string, on: boolean): void {
   const next = new Set(loading.value)
   on ? next.add(id) : next.delete(id)
   loading.value = next
+}
+
+// ---------------- 刷新（重扫已展开的文件夹）
+
+/**
+ * 用户报的问题：另存为一个新 PDF、或者往已添加的文件夹里拷了一份，列表里看不见，
+ * 必须重开应用。
+ *
+ * 这里只重扫**展开过**的目录 —— 没展开的还是懒加载（点开才读）。
+ */
+const refreshing = ref(false)
+
+async function onRefresh(): Promise<void> {
+  if (refreshing.value) return
+  if (!IS_TAURI) {
+    emit('toast', '浏览器版拿不到真实路径，刷新不了（重新添加一次即可）')
+    return
+  }
+  refreshing.value = true
+  try {
+    const r = await refreshList()
+    emit('change')
+    if (r.scanned === 0) {
+      emit('toast', '还没有展开过的文件夹，点开一个再刷新')
+    } else if (r.added > 0) {
+      emit('toast', `已刷新：新增 ${r.added} 项（扫了 ${r.scanned} 个文件夹）`)
+    } else {
+      emit('toast', `已刷新：没有新文件（扫了 ${r.scanned} 个文件夹）`)
+    }
+  } catch (e) {
+    emit('toast', `刷新失败：${String(e)}`)
+  } finally {
+    refreshing.value = false
+  }
 }
 
 // ---------------- 添加
@@ -111,7 +214,10 @@ function onFolderPicked(e: Event): void {
   if (!list.length) return
   addFolder(list)
   // 刚加进来的根文件夹默认展开 —— 不然用户看到的是"点了一下什么都没发生"
-  for (const n of props.nodes) if (n.kind === 'folder') expanded.value.add(n.id)
+  const next = new Set(expanded.value)
+  for (const n of props.nodes) if (n.kind === 'folder') next.add(n.key)
+  expanded.value = next
+  saveExpanded(next)
   emit('change')
 }
 
@@ -270,7 +376,7 @@ const rows = computed(() => {
   const walk = (list: readonly FileNode[], depth: number): void => {
     for (const n of list) {
       out.push({ node: n, depth })
-      if (n.kind === 'folder' && isOpen(n.id) && n.children) walk(n.children, depth + 1)
+      if (n.kind === 'folder' && isOpen(n) && n.children) walk(n.children, depth + 1)
     }
   }
   walk(props.nodes, 0)
@@ -280,6 +386,24 @@ const rows = computed(() => {
 
 <template>
   <div class="files" data-tid="files-panel" @contextmenu="openBlankMenu" @click="closeMenu">
+    <!--
+      顶部工具条：刷新。
+      ⚠️ 粘在顶部（`position: sticky`），否则列表一长，刷新按钮就跟着滚走了。
+    -->
+    <div class="bar">
+      <span class="bar-title">文件</span>
+      <button
+        class="bar-btn"
+        :class="{ spin: refreshing }"
+        data-tid="files-refresh"
+        :title="IS_TAURI ? '刷新：重扫已展开的文件夹（新另存的文件也能出现）' : '浏览器版拿不到真实路径，刷新不了'"
+        :disabled="!IS_TAURI"
+        @click.stop="onRefresh"
+      >
+        <Icon name="refresh" />
+      </button>
+    </div>
+
     <!-- 隐藏的文件选择器：右键菜单点完才触发 -->
     <input
       ref="fileInput"
@@ -316,7 +440,7 @@ const rows = computed(() => {
         @click.stop="openNode(r.node)"
         @contextmenu.stop="openFileMenu($event, r.node)"
       >
-        <span v-if="r.node.kind === 'folder'" class="twisty" :class="{ open: isOpen(r.node.id) }">
+        <span v-if="r.node.kind === 'folder'" class="twisty" :class="{ open: isOpen(r.node) }">
           <Icon name="chevron-right" />
         </span>
         <span v-else class="twisty" />
@@ -416,6 +540,57 @@ const rows = computed(() => {
   overflow: auto;
   padding: 6px 4px 40px;
   position: relative;
+}
+
+/*
+ * 顶部工具条。`sticky` 是必须的：文件多的时候列表会滚，
+ * 刷新按钮不能跟着一起滚走（那就等于没有）。背景要用面板色盖住底下滚过去的行。
+ */
+.bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 2px 8px 6px;
+  margin: -6px -4px 4px;
+  background: var(--panel);
+}
+.bar-title {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--mute);
+}
+.bar-btn {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  padding: 0;
+}
+.bar-btn:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--fg);
+}
+.bar-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.bar-btn.spin :deep(.ic) {
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .hidden-input {

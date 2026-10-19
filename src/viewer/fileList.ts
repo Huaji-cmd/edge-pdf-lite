@@ -190,6 +190,87 @@ export async function loadChildren(node: FileNode): Promise<void> {
 }
 
 /**
+ * 强制重读某一层（不走 `loaded` 早退），用于「刷新」。
+ *
+ * 🔴 必须**复用已有子节点对象**：如果无脑重建一遍，那些已经展开过、children 装满
+ *    的孙目录会变成 `children: []` + `loaded: false` —— 用户看到的是"刷新之后
+ *    我展开的层级全塌了"。所以按 `key`（真实路径）认领旧对象，只更新名字。
+ */
+async function rescanChildren(node: FileNode): Promise<void> {
+  if (node.kind !== 'folder' || !node.path) return
+  const prev = new Map<string, FileNode>()
+  for (const c of node.children ?? []) prev.set(c.key, c)
+
+  try {
+    const entries = await invoke<Array<{ name: string; path: string; is_dir: boolean }>>(
+      'list_dir',
+      { path: node.path },
+    )
+    node.children = entries.map((e) => {
+      const key = `p:${e.path}`
+      const kind: 'file' | 'folder' = e.is_dir ? 'folder' : 'file'
+      const old = prev.get(key)
+      if (old && old.kind === kind) {
+        old.name = e.name // 顺带吃掉改名
+        return old
+      }
+      return {
+        id: newId(),
+        name: e.name,
+        kind,
+        path: e.path,
+        children: kind === 'folder' ? [] : undefined,
+        loaded: false,
+        key,
+      }
+    })
+    node.loaded = true
+  } catch (e) {
+    /*
+     * ⚠️ 读失败**不要清空** children（`loadChildren` 那样做是为了"别一直转圈"，
+     *    但刷新时的失败多半是临时性的：U 盘拔了、目录被别的程序锁住）。
+     *    清空等于把用户看得见的列表变成空的 —— 比"没刷新成功"糟得多。
+     */
+    console.warn('[fileList] 刷新目录失败：', node.path, e)
+  }
+}
+
+export interface RefreshResult {
+  /** 新出现的条目数（文件 + 文件夹，递归） */
+  added: number
+  /** 重新扫过的目录数 */
+  scanned: number
+}
+
+/**
+ * 刷新文件列表：把**所有展开过**的文件夹重新扫一遍。
+ *
+ * 解决的是"另存为新文件 / 往文件夹里拷了一个 PDF，列表里看不见，得重开"。
+ * 没展开过的目录不扫 —— 那还是懒加载，点开时才读。
+ *
+ * 浏览器版没有真实路径，列表本来就只在会话里，直接返回 0。
+ */
+export async function refreshList(): Promise<RefreshResult> {
+  if (!IS_TAURI) return { added: 0, scanned: 0 }
+  let added = 0
+  let scanned = 0
+
+  const walk = async (list: readonly FileNode[]): Promise<void> => {
+    for (const n of list) {
+      if (n.kind !== 'folder' || !n.path || !n.loaded) continue
+      const before = new Set((n.children ?? []).map((c) => c.key))
+      await rescanChildren(n)
+      scanned++
+      for (const c of n.children ?? []) if (!before.has(c.key)) added++
+      await walk(n.children ?? [])
+    }
+  }
+
+  await walk(nodes.value)
+  return { added, scanned }
+}
+
+/**
  * 按**真实路径**读一份 PDF（桌面端）。
  *
  * 单独抽出来是因为它有两个调用方：文件列表里的条目，以及

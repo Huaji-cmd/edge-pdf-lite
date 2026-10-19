@@ -25,7 +25,6 @@ import type {
   Rect,
 } from '@/annot/types'
 import {
-  isResizable,
   isMarkupTool,
   sanitizeToolColor,
   normalizeRect,
@@ -138,15 +137,29 @@ const canUndo = ref(false)
 const canRedo = ref(false)
 
 /**
- * 要不要画那 8 个改大小的手柄。
+ * 「边条模式」：区域高亮 / 方框用**左侧移动条 + 上右下三边拉伸**。
  *
- * ⚠️ 文本框**排除在外**：它有自己的 Chrome（左实心条 + 右圆圈 + 三边虚线，见
- *    `.text-edit`），再叠一层 8 手柄会两边打架 —— 而且用户在文本框上要做的是
- *    "改字、调宽度"，不是"四角拉伸"。
+ * 和就地文本框保持一致（用户明确要求）：左边那条是"整块搬家"，其余三边才是改大小。
+ * 为什么不用 8 个角点：4 个角改的是两条边，在贴边的小框上很容易误抓 ——
+ * 而 area / rect 几乎总是画在正文行间，框不大。
+ */
+const selEdgeMode = computed(() => {
+  const a = selId.value ? annotStore.get(selId.value) : null
+  return !!a && (a.kind === 'area' || a.kind === 'rect')
+})
+
+/**
+ * 要不要画那 8 个角点手柄。
+ *
+ * ⚠️ 现在只剩**手写**用它：手写的缩放是整体等比变形（笔画跟着缩），
+ *    8 个方向都有意义，也没有"文字会错位"的顾虑。
+ *    · 文本标记类（高亮/下划线/删除线）：**一个手柄都没有**，选中后只能删；
+ *    · area / rect：走 `selEdgeMode` 那套；
+ *    · 文本框：有自己的 Chrome（左实心条 + 右圆圈），再叠一层会两边打架。
  */
 const selHandlesVisible = computed(() => {
   const a = selId.value ? annotStore.get(selId.value) : null
-  return !!a && isResizable(a) && a.kind !== 'freetext'
+  return !!a && a.kind === 'ink'
 })
 
 /** 选中框本体：文本框不画（编辑态自己有框） */
@@ -1898,7 +1911,26 @@ watch(
             :style="selBoxStyle"
             @dblclick.stop="onSelDblClick"
           >
-            <template v-if="selHandlesVisible">
+            <!--
+              区域高亮 / 方框：**左侧实心条移动，上 / 右 / 下三边拉伸**。
+              和就地文本框同一套心智模型 —— 左边那一条是"整块搬家"，不是改大小。
+              ⚠️ 这三个边条只给 n / e / s：左边被移动条占掉了，所以 w 方向不拉伸。
+            -->
+            <template v-if="selEdgeMode">
+              <div class="sel-grip" data-tid="sel-grip" title="拖动（左边这条）">
+                <svg viewBox="0 0 6 10" aria-hidden="true">
+                  <circle cx="1.5" cy="1.5" r="1" /><circle cx="4.5" cy="1.5" r="1" />
+                  <circle cx="1.5" cy="5" r="1" /><circle cx="4.5" cy="5" r="1" />
+                  <circle cx="1.5" cy="8.5" r="1" /><circle cx="4.5" cy="8.5" r="1" />
+                </svg>
+              </div>
+              <div class="sel-edge se-n" data-handle="n" data-tid="sel-edge-n" />
+              <div class="sel-edge se-e" data-handle="e" data-tid="sel-edge-e" />
+              <div class="sel-edge se-s" data-handle="s" data-tid="sel-edge-s" />
+            </template>
+
+            <!-- 手写：8 个角点（整体等比缩放，8 个方向都有意义） -->
+            <template v-else-if="selHandlesVisible">
               <div
                 v-for="h in HANDLES"
                 :key="h"
@@ -2242,6 +2274,71 @@ watch(
   cursor: ew-resize;
 }
 
+/*
+ * 区域高亮 / 方框的「边条」手柄：左侧一条 = 移动，上 / 右 / 下 = 拉伸。
+ *
+ * ⚠️ 全部画在框**内部**。页插槽是 `overflow: hidden`，画到框外会被裁掉一半
+ *    （文本框那条实心蓝条能放框外，是因为它挂在 `.content` 层、根本不在页槽里）。
+ * ⚠️ 用半透明而不是实色：area 本身就是盖在正文上的一层色块，再压一条不透明的
+ *    手柄，用户会看不清自己到底框住了哪些字。hover 时再加深。
+ * ⚠️ `touch-action: none`：触屏上拖手柄不能被浏览器判成 pan（否则一拖页面就滚）。
+ */
+.sel-grip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-strong);
+  opacity: 0.55;
+  cursor: move;
+  touch-action: none;
+}
+.sel-grip:hover {
+  opacity: 1;
+}
+.sel-grip svg {
+  width: 6px;
+  height: 10px;
+  fill: rgba(255, 255, 255, 0.95);
+  pointer-events: none;
+}
+
+.sel-edge {
+  position: absolute;
+  background: var(--accent-strong);
+  opacity: 0.22;
+  touch-action: none;
+}
+.sel-edge:hover {
+  opacity: 0.9;
+}
+/* 上 / 下两条边让开左边那条移动条，免得点边条时被 grip 抢走 */
+.sel-edge.se-n {
+  left: 12px;
+  right: 0;
+  top: 0;
+  height: 10px;
+  cursor: ns-resize;
+}
+.sel-edge.se-e {
+  right: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 10px;
+  cursor: ew-resize;
+}
+.sel-edge.se-s {
+  left: 12px;
+  right: 0;
+  bottom: 0;
+  height: 10px;
+  cursor: ns-resize;
+}
+
 /* 批注工具激活时换光标，给用户一个"现在点下去会画东西"的信号 */
 .viewport.tool-active {
   cursor: crosshair;
@@ -2308,15 +2405,24 @@ watch(
 .te-grip {
   pointer-events: auto;
   position: absolute;
-  left: -16px;
+  left: -18px;
   top: 0;
   bottom: 0;
-  width: 14px;
+  width: 16px;
   background: var(--accent-strong);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: move;
+  /*
+   * 🔴 触屏上**必须**声明 none。
+   *    `.viewport` 是 `touch-action: pan-x pan-y`，手指在这里按下时浏览器会先
+   *    判成 pan → 开始滚页面 + 给我们发 pointercancel，拖动当场断掉。
+   *    症状就是用户报的"移动和拉伸都用不了，都在移动页面"：
+   *    pointerdown 收到了、setPointerCapture 也成功了，但第一下 move 之后就没了。
+   *    （同一类问题在绘图工具上用 `.viewport.tool-drawing` 那段样式解决过。）
+   */
+  touch-action: none;
 }
 .te-grip svg {
   width: 6px;
@@ -2324,19 +2430,39 @@ watch(
   fill: rgba(255, 255, 255, 0.9);
 }
 
-/* 右边圆圈：调宽度 */
+/*
+ * 右边圆圈：调宽度。
+ *
+ * 视觉半径仍是 6px（和原来一样），但**热区放大到 24px** —— 原来的 12px 在触屏上
+ * 根本点不中，手指一偏就落到页面上了。热区用透明盒子做，圆圈用 ::after 画。
+ */
 .te-widen {
   pointer-events: auto;
   position: absolute;
-  right: -6px;
+  /*
+   * 🔴 热区必须**整体在框外**（`right: -24px` + 宽 24px = 左边缘正好贴着框边界）。
+   *    一开始写的是 `right: -12px`，那 24px 的盒子有一半压在可编辑区上 ——
+   *    手指点在框右边缘附近时命中的是 `.te-input`（它在 DOM 里排在后面、盖住热区），
+   *    结果是"光标在动，宽度没变"，用户会以为手柄坏了。
+   *    放到框外就没有歧义：框内 = 放光标，框外那一圈 = 调宽度。
+   */
+  right: -24px;
   top: 50%;
-  width: 12px;
-  height: 12px;
-  margin-top: -6px;
+  width: 24px;
+  height: 24px;
+  margin-top: -12px;
+  background: transparent;
+  cursor: ew-resize;
+  touch-action: none;
+}
+.te-widen::after {
+  content: '';
+  position: absolute;
+  inset: 6px;
+  box-sizing: border-box;
   border-radius: 50%;
   background: var(--surface-2);
   border: 2px solid var(--accent-strong);
-  cursor: ew-resize;
 }
 
 /* 工具条：浮在框上方（所以编辑框必须挂在 .content 上，见模板里的说明） */

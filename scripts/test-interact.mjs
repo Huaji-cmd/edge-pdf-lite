@@ -287,7 +287,14 @@ try {
   const snap = async () => JSON.parse(await evaluate(`JSON.stringify(globalThis.__eplViewer.snapshot())`))
   const annots = async () => JSON.parse(await evaluate(`JSON.stringify(globalThis.__eplViewer.annots())`))
 
-  /** 选中框 + 8 个手柄在**屏幕**上的位置 —— 直接测用户看到和点到的东西 */
+  /**
+   * 选中框 + 手柄在**屏幕**上的位置 —— 直接测用户看到和点到的东西。
+   *
+   * 手柄有两种形态，都走 `data-handle` 协议：
+   *   · `.sel-handle` —— 8 个角点（手写用）
+   *   · `.sel-edge`   —— 上 / 右 / 下三条边条（区域高亮、方框用）
+   * 外加 `.sel-grip`（左边那条 = 平移，没有 data-handle）。
+   */
   const selGeometry = async () =>
     JSON.parse(
       await evaluate(`
@@ -296,14 +303,20 @@ try {
           if (!box) return JSON.stringify(null);
           const r = box.getBoundingClientRect();
           const handles = {};
-          for (const h of document.querySelectorAll('.sel-handle')) {
+          for (const h of document.querySelectorAll('.sel-handle, .sel-edge')) {
             const hr = h.getBoundingClientRect();
             handles[h.dataset.handle] = { x: hr.left + hr.width / 2, y: hr.top + hr.height / 2 };
+          }
+          const gripEl = document.querySelector('.sel-grip');
+          let grip = null;
+          if (gripEl) {
+            const gr = gripEl.getBoundingClientRect();
+            grip = { x: gr.left + gr.width / 2, y: gr.top + gr.height / 2 };
           }
           return JSON.stringify({
             left: r.left, top: r.top, width: r.width, height: r.height,
             cx: r.left + r.width / 2, cy: r.top + r.height / 2,
-            handles, handleCount: Object.keys(handles).length,
+            handles, handleCount: Object.keys(handles).length, grip,
           });
         })()
       `),
@@ -1233,9 +1246,9 @@ try {
   check('撤销把删掉的那条找回来了', countBack === countBefore, `${countAfter} → ${countBack}`)
   await shot('10-delete-undo')
 
-  // ---------------------------------------------------------------- 11. 高亮拖动 + 不变量
+  // ---------------------------------------------------------------- 11. 高亮：选中后只能删
 
-  console.log('\n[11] 拖动高亮（markup）：只能平移，且内容必须待在 /Rect 内')
+  console.log('\n[11] 选中高亮（markup）：**不能拖、不能缩放**，只能删')
   const hl = (await annots()).find((a) => a.kind === 'highlight')
   check('页面上有高亮批注', !!hl)
   if (hl) {
@@ -1246,45 +1259,59 @@ try {
 
     const hg = await selGeometry()
     check(
-      '高亮**不给**改大小手柄（拉伸高亮会脱离原文，没有意义）',
-      !!hg && hg.handleCount === 0,
-      hg ? `手柄=${hg.handleCount}` : 'null',
+      '高亮**一个手柄都不给**（区域高亮/手写才有）',
+      !!hg && hg.handleCount === 0 && !hg.grip,
+      hg ? `手柄=${hg.handleCount} 移动条=${!!hg.grip}` : 'null',
     )
 
+    /*
+     * 🔴 核心判据：拖它一下，**位置必须一点不动**。
+     *
+     * 这是用户明确提的需求 —— markup 的位置由原文决定，拖一下就会盖到别的句子上，
+     * 而且肉眼很难发现（黄底还在，只是不再贴着那行字）。所以这里量的是
+     * "拖完之后 x0/y0/宽/高 全都和拖动前一样"。
+     *
+     * ⚠️ 变异测试过：把 editor.ts 里那两处 `if (isMarkup(...))` 判断删掉，
+     *    这条立刻变红 —— 它卡的是行为，不是形状。
+     */
     const hlBefore = [...hl.rect]
+    const countBefore = (await annots()).length
     await dragOn(hc.x, hc.y, hc.x - 60, hc.y + 26)
+    await sleep(200)
     const hlAfter = (await annots()).find((a) => a.id === hl.id)
+    const countAfter = (await annots()).length
     check(
-      '高亮的 rect 跟着平移了',
-      !!hlAfter && Math.abs(hlAfter.rect[0] - hlBefore[0]) > 5,
+      '拖高亮**完全没有动**（x0/y0/宽/高 全不变）',
+      !!hlAfter &&
+        near(hlAfter.rect[0], hlBefore[0], 0.2) &&
+        near(hlAfter.rect[1], hlBefore[1], 0.2) &&
+        near(hlAfter.rect[2] - hlAfter.rect[0], hlBefore[2] - hlBefore[0], 0.2) &&
+        near(hlAfter.rect[3] - hlAfter.rect[1], hlBefore[3] - hlBefore[1], 0.2),
       hlAfter ? `x0 ${hlBefore[0].toFixed(1)} → ${hlAfter.rect[0].toFixed(1)}pt` : '找不到',
     )
+    check('拖高亮不会顺手多出一条批注', countAfter === countBefore, `${countBefore} → ${countAfter}`)
+    // 拖完仍要选中着 —— 否则用户连工具栏的「删除所选」都没得点
+    check('拖完高亮还选中着（没被顺手取消）', (await snap()).sel?.id === hl.id)
+
     check(
-      '平移后 /Rect 仍然**正好**是 QuadPoints 的包围盒（否则写回 PDF 会被查看器裁掉）',
+      '高亮的 /Rect 仍然**正好**是 QuadPoints 的包围盒（否则写回 PDF 会被查看器裁掉）',
       !!hlAfter && hlAfter.contentInsideRect === true,
       hlAfter ? `inside=${hlAfter.contentInsideRect}` : '',
     )
     const allOk = (await annots()).every((a) => a.contentInsideRect)
     check('所有批注的内容都待在各自 /Rect 内', allOk, allOk ? '全部通过' : '有越界')
 
-    // 页面在同一时刻只能有一个选中框，且 markup 选中时 DOM 里一个手柄都不该有
-    // （截图缩略图上"看着像有手柄"分不清，所以这条用 DOM 数出来）
+    // 页面在同一时刻只能有一个选中框；markup 选中时 DOM 里不该有任何手柄/移动条
     const boxes = await evaluate(`document.querySelectorAll('.sel-box').length`)
-    const handles = await evaluate(`document.querySelectorAll('.sel-handle').length`)
+    const handles = await evaluate(
+      `document.querySelectorAll('.sel-handle, .sel-edge, .sel-grip').length`,
+    )
     check(
-      '全场只有 1 个选中框、且 markup 选中时 0 个手柄',
+      '全场只有 1 个选中框、且 markup 选中时 0 个手柄 / 0 条移动条',
       boxes === 1 && handles === 0,
-      `sel-box=${boxes}, sel-handle=${handles}`,
+      `sel-box=${boxes}, handles=${handles}`,
     )
-    await shot('11-highlight-moved')
-
-    await UNDO()
-    const hlBack = (await annots()).find((a) => a.id === hl.id)
-    check(
-      '拖动高亮也能被撤销',
-      !!hlBack && near(hlBack.rect[0], hlBefore[0], 0.6),
-      hlBack ? `x0 回到 ${hlBack.rect[0].toFixed(1)}pt` : '找不到',
-    )
+    await shot('11-highlight-locked')
   }
 
   // ---------------------------------------------------------------- 12. 控制台
@@ -1419,22 +1446,50 @@ try {
       await tap(ac.x, ac.y)
       const g = await selGeometry()
       check(
-        '区域高亮**给**改大小手柄（它没有依附的文字，框本身就是内容）',
-        !!g && g.handleCount === 8,
-        g ? `手柄=${g.handleCount}` : 'null',
+        '区域高亮选中后是「左移动条 + 上右下三边」（和就地文本框一致）',
+        !!g && !!g.grip && g.handleCount === 3 && !!g.handles.n && !!g.handles.e && !!g.handles.s,
+        g ? `移动条=${!!g.grip} 边条=${Object.keys(g.handles).join(',') || '无'}` : 'null',
+      )
+      check(
+        '区域高亮**不再**给 8 个角点（左边那条已经占了移动）',
+        !!g && !g.handles.nw && !g.handles.ne && !g.handles.sw && !g.handles.w,
+        g ? Object.keys(g.handles).join(',') || '无' : 'null',
       )
 
-      if (g?.handles?.se) {
+      if (g?.handles?.n) {
+        // 上边：往上拖 → 只长高，宽度不变（左边固定）
         const r0 = [...area.rect]
-        await dragOn(g.handles.se.x, g.handles.se.y, g.handles.se.x + 80, g.handles.se.y + 50)
+        await dragOn(g.handles.n.x, g.handles.n.y, g.handles.n.x, g.handles.n.y - 40)
         await sleep(280)
         const r1 = (await annots()).find((a) => a.id === area.id)
         check(
-          '拉手柄能把区域高亮改大',
-          !!r1 && r1.rect[2] - r1.rect[0] > r0[2] - r0[0] + 20,
-          r1 ? `宽 ${(r0[2] - r0[0]).toFixed(0)} → ${(r1.rect[2] - r1.rect[0]).toFixed(0)}pt` : '找不到',
+          '拉上边能把区域高亮拉高，且宽度不变',
+          !!r1 &&
+            r1.rect[3] - r1.rect[1] > r0[3] - r0[1] + 10 &&
+            near(r1.rect[2] - r1.rect[0], r0[2] - r0[0], 0.6),
+          r1
+            ? `高 ${(r0[3] - r0[1]).toFixed(0)} → ${(r1.rect[3] - r1.rect[1]).toFixed(0)}pt；宽 ${(r0[2] - r0[0]).toFixed(0)} → ${(r1.rect[2] - r1.rect[0]).toFixed(0)}pt`
+            : '找不到',
         )
-        await shot('12-area-resized')
+
+        // 左边那条：平移（尺寸必须一动不动）
+        const g2 = await selGeometry()
+        if (g2?.grip) {
+          const r2 = (await annots()).find((a) => a.id === area.id)
+          await dragOn(g2.grip.x, g2.grip.y, g2.grip.x + 26, g2.grip.y + 18)
+          await sleep(280)
+          const r3 = (await annots()).find((a) => a.id === area.id)
+          check(
+            '拖左边那条是**平移**（位置动了、尺寸不变）',
+            !!r2 &&
+              !!r3 &&
+              Math.abs(r3.rect[0] - r2.rect[0]) > 2 &&
+              near(r3.rect[2] - r3.rect[0], r2.rect[2] - r2.rect[0], 0.6) &&
+              near(r3.rect[3] - r3.rect[1], r2.rect[3] - r2.rect[1], 0.6),
+            r3 ? `x0 ${r2.rect[0].toFixed(1)} → ${r3.rect[0].toFixed(1)}pt` : '找不到',
+          )
+        }
+        await shot('12-area-edges')
       }
     }
 

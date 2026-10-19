@@ -593,6 +593,162 @@ try {
   await evaluate(`document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'})); true`)
   await sleep(200)
 
+  // ---------------------------------------------------------------- 6b. 文本框手柄（触屏）
+
+  console.log('\n[6b] 文本框在触屏上的移动 / 拉伸')
+  /*
+   * 用户报的现象："触屏下移动和拉伸都用不了，都是在移动页面。"
+   *
+   * 根因：`.viewport` 是 `touch-action: pan-x pan-y`。手指按在把手上时，浏览器
+   * 先把这一下判成 pan → 开始滚页面，并给页面发 pointercancel，拖动当场断掉。
+   * `preventDefault()` 在 pointerdown 里挡不住这个（touch-action 是**手势开始前**
+   * 的声明，不是拦截），唯一解是给把手自己声明 `touch-action: none`。
+   *
+   * 所以这里量两件事，都能抓住那个 bug：
+   *   ① 把手自己的 computed `touch-action` 是 none（声明对了）；
+   *   ② 用**真实触摸序列**拖它：rect 真的变了。
+   *
+   * ⚠️ 另外还有一条"scrollTop 一点没动"，但**它在 CDP 下是弱判据**：
+   *    `Input.dispatchTouchEvent` 注入的是合成事件，不驱动渲染进程的合成器滚动，
+   *    所以就算把 `touch-action` 拿掉，scrollTop 照样不动（实测变异过）。
+   *    它只在真机上有意义，留在这里是当**回归哨**（真出现了滚动就一定有鬼），
+   *    不能当成"浏览器不会抢手势"的证据 —— 那个证据是 ① 和 ②。
+   */
+  {
+    check('切到「文本框」工具', await toolbarBtn('文本框'))
+    await sleep(200)
+
+    // 取"当前页 ∩ 视口"的中心点 —— 不写死坐标，滚到哪儿都点得中
+    const spot = await evaluate(`
+      (() => {
+        const vp = document.querySelector('.viewport').getBoundingClientRect();
+        for (const el of document.querySelectorAll('.page-slot')) {
+          const r = el.getBoundingClientRect();
+          const left = Math.max(r.left, vp.left), right = Math.min(r.right, vp.right);
+          const top = Math.max(r.top, vp.top), bottom = Math.min(r.bottom, vp.bottom);
+          if (right - left > 120 && bottom - top > 120) {
+            return JSON.stringify({ x: (left + right) / 2, y: (top + bottom) / 2 });
+          }
+        }
+        return JSON.stringify(null);
+      })()
+    `).then((s) => JSON.parse(s))
+    check('找到了一个在视口里的页面区域', !!spot, spot ? `(${Math.round(spot.x)}, ${Math.round(spot.y)})` : 'null')
+
+    if (!spot) throw new Error('没有可点的页面区域，后面的触摸坐标无从谈起')
+
+    // 单指轻点 → 就地建一个空文本框（编辑态自己会出来）
+    /*
+     * ⚠️ 建框点要**往左偏** 170px：框宽 150pt×scale 之后不算窄，再加上右边那个
+     *    圆圈伸出框外 24px —— 建在视口正中时圆点会落到 x≈1273（窗口只有 1280），
+     *    直接出屏，`elementFromPoint` 返回 null。这不是实现 bug，是测试站位不对。
+     */
+    await touchSeq([[{ id: 1, x: spot.x - 170, y: spot.y }]])
+    await sleep(650)
+    check(
+      '触屏点一下就地建出文本框（编辑态打开）',
+      await evaluate(`!!document.querySelector('.text-edit')`),
+    )
+
+    const gripPos = await evaluate(`
+      (() => {
+        const el = document.querySelector('[data-tid="te-grip"]');
+        if (!el) return JSON.stringify(null);
+        const r = el.getBoundingClientRect();
+        return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2 });
+      })()
+    `).then((s) => JSON.parse(s))
+    check('编辑态里出现了「左边移动条」', !!gripPos)
+
+    const taGrip = await evaluate(
+      `(() => { const el = document.querySelector('[data-tid="te-grip"]'); return el ? getComputedStyle(el).touchAction : 'missing'; })()`,
+    )
+    check(
+      '移动条自己声明 touch-action: none（声明缺失浏览器就会抢去滚页面）',
+      taGrip === 'none',
+      `touch-action=${taGrip}`,
+    )
+
+    const before = (await annots()).find((a) => a.kind === 'freetext')
+    if (gripPos && before) {
+      const st0 = await scrollTop()
+      await touchSeq(singlePath(gripPos.x, gripPos.y, gripPos.x + 72, gripPos.y + 52))
+      const st1 = await scrollTop()
+      const after = (await annots()).find((a) => a.id === before.id)
+
+      check(
+        '触屏拖左边那条**能移动文本框**',
+        !!after && Math.abs(after.rect[0] - before.rect[0]) > 8,
+        after ? `x0 ${before.rect[0].toFixed(1)} → ${after.rect[0].toFixed(1)}pt` : '找不到',
+      )
+      check(
+        '拖把手时页面**没有**跟着滚（用户报的就是这个）',
+        Math.abs(st1 - st0) < 2,
+        `scrollTop ${Math.round(st0)} → ${Math.round(st1)}`,
+      )
+    }
+
+    // 右圆圈：调宽度
+    /*
+     * ⚠️ 必须等一下再读坐标：拖完左边那条之后，编辑框的新位置是**异步**算出来的
+     *    （`refreshTextEditBox` 里要 await `doc.getPage()`）。立刻读会拿到旧位置，
+     *    手指于是落在页面上 —— 编辑结束 → 空框被回收 → 后面就"找不到"这条批注了。
+     */
+    await sleep(350)
+    const wPos = await evaluate(`
+      (() => {
+        const el = document.querySelector('[data-tid="te-widen"]');
+        if (!el) return JSON.stringify(null);
+        const r = el.getBoundingClientRect();
+        return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2, box: r.width });
+      })()
+    `).then((s) => JSON.parse(s))
+    check(
+      '右圆圈的热区够手指按（≥20px，原来只有 12px 点不中）',
+      !!wPos && wPos.box >= 20,
+      wPos ? `${Math.round(wPos.box)}px` : 'null',
+    )
+
+    const taWiden = await evaluate(
+      `(() => { const el = document.querySelector('[data-tid="te-widen"]'); return el ? getComputedStyle(el).touchAction : 'missing'; })()`,
+    )
+    check('右圆圈也声明了 touch-action: none', taWiden === 'none', `touch-action=${taWiden}`)
+
+    if (wPos) {
+      const b = (await annots()).find((a) => a.kind === 'freetext')
+      if (b) {
+        const hit = await evaluate(`
+          (() => {
+            const el = document.elementFromPoint(${Math.round(wPos.x)}, ${Math.round(wPos.y)});
+            if (!el) return 'null';
+            const t = el.closest('[data-tid]');
+            return (t ? 'tid=' + t.dataset.tid : 'cls=' + String(el.className)) + ' <' + el.tagName + '>';
+          })()
+        `)
+        // 只在没命中手柄时出声 —— 这行是排查"点了没反应"的抓手
+        if (!hit.includes('te-widen')) {
+          console.log(
+            `     ⚠️ 右圆圈中心 (${Math.round(wPos.x)}, ${Math.round(wPos.y)}) 上命中的是 ${hit}`,
+          )
+        }
+        const w0 = b.rect[2] - b.rect[0]
+        await touchSeq(singlePath(wPos.x, wPos.y, wPos.x + 80, wPos.y))
+        const a2 = (await annots()).find((a) => a.id === b.id)
+        check(
+          '触屏拖右圆圈**能改宽度**',
+          !!a2 && a2.rect[2] - a2.rect[0] > w0 + 15,
+          a2 ? `宽 ${w0.toFixed(0)} → ${(a2.rect[2] - a2.rect[0]).toFixed(0)}pt` : '找不到',
+        )
+      }
+    }
+
+    // 收尾：点页面另一处结束编辑，别把编辑态带进后面的控制台检查
+    await touchSeq([[{ id: 1, x: spot.x + 160, y: spot.y + 200 }]])
+    await sleep(350)
+    check('点空白结束了编辑态', !(await evaluate(`!!document.querySelector('.text-edit')`)))
+    await shot('06b-freetext-handles-touch')
+  }
+
   // ---------------------------------------------------------------- 7. 控制台
 
   console.log('\n[7] 控制台')

@@ -31,6 +31,7 @@ import type {
 import {
   DEFAULT_LINE_WIDTH,
   newAnnotId,
+  isMarkup,
   isMarkupTool,
   isResizable,
   bboxOfQuads,
@@ -190,7 +191,7 @@ export class AnnotEditor {
     this.host.onSelectionChange(id)
   }
 
-  /** 选中的批注是否还能改大小（高亮类只允许平移） */
+  /** 选中的批注能不能改大小（文本标记类两者都不行，只能删） */
   canResizeSelected(): boolean {
     const a = this.selectedId ? this.host.store.get(this.selectedId) : null
     return !!a && isResizable(a)
@@ -539,6 +540,21 @@ export class AnnotEditor {
 
     // 手柄 / 框体：直接进入拖动或改大小
     if (current && (hint.handle || hint.onBody)) {
+      /*
+       * 🔴 文本标记类（高亮 / 下划线 / 删除线）选中后**只能删，不能动**。
+       *
+       * 它们的位置完全由原文决定：拖动会让高亮盖到别的句子上，缩放会把四边形的
+       * 字宽一起拉变形 —— 都是"越修越坏"的操作，而且肉眼很难发现（黄底还在，
+       * 只是不再贴着那行字）。所以这里直接把指针事件吞掉：选中态保持、不进入
+       * manip，用户想调整只能删了重画。
+       *
+       * ⚠️ 只吞指针，不动选中态 —— 否则用户点一下已选中的高亮就变成"取消选中"，
+       *    反而连删除按钮都没了。
+       */
+      if (isMarkup(current)) {
+        e.preventDefault()
+        return
+      }
       const canResize = isResizable(current)
       const kind: 'move' | 'resize' = hint.handle && canResize ? 'resize' : 'move'
       await this.beginManip(e, current, kind, hint.handle)
@@ -565,7 +581,8 @@ export class AnnotEditor {
 
     e.preventDefault()
     this.setSelected(hit.id)
-    await this.beginManip(e, hit, 'move', null)
+    // 标记类只选中、不进入拖动 —— 理由见 pointerDownSelect 里那段说明
+    if (!isMarkup(hit)) await this.beginManip(e, hit, 'move', null)
   }
 
   private async beginManip(
