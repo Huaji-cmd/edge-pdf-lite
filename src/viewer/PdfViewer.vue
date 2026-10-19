@@ -1297,24 +1297,25 @@ function deleteSelected(): void {
   /*
    * 🔴 最后再无条件重绘一次。
    *
-   * 这一句是给"删了还在"兜底的**最后一道**：删除这条路径上会经过
-   * `endTextEdit` → `validateSelection` → `setSelected` 好几个可能提前返回的环节，
-   * 任何一环没接上，`onChange` 就不会带着 `remove` 走到画布这一层
-   * （实测过：`annotLog` 里记到了 `remove`，但批注层的 `lastPath` 停在
-   *  上一次的 `paint list=1` —— 说明 render 压根没被调用）。
+   * 删除经过 `endTextEdit` → `validateSelection` → `setSelected` 好几个可能提前
+   * 返回的环节，任何一环没接上，`onChange` 就不会带着 `remove` 走到画布这一层。
+   * 在"用户明确按了删除"这个**确定事件**上直接把这一页重画一遍，代价只有一次
+   * 重绘，换来的是"删了就是删了"。
    *
-   * 与其在这些链路上一处一处补，不如在"用户明确按了删除"这个**确定事件**上
-   * 直接把这一页重画一遍：数据已经是最新的，画出来一定是对的。
+   * ⚠️ 这里包 try/catch：删除是用户已经下达的意图，重绘失败也不该让界面卡在
+   *    "点了没反应"的状态（画布下一次 render 会自己补回来）。
    */
-  if (pn) {
-    annotLayer?.invalidate(pn, true)
-    void annotLayer?.render(pn, scale.value, true)
+  try {
+    if (annotLayer) {
+      annotLayer.invalidate(pn, true)
+      void annotLayer.render(pn, scale.value, true)
+    }
+  } catch {
+    /* 重绘失败不影响数据已经删掉这件事 */
   }
   ;(globalThis as unknown as Record<string, unknown>).__eplLastDelete = {
     pn,
     ok,
-    selPage: selPage.value,
-    currentPage: currentPage.value,
     left: annotStore.count(),
     scale: scale.value,
   }

@@ -29,6 +29,8 @@ import type { PdfDocument } from '@/viewer/pdfDocument'
 type Layer = 'under' | 'over'
 
 interface Slot {
+  /** 自增 id —— 诊断时用来区分"同一个 slot 还是重挂过的新 slot" */
+  id: number
   el: HTMLElement
   /** 高亮（multiply 混合，染背景） */
   under: HTMLCanvasElement | null
@@ -64,6 +66,7 @@ export class AnnotLayer {
     const prev = this.slots.get(pageNumber)
     if (prev && prev.el === el) return
     this.slots.set(pageNumber, {
+      id: ++this.slotSeq,
       el,
       under: prev?.under ?? null,
       over: prev?.over ?? null,
@@ -160,28 +163,49 @@ export class AnnotLayer {
    */
   /** 每页最后一次 render 走到了哪条分支（诊断用） */
   private lastPath = new Map<number, string>()
+  /** render 的全局调用序号 —— 让"看起来一样"的两次记录能区分开 */
+  private seq = 0
+  private slotSeq = 0
 
   async render(pageNumber: number, scale: number, force = false): Promise<void> {
+    const n = ++this.seq
     const slot = this.slots.get(pageNumber)
     if (!slot) {
-      this.lastPath.set(pageNumber, 'no-slot')
+      this.lastPath.set(pageNumber, `#${n} no-slot`)
       return
     }
 
     const list = [...this.getData(pageNumber), ...this.draftList(pageNumber)]
-    this.lastPath.set(pageNumber, `enter list=${list.length} force=${force}`)
+    const draftId = this.drafts.get(pageNumber)?.id ?? '-'
+    this.lastPath.set(
+      pageNumber,
+      `#${n} enter list=${list.length} force=${force} draft=${draftId}`,
+    )
 
     if (!list.length) {
-      // 没东西可画 → 两层都收掉
+      /*
+       * 🔴 没东西可画 → 两层都收掉。**这里必须 `++slot.token`**。
+       *
+       * 这条分支原来直接 return，没动 token —— 于是"删除前已经出发、还在
+       * `await transformFor()` 里排队"的那个 render 手里的 token 依然是最新的，
+       * 它下面那句 `token !== slot.token` 闸门会**放行**，然后在几百毫秒后把
+       * **删除之前抓到的旧快照**（list=1）画回画布上。
+       *
+       * 用户看到的就是：删掉页面上最后一条批注，字还在原地；再画任何一笔
+       * （触发一次新的 render）它才消失 —— 因为新 render 带的是空快照。
+       *
+       * 判据见 scripts/test-interact.mjs 的 [12b]。
+       */
+      ++slot.token
       const hadOver = !!slot.over
       this.drop(slot, 'under')
       this.drop(slot, 'over')
       slot.renderedScale = 0
-      this.lastPath.set(pageNumber, `drop list=0 hadOver=${hadOver}`)
+      this.lastPath.set(pageNumber, `#${n} drop list=0 hadOver=${hadOver}`)
       return
     }
     if (!force && slot.renderedScale === scale) {
-      this.lastPath.set(pageNumber, `skip same-scale list=${list.length}`)
+      this.lastPath.set(pageNumber, `#${n} skip same-scale list=${list.length}`)
       return
     }
 
@@ -199,18 +223,35 @@ export class AnnotLayer {
         this.drop(slot, 'over')
         slot.renderedScale = 0
       }
-      this.lastPath.set(pageNumber, `abort tf=${!!tf} stale=${token !== slot.token}`)
+      this.lastPath.set(pageNumber, `#${n} abort tf=${!!tf} stale=${token !== slot.token}`)
       return
     }
     if (!slot.el.isConnected) {
-      this.lastPath.set(pageNumber, 'abort detached')
+      this.lastPath.set(pageNumber, `#${n} abort detached`)
       return
     }
 
-    this.paint(slot, 'under', list.filter((a) => blendGroupOf(a) === 'under'), tf)
-    this.paint(slot, 'over', list.filter((a) => blendGroupOf(a) === 'over'), tf)
+    /*
+     * 🔴 **落笔前再取一次数据**。
+     *
+     * 上面那份 `list` 是 `await` 之前抓的：等 transform 的这段时间里用户完全
+     * 可能已经把这条批注删掉了（点删除到真正重绘之间隔了事件循环）。
+     * 拿旧快照去画，等于"画了一条已经不存在的批注"。
+     * token 闸门挡不住这种情况 —— 删除时的 render 走的是空列表分支，压根没抢 token。
+     */
+    const fresh = [...this.getData(pageNumber), ...this.draftList(pageNumber)]
+    if (!fresh.length) {
+      this.drop(slot, 'under')
+      this.drop(slot, 'over')
+      slot.renderedScale = 0
+      this.lastPath.set(pageNumber, `#${n} stale-empty list=0 scale=${scale}`)
+      return
+    }
+
+    this.paint(slot, 'under', fresh.filter((a) => blendGroupOf(a) === 'under'), tf)
+    this.paint(slot, 'over', fresh.filter((a) => blendGroupOf(a) === 'over'), tf)
     slot.renderedScale = scale
-    this.lastPath.set(pageNumber, `paint list=${list.length} scale=${scale}`)
+    this.lastPath.set(pageNumber, `#${n} paint list=${fresh.length} scale=${scale}`)
   }
 
   /** 把一组批注画进指定层；这一层没内容就把 canvas 收掉 */
@@ -228,6 +269,8 @@ export class AnnotLayer {
       slot[layer] = canvas
       slot.el.appendChild(canvas)
     }
+    // 诊断用：测试要区分 under（高亮）/ over（其余）两层
+    canvas.dataset.eplLayer = layer
     if (canvas.width !== pw || canvas.height !== ph) {
       canvas.width = pw
       canvas.height = ph
@@ -250,6 +293,9 @@ export class AnnotLayer {
    */
   debugState(): Array<{
     page: number
+    slotId: number
+    overConnected: boolean
+    underConnected: boolean
     hasUnder: boolean
     hasOver: boolean
     renderedScale: number
@@ -258,9 +304,13 @@ export class AnnotLayer {
     /** 这一页现在有几条要画（含 draft）—— 空的话下次 render 会直接 drop */
     listLen: number
     hasDraft: boolean
+    lastPath: string
   }> {
     return [...this.slots.entries()].map(([pn, s]) => ({
       page: pn,
+      slotId: s.id,
+      overConnected: !!s.over?.isConnected,
+      underConnected: !!s.under?.isConnected,
       hasUnder: !!s.under,
       hasOver: !!s.over,
       renderedScale: s.renderedScale,

@@ -1735,9 +1735,22 @@ try {
   /*
    * 用户的原话："只有在已有批注数为 0 时才会触发；大于 0 时再复现就能正常删除。"
    *
-   * 这条线索直接指向 `AnnotLayer.render` 里唯一一个"list 为空"的分支：
-   *   if (!list.length) { drop(under); drop(over); renderedScale = 0; return }
-   * 之前所有用例的页面上都有 5~6 条批注，从来没进过这条路 —— 所以一直没复现出来。
+   * 根因（诊断流水定死的，不是猜的）：
+   *   #205 render list=1        ← 删除**之前**抓的快照
+   *   invalidate clearNow=true
+   *   #206 render list=0        ← 删除后的重绘：空列表分支，收两层（此刻 slot 里还没画布）
+   *   #207 render list=0
+   *   paint over slot=16 n=1    ← #205 的 await 之后**迟到落地**，把已删的字又画了回去
+   *
+   * `render` 是异步的：它先抓快照、再 `await transformFor()`、最后才落笔。删除瞬间的
+   * 空列表重绘在"抢 token"之前就 return 了，于是 #205 手里的 token 依然是最新的，
+   * 闸门放行 —— 旧快照晚一步把画布刷回去。日志停在这里，也没有任何后续重绘，
+   * 所以字会一直留着，直到用户再画一笔（那才会触发一次带空快照的重绘）。
+   *
+   * 修法两道（都在 AnnotLayer.render）：
+   *   ① 空列表分支也 `++slot.token`，作废在途请求
+   *   ② 落笔前重新取一次数据，`await` 期间被删掉就不画
+   * 判据必须在**两个时间点**都干净：这个 bug 是"晚到一步"才出现的。
    */
   {
     for (let i = 0; i < 40; i++) {
@@ -1780,22 +1793,24 @@ try {
       await evaluate(
         `(() => { document.querySelector('[data-tid="delete-selected"]')?.click(); return true })()`,
       )
-      await sleep(750)
+      await sleep(300)
       check('数据里删掉了（0 条）', (await annots()).length === 0, `${(await annots()).length} 条`)
+      /*
+       * 先量一次"立刻"，再等 1.2 秒量一次"之后" —— 根因是异步快照晚到落地，
+       * 只量一次（尤其是在 750ms 这种刚好卡在中间的时刻）容易碰巧绿。
+       */
+      const pxFast = await colorPixels(ORANGE, 24)
+      await sleep(1200)
       const px1 = await colorPixels(ORANGE, 24)
-      const diag = await evaluate(`
-        JSON.stringify({
-          del: globalThis.__eplLastDelete ?? null,
-          log: globalThis.__eplViewer.annotLog ? globalThis.__eplViewer.annotLog() : 'n/a',
-          page1: (globalThis.__eplViewer.annotSlots?.() ?? []).find(s => s.page === 1) ?? null,
-          annots: globalThis.__eplViewer.annots().length,
-        })
-      `)
-      console.log('     诊断：删除后 →', diag)
       check(
-        '删掉**最后一条**批注时画布也必须干净（用户报的残留）',
+        '删掉最后一条后，画布**立刻**变干净（300ms 内）',
+        pxFast < 20,
+        `${px0} → ${pxFast} px`,
+      )
+      check(
+        '1.2 秒后也不能被迟到的旧快照画回来（这个 bug 的真身）',
         px1 < 20,
-        `${px0} → ${px1} px`,
+        `${px0} → ${pxFast} → ${px1} px`,
       )
       check(
         '编辑框也收起了',
