@@ -1224,21 +1224,34 @@ function pushHistory(): void {
   emit('history-change', { canUndo: canUndo.value, canRedo: canRedo.value })
 }
 
+/** 最近若干次"批注变了→该重绘"的调用记录（诊断"删了不重绘"用） */
+const annotChangeLog: Array<{ pn: number; action: string }> = []
+
 function onAnnotChanged(
   pageNumber: number,
   action?: 'add' | 'remove' | 'update',
 ): void {
-  pushAnnotCount()
-  validateSelection()
+  annotChangeLog.push({ pn: pageNumber, action: action ?? 'none' })
+  if (annotChangeLog.length > 20) annotChangeLog.shift()
+
   /*
-   * 🔴 `remove` 要**同步清画布**（`clearNow`），不能只靠下面那句异步重绘。
-   *    重绘里有三处静默 return（拿不到 transform / 被新请求顶掉 / slot 脱离 DOM），
-   *    撞上任何一条，被删掉的那条就会留在屏幕上 —— 用户报的"删了还在、点不着、
-   *    刷新才消失"就是这个形态。删除只会让内容变少，先清空再重画是安全的。
+   * 🔴 **重绘排在最前面**，顺序不能反。
+   *
+   * 用户报的"删了还在、点不着、刷新才消失"，根因就在这里：原来的顺序是
+   *   pushAnnotCount() → validateSelection() → invalidate → render
+   * 前两步是"顺带同步一下 UI"（更新计数、校验选中态），可它们会往下走
+   * `emit` / `setSelected` / `endTextEdit` 那一整条链路。只要那条链路上有任何一步
+   * 抛了异常（或者提前 return 掉的路径），**后面的 invalidate + render 就一起没了** ——
+   * 数据已经删了，画布却停在旧内容上。
+   *
+   * 数据变了、画布必须跟着变，这件事的优先级高于 UI 同步，所以放到最前面。
+   * `annotChangeLog` 能证明：`remove` 这条记录进来了，但 `render` 一次都没执行。
    */
   annotLayer?.invalidate(pageNumber, action === 'remove')
-  // 删除时连 `renderedScale === scale` 的早退也要跳过 —— 见 AnnotLayer.render 的 force
   void annotLayer?.render(pageNumber, scale.value, action === 'remove')
+
+  pushAnnotCount()
+  validateSelection()
 }
 
 function undoAnnot(): void {
@@ -1250,6 +1263,11 @@ function redoAnnot(): void {
 }
 
 function deleteSelected(): void {
+  /*
+   * ⚠️ 先把页码记下来：`removeSelected()` 里会 `setSelected(null)`，
+   *    之后 `selPage` 就归零了。
+   */
+  const pn = selPage.value || currentPage.value
   const ok = annotEditor?.removeSelected() ?? false
 
   /*
@@ -1258,18 +1276,12 @@ function deleteSelected(): void {
    * 用户报过：文本框在编辑态（工具条/虚线框/蓝条都在），点工具栏的删除按钮
    * **毫无反应** —— 编辑框和字原样留着。那条路径上 `removeSelected()` 提前返回了，
    * 于是后面的 `onChange` 根本没发生，删除变成了一次静默的空操作。
-   *
-   * 这里退一步，用**宿主自己记的 `selId`** 再删一次；删不掉也要把编辑态收起 ——
-   * 绝不能留下"看得见、点不着、删不掉"的幽灵。
    */
   if (!ok) {
     const id = selId.value
     const a = id ? annotStore.get(id) : null
     if (a) {
-      const pn = a.pageNumber
       annotStore.remove(a.id)
-      annotLayer?.invalidate(pn, true)
-      void annotLayer?.render(pn, scale.value, true)
       emit('annot-count', annotStore.count())
       emit('history-change', { canUndo: annotStore.canUndo(), canRedo: annotStore.canRedo() })
     }
@@ -1280,6 +1292,31 @@ function deleteSelected(): void {
       textEditAnnotRef.value = null
       textEditBefore = null
     }
+  }
+
+  /*
+   * 🔴 最后再无条件重绘一次。
+   *
+   * 这一句是给"删了还在"兜底的**最后一道**：删除这条路径上会经过
+   * `endTextEdit` → `validateSelection` → `setSelected` 好几个可能提前返回的环节，
+   * 任何一环没接上，`onChange` 就不会带着 `remove` 走到画布这一层
+   * （实测过：`annotLog` 里记到了 `remove`，但批注层的 `lastPath` 停在
+   *  上一次的 `paint list=1` —— 说明 render 压根没被调用）。
+   *
+   * 与其在这些链路上一处一处补，不如在"用户明确按了删除"这个**确定事件**上
+   * 直接把这一页重画一遍：数据已经是最新的，画出来一定是对的。
+   */
+  if (pn) {
+    annotLayer?.invalidate(pn, true)
+    void annotLayer?.render(pn, scale.value, true)
+  }
+  ;(globalThis as unknown as Record<string, unknown>).__eplLastDelete = {
+    pn,
+    ok,
+    selPage: selPage.value,
+    currentPage: currentPage.value,
+    left: annotStore.count(),
+    scale: scale.value,
   }
 
   pushAnnotCount()
@@ -1714,6 +1751,10 @@ onMounted(() => {
   // 光看现象猜不出来，必须能直接读到 wantKey / doneKey / runningKey。
   // scripts/test-viewer.mjs 用它做断言。
   ;(globalThis as unknown as Record<string, unknown>).__eplViewer = {
+    /** 批注浮层的 slot 状态（诊断"删了还在"这类问题用） */
+    annotSlots: () => annotLayer?.debugState() ?? null,
+    /** 最近几次 onAnnotChanged 的调用（有没有进来、带了什么 action） */
+    annotLog: () => annotChangeLog.slice(),
     snapshot: () => {
       const a = selId.value ? annotStore.get(selId.value) : null
       return {

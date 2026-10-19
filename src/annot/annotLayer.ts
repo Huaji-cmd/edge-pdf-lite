@@ -158,20 +158,32 @@ export class AnnotLayer {
    * `force` 跳过 `renderedScale === scale` 的早退。**删除**时一定要传 ——
    * 早退本来是省一次重复绘制的优化，但在删除语义下它会变成"该重画却没重画"。
    */
+  /** 每页最后一次 render 走到了哪条分支（诊断用） */
+  private lastPath = new Map<number, string>()
+
   async render(pageNumber: number, scale: number, force = false): Promise<void> {
     const slot = this.slots.get(pageNumber)
-    if (!slot) return
+    if (!slot) {
+      this.lastPath.set(pageNumber, 'no-slot')
+      return
+    }
 
     const list = [...this.getData(pageNumber), ...this.draftList(pageNumber)]
+    this.lastPath.set(pageNumber, `enter list=${list.length} force=${force}`)
 
     if (!list.length) {
       // 没东西可画 → 两层都收掉
+      const hadOver = !!slot.over
       this.drop(slot, 'under')
       this.drop(slot, 'over')
       slot.renderedScale = 0
+      this.lastPath.set(pageNumber, `drop list=0 hadOver=${hadOver}`)
       return
     }
-    if (!force && slot.renderedScale === scale) return
+    if (!force && slot.renderedScale === scale) {
+      this.lastPath.set(pageNumber, `skip same-scale list=${list.length}`)
+      return
+    }
 
     const token = ++slot.token
     const tf = await this.transformFor(pageNumber, scale)
@@ -187,13 +199,18 @@ export class AnnotLayer {
         this.drop(slot, 'over')
         slot.renderedScale = 0
       }
+      this.lastPath.set(pageNumber, `abort tf=${!!tf} stale=${token !== slot.token}`)
       return
     }
-    if (!slot.el.isConnected) return
+    if (!slot.el.isConnected) {
+      this.lastPath.set(pageNumber, 'abort detached')
+      return
+    }
 
     this.paint(slot, 'under', list.filter((a) => blendGroupOf(a) === 'under'), tf)
     this.paint(slot, 'over', list.filter((a) => blendGroupOf(a) === 'over'), tf)
     slot.renderedScale = scale
+    this.lastPath.set(pageNumber, `paint list=${list.length} scale=${scale}`)
   }
 
   /** 把一组批注画进指定层；这一层没内容就把 canvas 收掉 */
@@ -222,6 +239,37 @@ export class AnnotLayer {
   async renderAll(scale: number): Promise<void> {
     const pns = [...this.slots.keys()]
     await Promise.all(pns.map((pn) => this.render(pn, scale)))
+  }
+
+  /**
+   * 只读诊断：每页的 slot 状态。
+   *
+   * 存在的理由：出现过「最后一条批注删掉后，画布上的字还在」——
+   * 那条分支（`list` 为空 → drop 两层）只在**这一页还有 slot** 时才会执行，
+   * 光看 DOM 分不清是"没重绘"还是"slot 根本不在了"。测试直接读这里。
+   */
+  debugState(): Array<{
+    page: number
+    hasUnder: boolean
+    hasOver: boolean
+    renderedScale: number
+    token: number
+    connected: boolean
+    /** 这一页现在有几条要画（含 draft）—— 空的话下次 render 会直接 drop */
+    listLen: number
+    hasDraft: boolean
+  }> {
+    return [...this.slots.entries()].map(([pn, s]) => ({
+      page: pn,
+      hasUnder: !!s.under,
+      hasOver: !!s.over,
+      renderedScale: s.renderedScale,
+      token: s.token,
+      connected: s.el.isConnected,
+      listLen: this.getData(pn).length,
+      hasDraft: this.drafts.has(pn),
+      lastPath: this.lastPath.get(pn) ?? '', 
+    }))
   }
 
   destroy(): void {

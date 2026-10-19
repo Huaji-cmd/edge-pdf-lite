@@ -1731,6 +1731,80 @@ try {
     await hotkey('Escape', 27)
     await sleep(150)
   }
+  // ---- 12b. 用户给的最小复现：**页面上一条批注都没有**时，新建文本框再删
+  /*
+   * 用户的原话："只有在已有批注数为 0 时才会触发；大于 0 时再复现就能正常删除。"
+   *
+   * 这条线索直接指向 `AnnotLayer.render` 里唯一一个"list 为空"的分支：
+   *   if (!list.length) { drop(under); drop(over); renderedScale = 0; return }
+   * 之前所有用例的页面上都有 5~6 条批注，从来没进过这条路 —— 所以一直没复现出来。
+   */
+  {
+    for (let i = 0; i < 40; i++) {
+      if ((await annots()).length === 0) break
+      await UNDO()
+      await sleep(120)
+    }
+    check(
+      '批注已经清成 0 条（复现的前提）',
+      (await annots()).length === 0,
+      `${(await annots()).length} 条`,
+    )
+
+    check('切到「文字」工具', await toolbarBtn('文字'))
+    await sleep(200)
+    await tap(box.x + box.w * 0.4, box.y + Math.min(box.h * 0.3, 240))
+    await sleep(520)
+    await send('Input.insertText', { text: '唯一一条批注' })
+    await sleep(320)
+    // 橙色：页面上不会有别的橙，数像素不会混
+    if (!(await uiTextColor()).open) await tapEl('[data-tid="te-color"]')
+    await sleep(200)
+    await tapEl('.te-swatches .te-sw:nth-child(2)')
+    await sleep(260)
+    await tapEl('[data-tid="te-color"]')
+    // 点空白结束编辑 → 这时才会画到画布上
+    await tap(box.x + 26, box.y + 26)
+    await sleep(520)
+
+    const ORANGE = [255, 153, 38]
+    const px0 = await colorPixels(ORANGE, 24)
+    check('字已经画到画布上（橙色像素 > 0）', px0 > 60, `${px0} px`)
+
+    const only = (await annots())[0]
+    check('现在页面上正好 1 条批注', (await annots()).length === 1 && !!only)
+    if (only) {
+      const c = await centerOf(only.id)
+      await tap(c.x, c.y)
+      await sleep(380)
+      await evaluate(
+        `(() => { document.querySelector('[data-tid="delete-selected"]')?.click(); return true })()`,
+      )
+      await sleep(750)
+      check('数据里删掉了（0 条）', (await annots()).length === 0, `${(await annots()).length} 条`)
+      const px1 = await colorPixels(ORANGE, 24)
+      const diag = await evaluate(`
+        JSON.stringify({
+          del: globalThis.__eplLastDelete ?? null,
+          log: globalThis.__eplViewer.annotLog ? globalThis.__eplViewer.annotLog() : 'n/a',
+          page1: (globalThis.__eplViewer.annotSlots?.() ?? []).find(s => s.page === 1) ?? null,
+          annots: globalThis.__eplViewer.annots().length,
+        })
+      `)
+      console.log('     诊断：删除后 →', diag)
+      check(
+        '删掉**最后一条**批注时画布也必须干净（用户报的残留）',
+        px1 < 20,
+        `${px0} → ${px1} px`,
+      )
+      check(
+        '编辑框也收起了',
+        !(await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`)),
+      )
+      await shot('12b-last-annot-deleted')
+    }
+  }
+
   console.log('\n[13] 控制台')
   check(
     '没有未捕获异常 / error',
