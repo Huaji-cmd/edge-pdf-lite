@@ -527,6 +527,29 @@ export class AnnotEditor {
       created: nowIso(),
       modified: nowIso(),
     }
+    /*
+     * 去重：**同一页、同一类型、几乎同一个四边形** 已经有一条了，就别再叠一条。
+     *
+     * 为什么需要：用户报过"有时候出现双下划线"。除了"一行被拆成多个高度不同的
+     * quad"（那个在 textSelect 里对齐修掉了），另一个成因是**同一次划选被提交了两次**
+     * （触屏的手指 + 笔、或 pointerup 与 touch 路径交叠）—— 两条批注完全重合，
+     * 画出来就是一条更粗、边缘带重影的线。
+     * 叠两条一模一样的下划线对用户没有任何意义，所以这里直接丢弃。
+     */
+    const dup = this.host.store
+      .list(loc.pageNumber)
+      .some(
+        (b) =>
+          isMarkup(b) &&
+          b.kind === kind &&
+          b.quads.length === annot.quads.length &&
+          b.quads.every((v, i) => Math.abs(v - annot.quads[i]!) < 0.5),
+      )
+    if (dup) {
+      clearSelection()
+      return
+    }
+
     this.host.store.add(annot)
     clearSelection()
     this.host.onChange(loc.pageNumber, 'add')

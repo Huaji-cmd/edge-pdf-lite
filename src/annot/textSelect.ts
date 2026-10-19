@@ -19,6 +19,14 @@
 
 import type { PageTransform } from './coords'
 
+/** 一行里的一个矩形（页内 CSS 坐标） */
+interface Box {
+  l: number
+  t: number
+  r: number
+  b: number
+}
+
 export interface HarvestResult {
   /** Z 序四边形，页面坐标，每 8 个数一个 */
   quads: number[]
@@ -50,23 +58,68 @@ export function harvestSelection(
   const rects = Array.from(range.getClientRects()).filter((r) => r.width > 0.5 && r.height > 0.5)
   if (!rects.length) return null
 
-  const quads: number[] = []
-  let minX = Infinity
-  let minY = Infinity
-  let maxX = -Infinity
-  let maxY = -Infinity
-
+  /*
+   * ① 先收集矩形（页内 CSS 坐标）。
+   *
+   * ② 再把**同一行的矩形对齐到同一组上下边**。
+   *
+   * 🔴 为什么必须对齐：`getClientRects()` 会把一行里跨 span 的选区拆成多个矩形，
+   *    而不同 span 的**行盒高度可能不同**（粗体、不同字号、上下标）。
+   *    各自按自己的 bottom 画下划线 → 同一条视觉行上出现**两条平行的线**，
+   *    用户看到的就是"有时候会出现双下划线"（实测报过）。
+   *    对齐之后每行的 quad 高度一致，下划线 / 删除线只会有一条。
+   *
+   * 判"同一行"用**垂直重叠超过较矮者的一半**：正常行间距 ≥ 一个行高，相邻行
+   * 不会误并；而同一行里的上下标行盒是明显重叠的。
+   */
+  const boxes: Box[] = []
   for (const r of rects) {
     const l = r.left - slotRect.left
     const t = r.top - slotRect.top
     const rr = r.right - slotRect.left
     const b = r.bottom - slotRect.top
     if (rr <= l || b <= t) continue
+    boxes.push({ l, t, r: rr, b })
+  }
+  if (!boxes.length) return null
 
-    const tl = tf.toPage(l, t)
-    const tr = tf.toPage(rr, t)
-    const bl = tf.toPage(l, b)
-    const br = tf.toPage(rr, b)
+  const seen = new Array<boolean>(boxes.length).fill(false)
+  for (let i = 0; i < boxes.length; i++) {
+    if (seen[i]) continue
+    seen[i] = true
+    const group = [i]
+    for (let j = i + 1; j < boxes.length; j++) {
+      if (seen[j]) continue
+      const A = boxes[i]!
+      const B = boxes[j]!
+      const overlap = Math.min(A.b, B.b) - Math.max(A.t, B.t)
+      const minH = Math.min(A.b - A.t, B.b - B.t)
+      if (minH > 0 && overlap > minH * 0.5) {
+        group.push(j)
+        seen[j] = true
+      }
+    }
+    if (group.length < 2) continue
+    // 整组取并集 —— 一行只留一组上下边
+    const t = Math.min(...group.map((k) => boxes[k]!.t))
+    const b = Math.max(...group.map((k) => boxes[k]!.b))
+    for (const k of group) {
+      boxes[k]!.t = t
+      boxes[k]!.b = b
+    }
+  }
+
+  const quads: number[] = []
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+
+  for (const bx of boxes) {
+    const tl = tf.toPage(bx.l, bx.t)
+    const tr = tf.toPage(bx.r, bx.t)
+    const bl = tf.toPage(bx.l, bx.b)
+    const br = tf.toPage(bx.r, bx.b)
 
     // Z 序：左上 → 右上 → 左下 → 右下
     quads.push(tl[0], tl[1], tr[0], tr[1], bl[0], bl[1], br[0], br[1])

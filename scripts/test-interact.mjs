@@ -1343,8 +1343,72 @@ try {
     await sleep(300)
   }
 
-  // ---------------------------------------------------------------- 11. 高亮：选中后只能删
+  /*
+   * ---- 10b. 用户报的：**文本框**选中后点工具栏删除，字还在、点不着 ----------------
+   *
+   * 为什么 [10] 抓不到：[10] 删的是手写（不在编辑态）。而文本框**一被选中就进编辑态**，
+   * 走的是另一条状态机：
+   *   removeSelected → setSelected(null) → onSelectionChange(null) → endTextEdit()
+   *   （它会 textEditId=null、提交历史、重绘一次）→ 然后才 store.remove
+   *
+   * ⚠️ 关键：编辑态下画布**不画**这个文本框（getData 里排除了 textEditId），
+   *    所以用户看到的"字还在"**不是画布残影，是 `.te-input` 那个编辑框 DOM 没收起**。
+   *    判据必须查 DOM，查像素会恒真（编辑态本来就没画）。
+   */
+  {
+    check('切到「文字」工具（建一个待删的文本框）', await toolbarBtn('文字'))
+    await sleep(200)
+    const ftx = box.x + box.w * 0.42
+    const fty = box.y + Math.min(box.h * 0.3, 260)
+    await tap(ftx, fty)
+    await sleep(520)
+    await send('Input.insertText', { text: '删除测试文本' })
+    await sleep(300)
 
+    // 点页面左上角的空白结束编辑（位置要留在页面内、又不压到刚才那行字）
+    await tap(box.x + 26, box.y + 26)
+    await sleep(500)
+    check('编辑框先收起了（删除前的前提）', !(await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`)))
+
+    const ftDel = (await annots()).filter((a) => a.kind === 'freetext').pop()
+    check('找得到刚建的那个文本框', !!ftDel, ftDel ? `id=${ftDel.id.slice(0, 8)}` : 'null')
+    if (ftDel) {
+      const c = await centerOf(ftDel.id)
+      await tap(c.x, c.y)
+      await sleep(400)
+      check(
+        '选中文本框后进入编辑态（这就是用户点删除前的状态）',
+        await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`),
+      )
+
+      // 用户是点工具栏右上角那个垃圾桶
+      await evaluate(
+        `(() => { document.querySelector('[data-tid="delete-selected"]')?.click(); return true })()`,
+      )
+      await sleep(700)
+
+      check(
+        '文本框从数据里删掉了',
+        !(await annots()).some((a) => a.id === ftDel.id),
+        `剩下 ${(await annots()).filter((a) => a.kind === 'freetext').length} 个文本框`,
+      )
+      /*
+       * 🔴 这条是本轮的核心：编辑框 DOM 必须一起收起。
+       *    没收起的话，用户看到的就是"字还在、但点不着"——因为 `currentFreeText()`
+       *    已经返回 null，往那个 contenteditable 里打字什么也不会发生。
+       */
+      check(
+        '删除后编辑框必须收起（DOM 里不能还留着 .text-edit）',
+        !(await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`)),
+        (await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`))
+          ? '★ .text-edit 还在 —— 用户看到的就是这个'
+          : '已收起',
+      )
+      await shot('10b-freetext-deleted')
+    }
+  }
+
+  // ---------------------------------------------------------------- 11. 高亮：选中后只能删
   console.log('\n[11] 选中高亮（markup）：**不能拖、不能缩放**，只能删')
   const hl = (await annots()).find((a) => a.kind === 'highlight')
   check('页面上有高亮批注', !!hl)
