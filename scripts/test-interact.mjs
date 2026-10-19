@@ -775,6 +775,50 @@ try {
   check('就地出现了编辑框', await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`))
   check('左边是拖动用的实心条', await evaluate(`!!document.querySelector('[data-tid="te-grip"]')`))
   check('右边是调宽度的圆圈', await evaluate(`!!document.querySelector('[data-tid="te-widen"]')`))
+  /*
+   * 右边那个圆圈的**位置**和**热区**。
+   *
+   * ⚠️ 两条都是用户实测报回来的：
+   *    · "圆圈错位了，在文本框外面" —— 上一版把热区整体推到框外，视觉圆跟着跑了 12px；
+   *    · "手感依然不好，经常点不到" —— 热区只有 12px，而且压在编辑区上的那半边
+   *      会被 `.te-input`（DOM 里排在后面）抢走，于是那一下变成"放光标"。
+   * 所以量三件事：圆心**落在框边界上**、热区够大、热区往框内探几像素并且 z-index 压过输入区。
+   */
+  const circleGeo = JSON.parse(
+    await evaluate(`(() => {
+      const el = document.querySelector('[data-tid="te-widen"]');
+      const box = document.querySelector('[data-tid="text-edit"]');
+      if (!el || !box) return JSON.stringify(null);
+      const er = el.getBoundingClientRect(), br = box.getBoundingClientRect();
+      // 看得见的那个圆是 ::after；它的 left 相对 el 的 padding box
+      const cs = getComputedStyle(el, '::after');
+      const w = parseFloat(cs.width) || 0;
+      const left = parseFloat(cs.left) || 0;
+      return JSON.stringify({
+        circleCx: er.left + left + w / 2,
+        boxRight: br.right,
+        hitW: er.width,
+        hitH: er.height,
+        inside: br.right - er.left,
+        z: getComputedStyle(el).zIndex,
+      });
+    })()`),
+  )
+  check(
+    '右边的圆圈**圆心落在框边界上**（不是浮在框外）',
+    !!circleGeo && Math.abs(circleGeo.circleCx - circleGeo.boxRight) <= 1.5,
+    circleGeo ? `圆心偏离框右边界 ${(circleGeo.circleCx - circleGeo.boxRight).toFixed(1)}px` : 'null',
+  )
+  check(
+    '圆圈热区够手指按（≈38×44，不是原来的 12px）',
+    !!circleGeo && circleGeo.hitW >= 36 && circleGeo.hitH >= 40,
+    circleGeo ? `${Math.round(circleGeo.hitW)}×${Math.round(circleGeo.hitH)}px` : 'null',
+  )
+  check(
+    '热区往框内探了几像素且压过 .te-input（否则按在圆上会被抢成"放光标"）',
+    !!circleGeo && circleGeo.inside >= 3 && circleGeo.inside <= 10 && Number(circleGeo.z) > 0,
+    circleGeo ? `压进 ${circleGeo.inside.toFixed(1)}px，z-index=${circleGeo.z}` : 'null',
+  )
   check(
     '其余三边是虚线（左边被实心条占掉，所以左边无边框）',
     await evaluate(`(() => {

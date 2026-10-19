@@ -2423,6 +2423,24 @@ watch(
    *    （同一类问题在绘图工具上用 `.viewport.tool-drawing` 那段样式解决过。）
    */
   touch-action: none;
+  /* 盖住编辑区 —— 热区往框内探的那几像素才点得到（见下面的 ::after） */
+  z-index: 2;
+}
+
+/*
+ * 移动条的热区往四周扩（**视觉条仍然是 16px，一点没变**）。
+ *
+ * 用户反馈"经常点不到"：手指按在视觉条上时，落点常常偏进框内几像素，
+ * 而那里是 `.te-input` → 变成了"在放光标"。伪元素扩出来的部分，事件仍然算在
+ * `.te-grip` 上，配合 `z-index: 2` 就接得住。
+ */
+.te-grip::after {
+  content: '';
+  position: absolute;
+  top: -8px;
+  bottom: -8px;
+  left: -6px;
+  right: -6px;
 }
 .te-grip svg {
   width: 6px;
@@ -2440,25 +2458,38 @@ watch(
   pointer-events: auto;
   position: absolute;
   /*
-   * 🔴 热区必须**整体在框外**（`right: -24px` + 宽 24px = 左边缘正好贴着框边界）。
-   *    一开始写的是 `right: -12px`，那 24px 的盒子有一半压在可编辑区上 ——
-   *    手指点在框右边缘附近时命中的是 `.te-input`（它在 DOM 里排在后面、盖住热区），
-   *    结果是"光标在动，宽度没变"，用户会以为手柄坏了。
-   *    放到框外就没有歧义：框内 = 放光标，框外那一圈 = 调宽度。
+   * 热区 = **框内 6px ~ 框外 32px**，高 44px（手指按得中）。
+   * 计算：`right:-32` + `width:38` → 左边缘 = 框右 − 6px。
+   *
+   * ⚠️ 为什么允许压进框内 6px：
+   *    视觉圆本来就跨在框边界上（内 6 / 外 6），手指按上去时落点很可能在框内那半边。
+   *    上一版把热区整体推到框外，结果**点了没反应**（那一下落到 `.te-input` 上，
+   *    变成放光标）—— 用户的原话是"经常点不到"。
+   *    `.te-input` 在 DOM 里排在后面、层叠更高，所以必须靠 z-index 才盖得过它。
    */
-  right: -24px;
+  right: -32px;
   top: 50%;
-  width: 24px;
-  height: 24px;
-  margin-top: -12px;
+  width: 38px;
+  height: 44px;
+  margin-top: -22px;
   background: transparent;
   cursor: ew-resize;
   touch-action: none;
+  z-index: 2;
 }
+/*
+ * 视觉圆**中心落在框边界上**（和"改成框外"之前一模一样）。
+ * 热区左边缘 = 框右 − 6px，所以 `left: 0` 正好让 12px 的圆从 −6 铺到 +6。
+ * 上一版错位就是因为把 `inset: 6px` 相对一个整体在框外的盒子定位了。
+ */
 .te-widen::after {
   content: '';
   position: absolute;
-  inset: 6px;
+  left: 0;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  margin-top: -6px;
   box-sizing: border-box;
   border-radius: 50%;
   background: var(--surface-2);
@@ -2471,6 +2502,8 @@ watch(
   position: absolute;
   left: 0;
   bottom: calc(100% + 6px);
+  /* 压在右圆圈之上：那个热区有 44px 高，会探到工具条下边缘 */
+  z-index: 3;
   display: flex;
   align-items: center;
   gap: 4px;
