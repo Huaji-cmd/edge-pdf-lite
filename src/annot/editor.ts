@@ -209,7 +209,17 @@ export class AnnotEditor {
   /** 删除选中的批注（可撤销） */
   removeSelected(): boolean {
     const a = this.selectedId ? this.host.store.get(this.selectedId) : null
-    if (!a) return false
+    if (!a) {
+      /*
+       * ⚠️ 查不到也要**把选中态清掉**，不能直接 return。
+       *    用户报过"文本框在编辑态，点删除按钮毫无反应，框和字都留着"：
+       *    界面（宿主的 selId / 编辑框）和这里的 selectedId 一旦不同步，
+       *    原样返回就会留下一个"看得见、点不着、也删不掉"的幽灵。
+       *    清掉选中态，宿主那边的 validateSelection 才有机会把编辑框一起收起。
+       */
+      this.setSelected(null)
+      return false
+    }
     const pn = a.pageNumber
     this.setSelected(null)
     if (!this.host.store.remove(a.id)) return false
@@ -564,17 +574,17 @@ export class AnnotEditor {
     // 手柄 / 框体：直接进入拖动或改大小
     if (current && (hint.handle || hint.onBody)) {
       /*
-       * 🔴 文本标记类（高亮 / 下划线 / 删除线）选中后**只能删，不能动**。
+       * 🔴 选中后**不能拖动、也不能缩放**的批注：文本标记类（高亮/下划线/删除线）
+       * 和**手写**。
        *
-       * 它们的位置完全由原文决定：拖动会让高亮盖到别的句子上，缩放会把四边形的
-       * 字宽一起拉变形 —— 都是"越修越坏"的操作，而且肉眼很难发现（黄底还在，
-       * 只是不再贴着那行字）。所以这里直接把指针事件吞掉：选中态保持、不进入
-       * manip，用户想调整只能删了重画。
+       * 标记类的位置由原文决定，拖一下就会盖到别的句子上；
+       * 手写则是"一笔画下去就是那个样子"，缩放会把笔画连同线宽一起拉变形。
+       * 两者都是"越修越坏"的操作，用户明确要求：选中只能删。
        *
-       * ⚠️ 只吞指针，不动选中态 —— 否则用户点一下已选中的高亮就变成"取消选中"，
+       * ⚠️ 只吞指针，不动选中态 —— 否则用户点一下已选中的批注就变成"取消选中"，
        *    反而连删除按钮都没了。
        */
-      if (isMarkup(current)) {
+      if (isLocked(current)) {
         e.preventDefault()
         return
       }
@@ -604,8 +614,8 @@ export class AnnotEditor {
 
     e.preventDefault()
     this.setSelected(hit.id)
-    // 标记类只选中、不进入拖动 —— 理由见 pointerDownSelect 里那段说明
-    if (!isMarkup(hit)) await this.beginManip(e, hit, 'move', null)
+    // 锁定类（标记 / 手写）只选中、不进入拖动 —— 理由见 pointerDownSelect 里那段说明
+    if (!isLocked(hit)) await this.beginManip(e, hit, 'move', null)
   }
 
   private async beginManip(
@@ -772,6 +782,19 @@ export class AnnotEditor {
 
 function sameColor(a: Rgb, b: Rgb): boolean {
   return Math.abs(a[0] - b[0]) < 1e-3 && Math.abs(a[1] - b[1]) < 1e-3 && Math.abs(a[2] - b[2]) < 1e-3
+}
+
+/**
+ * 选中后**不能拖动、也不能缩放**的批注。
+ *
+ * · 文本标记类（高亮/下划线/删除线）：位置由原文决定，拖了就会盖到别的句子上；
+ * · 手写：一笔画下去就是那个样子，缩放会把笔画和线宽一起拉变形。
+ *
+ * 两者的共同点是"改了就比不改更糟，而且很难看出改过"。用户明确要求：
+ * 选中只能删，要调整就删了重画。
+ */
+export function isLocked(a: Annotation): boolean {
+  return isMarkup(a) || a.kind === 'ink'
 }
 
 /** 手柄列表（对外暴露，供宿主渲染 DOM） */

@@ -12,7 +12,7 @@ import {
 import type { PageSize, ViewMode } from './types'
 import { AnnotationStore } from '@/annot/store'
 import { AnnotLayer } from '@/annot/annotLayer'
-import { AnnotEditor, HANDLES } from '@/annot/editor'
+import { AnnotEditor } from '@/annot/editor'
 import type { HandleId } from '@/annot/geometry'
 import type {
   ToolKind,
@@ -148,19 +148,13 @@ const selEdgeMode = computed(() => {
   return !!a && (a.kind === 'area' || a.kind === 'rect')
 })
 
-/**
- * 要不要画那 8 个角点手柄。
- *
- * ⚠️ 现在只剩**手写**用它：手写的缩放是整体等比变形（笔画跟着缩），
- *    8 个方向都有意义，也没有"文字会错位"的顾虑。
- *    · 文本标记类（高亮/下划线/删除线）：**一个手柄都没有**，选中后只能删；
- *    · area / rect：走 `selEdgeMode` 那套；
- *    · 文本框：有自己的 Chrome（左实心条 + 右圆圈），再叠一层会两边打架。
+/*
+ * 8 角点手柄**已经全部取消了**（2026-10-19），别再"补"回来：
+ *   · 文本标记类 + 手写 → 选中后只能删（见 editor.ts 的 isLocked），
+ *     给手柄等于给一个"能把它拉坏"的入口；
+ *   · area / rect → 用「左移动条 + 上/右/下三边」（`selEdgeMode`）；
+ *   · 文本框 → 自己的 Chrome（左实心条 + 右圆圈）。
  */
-const selHandlesVisible = computed(() => {
-  const a = selId.value ? annotStore.get(selId.value) : null
-  return !!a && a.kind === 'ink'
-})
 
 /** 选中框本体：文本框不画（编辑态自己有框） */
 const selBoxVisible = computed(() => {
@@ -1256,7 +1250,38 @@ function redoAnnot(): void {
 }
 
 function deleteSelected(): void {
-  annotEditor?.removeSelected()
+  const ok = annotEditor?.removeSelected() ?? false
+
+  /*
+   * 🔴 兜底：编辑器说"没东西可删"，但界面上可能还连着一条。
+   *
+   * 用户报过：文本框在编辑态（工具条/虚线框/蓝条都在），点工具栏的删除按钮
+   * **毫无反应** —— 编辑框和字原样留着。那条路径上 `removeSelected()` 提前返回了，
+   * 于是后面的 `onChange` 根本没发生，删除变成了一次静默的空操作。
+   *
+   * 这里退一步，用**宿主自己记的 `selId`** 再删一次；删不掉也要把编辑态收起 ——
+   * 绝不能留下"看得见、点不着、删不掉"的幽灵。
+   */
+  if (!ok) {
+    const id = selId.value
+    const a = id ? annotStore.get(id) : null
+    if (a) {
+      const pn = a.pageNumber
+      annotStore.remove(a.id)
+      annotLayer?.invalidate(pn, true)
+      void annotLayer?.render(pn, scale.value, true)
+      emit('annot-count', annotStore.count())
+      emit('history-change', { canUndo: annotStore.canUndo(), canRedo: annotStore.canRedo() })
+    }
+    annotEditor?.setSelected(null)
+    if (textEditId.value) {
+      textEditId.value = null
+      textEditBox.value = null
+      textEditAnnotRef.value = null
+      textEditBefore = null
+    }
+  }
+
   pushAnnotCount()
 }
 
@@ -1947,17 +1972,6 @@ watch(
               <div class="sel-edge se-n" data-handle="n" data-tid="sel-edge-n" />
               <div class="sel-edge se-e" data-handle="e" data-tid="sel-edge-e" />
               <div class="sel-edge se-s" data-handle="s" data-tid="sel-edge-s" />
-            </template>
-
-            <!-- 手写：8 个角点（整体等比缩放，8 个方向都有意义） -->
-            <template v-else-if="selHandlesVisible">
-              <div
-                v-for="h in HANDLES"
-                :key="h"
-                class="sel-handle"
-                :class="`h-${h}`"
-                :data-handle="h"
-              />
             </template>
           </div>
         </div>

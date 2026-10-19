@@ -1380,6 +1380,19 @@ try {
         '选中文本框后进入编辑态（这就是用户点删除前的状态）',
         await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`),
       )
+      /*
+       * 🔴 用户图 1 的关键信息：点完垃圾桶，编辑框的**整套 Chrome 都还在**
+       *    （虚线框 / 左边蓝条 / 右边圆圈 / 上方工具条）—— 说明 `removeSelected()`
+       *    压根没删东西就返回了。要么按钮是 disabled（`!selected`），要么
+       *    `selectedId` 与宿主不同步。这里先量按钮本身。
+       */
+      check(
+        '编辑态下「删除所选」按钮必须是**可点的**（disabled=false）',
+        (await evaluate(`document.querySelector('[data-tid="delete-selected"]')?.disabled`)) === false,
+        (await evaluate(`document.querySelector('[data-tid="delete-selected"]')?.disabled`))
+          ? '★ 按钮是 disabled —— 点它当然没反应'
+          : '可点',
+      )
 
       // 用户是点工具栏右上角那个垃圾桶
       await evaluate(
@@ -1405,6 +1418,37 @@ try {
           : '已收起',
       )
       await shot('10b-freetext-deleted')
+    }
+  }
+
+  // ---- 10c. 手写也不能缩放 / 拖动（用户要求与下划线一致）
+  {
+    const inkL = (await annots()).find((a) => a.kind === 'ink')
+    check('找得到一条手写批注（测锁定）', !!inkL)
+    if (inkL) {
+      const c = await centerOf(inkL.id)
+      await tap(c.x, c.y)
+      await sleep(260)
+      const g = await selGeometry()
+      check(
+        '手写选中后**一个手柄都不给**、也没有移动条（和标记类一致，只能删）',
+        !!g && g.handleCount === 0 && !g.grip,
+        g ? `手柄=${g.handleCount} 移动条=${!!g.grip}` : 'null',
+      )
+
+      const r0 = [...inkL.rect]
+      await dragOn(c.x, c.y, c.x + 50, c.y + 30)
+      await sleep(260)
+      const r1 = (await annots()).find((a) => a.id === inkL.id)
+      check(
+        '拖手写**完全不动**（x0/y0/宽 全不变）',
+        !!r1 &&
+          near(r1.rect[0], r0[0], 0.2) &&
+          near(r1.rect[1], r0[1], 0.2) &&
+          near(r1.rect[2] - r1.rect[0], r0[2] - r0[0], 0.2),
+        r1 ? `x0 ${r0[0].toFixed(1)} → ${r1.rect[0].toFixed(1)}pt` : '找不到',
+      )
+      await shot('10c-ink-locked')
     }
   }
 
