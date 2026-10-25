@@ -767,6 +767,58 @@ try {
   await sleep(600)
   await evaluate(`localStorage.removeItem('epl.settings.v1')`)
 
+  /*
+   * 4c. 侧边栏的开合与面板要跨刷新记住。
+   *
+   * 用户提的："关掉应用重新打开，如果左边侧边栏是展开的就是展开。"
+   * 之前 `sideOpen` / `panel` 都是启动即归零的 `ref(...)`，重开必然收起。
+   *
+   * 先清掉记忆再刷一次，量的是**首次运行**的样子 —— 否则上一段用例把侧边栏
+   * 开着，这里会"看起来对"其实根本没验证默认值。
+   */
+  console.log('\n[4c] 重开后侧边栏的开合 / 面板还在吗')
+  await evaluate(`localStorage.removeItem('epl:ui-state')`)
+  await reload()
+  await sleep(800)
+  check(
+    '第一次运行：侧边栏默认是收起的',
+    !(await evaluate(`!!document.querySelector('.side')`)),
+  )
+
+  // 打开侧边栏 → 切到「搜索」面板（它不依赖文档，重开后也能显示）
+  await evaluate(`document.querySelector('[data-tid="sidebar-toggle"]').click()`)
+  await sleep(320)
+  await evaluate(`document.querySelector('[data-tid="side-search"]').click()`)
+  await sleep(320)
+  check(
+    '打开后确实停在搜索面板',
+    await evaluate(`!!document.querySelector('[data-tid="search-panel"]')`),
+  )
+
+  await reload()
+  await sleep(900)
+  check(
+    '重开后侧边栏仍然是展开的',
+    await evaluate(`!!document.querySelector('.side')`),
+  )
+  check(
+    '而且仍停在搜索面板（不是被重置回文件列表）',
+    await evaluate(`!!document.querySelector('[data-tid="search-panel"]')`),
+  )
+
+  // 反过来：收起之后重开，也不该自己弹出来
+  await evaluate(`document.querySelector('[data-tid="sidebar-toggle"]').click()`)
+  await sleep(320)
+  await reload()
+  await sleep(800)
+  check(
+    '收起后重开还是收起的（不会强行弹出来）',
+    !(await evaluate(`!!document.querySelector('.side')`)),
+  )
+
+  // 别把记忆留给后面的用例
+  await evaluate(`localStorage.removeItem('epl:ui-state')`)
+
   // ---------------------------------------------------------------- 5. 控制台
 
   console.log('\n[5] 控制台')

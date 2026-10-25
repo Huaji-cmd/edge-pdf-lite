@@ -28,6 +28,8 @@ import {
   clearLastDocument,
 } from './viewer/readingState'
 import type { ViewMode } from './viewer/types'
+import { loadUiState, saveUiState, restorablePanel } from './viewer/uiState'
+import type { RestorablePanel } from './viewer/uiState'
 import type { ToolKind, ToolColors, PointerMode, Rgb, SelectedInfo } from './annot/types'
 import {
   defaultToolColors,
@@ -50,9 +52,17 @@ const page = ref(1)
 
 // ---------------------------------------------------------------- 侧边栏：文件 / 搜索 / 目录 / 缩略图
 
-const sideOpen = ref(false)
+/**
+ * 侧边栏的开合与当前面板会**跨启动记住**。
+ *
+ * 只在启动时读一次（`loadUiState()` 是最初值），之后每次变化由下面的 watch 落盘。
+ * ⚠️ 别改成"每次用到时读 localStorage" —— 那会让面板状态变成非响应式的，
+ *    而且手改 localStorage 之后界面不会跟着变。
+ */
+const initialUi = loadUiState()
+const sideOpen = ref(initialUi.sideOpen)
 /** 侧边栏当前显示哪个面板。默认「文件列表」—— 跟 Obsidian 一样，先从列表挑书 */
-const panel = ref<SidePanelKind>('files')
+const panel = ref<SidePanelKind>(initialUi.panel)
 const outline = ref<OutlineNode[]>([])
 const outlineLoading = ref(false)
 /** 各页基准尺寸 —— 缩略图靠它算宽高比和占位高度（没渲染出来之前也要占位） */
@@ -641,10 +651,26 @@ function goToDest(p: number, top: number | null): void {
  *    这样从设置里点顶栏的「目录」切走时，记忆也会跟着更新 ——
  *    `文件 → 设置 → 目录 → 再点设置` 应该回到**目录**，不是文件。
  */
-let panelBeforeSettings: SidePanelKind = 'files'
+let panelBeforeSettings: SidePanelKind = initialUi.panel
 watch(panel, (p) => {
   if (p !== 'settings') panelBeforeSettings = p
 })
+
+/**
+ * 把「侧边栏开合 + 当前面板」落盘。
+ *
+ * ⚠️ 放在上面那个 watch **之后**：Vue 的 watch 回调按创建顺序执行，
+ *    这样 `panelBeforeSettings` 一定已经是新值了 —— 否则从"设置"里切走时
+ *    会先把**旧的**面板写进 localStorage，重开就退回上一个面板。
+ */
+/** 上次真正记住的面板 —— 当前面板不适合记（大纲/缩略图）时沿用它 */
+let rememberedPanel: RestorablePanel = initialUi.panel
+function persistUiState(): void {
+  const p = restorablePanel(panel.value, panelBeforeSettings)
+  if (p) rememberedPanel = p
+  saveUiState({ sideOpen: sideOpen.value, panel: rememberedPanel })
+}
+watch([sideOpen, panel], persistUiState)
 
 /**
  * 切面板。设置是**可来回切**的：已经在设置里了，再点一次就退回上一个面板

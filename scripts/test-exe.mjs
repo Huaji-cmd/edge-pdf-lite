@@ -461,6 +461,69 @@ const pageAfterReload = await evaluate(
 )
 check('页码也恢复了（阅读位置记忆没被这次改动破坏）', pageAfterReload >= 1, `page=${pageAfterReload}`)
 
+/*
+ * ---- 5c. 关掉再开：侧边栏的开合 / 停在哪一栏 / 文件夹展开都要还在 ---------
+ *
+ * 用户的原话："关掉应用重新打开，如果左边侧边栏是展开的就是展开，文件列表也是这样。"
+ *
+ * 这一段**不点任何按钮** —— 重载完直接量。点一下再量等于自己把状态又打开了一遍，
+ * 那种判据再怎么错都容易绿。
+ *
+ * ⚠️ 断言的基准 `kidFiles` 是"加 refresh-probe 之前"的数：那个探针文件在 5a 末尾
+ *    已经从磁盘删掉了，重开后重新扫盘应当回到原来的行数 —— 顺便也验证了
+ *    "扫盘拿到的是最新文件系统，不是上次的快照"。
+ */
+check(
+  '重开后侧边栏仍然展开（上次开着就一直开着）',
+  await evaluate(`!!document.querySelector('.side')`),
+)
+
+check(
+  '而且停在上次用的「文件」面板',
+  await evaluate(`!!document.querySelector('[data-tid="files-panel"]')`),
+)
+
+let rowsAfterRestart = 0
+for (let i = 0; i < 15; i++) {
+  rowsAfterRestart = Number(
+    await evaluate(
+      `document.querySelectorAll('[data-tid="files-panel"] [data-node-id][data-kind="file"]').length`,
+    ),
+  )
+  if (rowsAfterRestart === kidFiles) break
+  await sleep(400)
+}
+// 只在失败时打印：一眼分辨是"localStorage 里没有展开键"还是"有键但没恢复"
+if (rowsAfterRestart !== kidFiles) {
+  console.log(
+    '     诊断：',
+    await evaluate(`
+      JSON.stringify({
+        expanded: localStorage.getItem('epl:files-expanded'),
+        folders: [...document.querySelectorAll('[data-tid="files-panel"] [data-kind="folder"]')]
+          .map(e => ({ cls: e.className, html: e.textContent.trim().slice(0, 20) })),
+        nodes: document.querySelectorAll('[data-tid="files-panel"] [data-node-id]').length,
+        list: localStorage.getItem('epl:file-list'),
+      })
+    `),
+  )
+}
+check(
+  '文件夹的展开状态也还在（重开后一行不少）',
+  rowsAfterRestart === kidFiles && rowsAfterRestart > 0,
+  `${kidFiles} 行 → 重开 ${rowsAfterRestart} 行`,
+)
+
+// 反过来：收起之后重开，也不该自己弹出来
+await evaluate(`document.querySelector('[data-tid="sidebar-toggle"]')?.click()`)
+await sleep(500)
+await send('Page.reload')
+await sleep(2600)
+check(
+  '收起后重开还是收起的（不会强行弹出来）',
+  !(await evaluate(`!!document.querySelector('.side')`)),
+)
+
 // 文件不在了的时候不能卡住，也不能每次都白试
 const ghost = join(TDIR, 'definitely-not-here.pdf')
 await evaluate(

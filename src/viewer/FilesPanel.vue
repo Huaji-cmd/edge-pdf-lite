@@ -110,26 +110,49 @@ async function toggle(node: FileNode): Promise<void> {
  * 所以反复切面板不会反复扫盘。
  */
 let restoring = false
+/**
+ * 跑到一半又来了新请求 —— 收尾时**再走一遍**。
+ *
+ * 🔴 这里原来是 `if (restoring) return`，会**静默丢掉**一次合法的恢复，
+ *    症状是「重启后侧边栏还在、文件列表也在，但文件夹是收着的」。
+ *
+ * 竞态长这样：启动时 `FilesPanel` 先挂载（`nodes` 还是空数组，书单在
+ * 父组件的 `onMounted` 里才 `restoreList()`），第一次 walk 拿到空列表；
+ * 紧接着父组件换掉 `nodes` 这个引用 → watch 触发第二次调用 —— 而第一次
+ * walk 的 `finally` 还排在微任务队列里没跑，`restoring` 仍是 true，
+ * 第二次就被 return 掉了。等它复位时，已经没有人再来恢复了。
+ *
+ * 所以改成"置一个 pending 标记，收尾时重跑"：不管期间来了几次，最后一定
+ * 会用**最新的 props.nodes** 再扫一遍。
+ */
+let restorePending = false
 
 async function restoreExpanded(): Promise<void> {
-  if (restoring) return
+  // 队列化：正在跑就记一笔，收尾时会重跑，不会丢
+  if (restoring) {
+    restorePending = true
+    return
+  }
   restoring = true
   try {
-    const walk = async (list: readonly FileNode[]): Promise<void> => {
-      for (const n of list) {
-        if (n.kind !== 'folder' || !expanded.value.has(n.key)) continue
-        if (!n.loaded) {
-          markLoading(n.id, true)
-          try {
-            await loadChildren(n)
-          } finally {
-            markLoading(n.id, false)
+    do {
+      restorePending = false
+      const walk = async (list: readonly FileNode[]): Promise<void> => {
+        for (const n of list) {
+          if (n.kind !== 'folder' || !expanded.value.has(n.key)) continue
+          if (!n.loaded) {
+            markLoading(n.id, true)
+            try {
+              await loadChildren(n)
+            } finally {
+              markLoading(n.id, false)
+            }
           }
+          await walk(n.children ?? [])
         }
-        await walk(n.children ?? [])
       }
-    }
-    await walk(props.nodes)
+      await walk(props.nodes)
+    } while (restorePending)
   } finally {
     restoring = false
   }
