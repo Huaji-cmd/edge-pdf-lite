@@ -2,7 +2,7 @@
 # ⚠️ 这个名字决定**产出的 exe 叫什么**（默认模板给的 "app" 会生成 app.exe）。
 #    改成产品名，用户拿到的才是 edge-pdf-lite.exe。
 name = "edge-pdf-lite"
-version = "1.2.0"
+version = "1.2.1"
 description = "轻量 PDF 阅读 + 批注编辑器"
 authors = ["Huaji-cmd"]
 license = "MIT"
