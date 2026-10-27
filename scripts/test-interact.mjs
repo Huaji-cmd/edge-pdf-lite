@@ -1820,7 +1820,82 @@ try {
     }
   }
 
-  console.log('\n[13] 控制台')
+  // ---------------------------------------------------------------- 13. 收起批注面板
+  /*
+   * 用户报的："收起批注栏后依旧能够批注，让我又要打开批注栏取消"。
+   * 根因：`annotOpen` 只管按钮显不显示，没人把 `tool` 清掉 ——
+   * 工具还亮着，页面上照样能画。
+   */
+  console.log('\n[13] 收起批注面板 → 批注工具必须失效')
+  const toolOn = (tid) =>
+    evaluate(`!!document.querySelector('[data-tid="${tid}"]')?.classList.contains('on')`)
+
+  /*
+   * ⚠️ 不要假设面板的初始开合状态：前面的用例可能已经把它打开过
+   * （点工具本身不需要展开，但颜色菜单会顺手展开它）。
+   * 先归一化成"展开"，否则这里的"点一下收起"会变成"点一下展开" ——
+   * 上一版就是这样连红 4 条的。
+   */
+  const annotExpanded = () => evaluate(`!!document.querySelector('.annot-group.open')`)
+  if (!(await annotExpanded())) {
+    await evaluate(clickByTidExpr('批注'))
+    await sleep(320)
+  }
+  check('批注工具组已展开（前提）', await annotExpanded())
+  await evaluate(clickByTidExpr('手写'))
+  await sleep(260)
+  check('选「手写」→ 按钮点亮', await toolOn(TID.toolInk))
+
+  // 先证明"开着的时候真的能画"（对照，否则下面那条绿得没有意义）
+  const yDraw = box.y + Math.min(box.h * 0.25, 200)
+  await dragOn(box.x + 60, yDraw, box.x + 160, yDraw, 8)
+  const nOpen = (await annots()).length
+  check('工具开着能画（对照）', nOpen === 1, `${nOpen} 条`)
+
+  await evaluate(clickByTidExpr('批注'))
+  await sleep(380)
+  check('收起面板后工具**被清掉**（不再点亮）', !(await toolOn(TID.toolInk)))
+  check('组件内部的 tool 也回到 none', (await snap()).tool === 'none', String((await snap()).tool))
+
+  const yDraw2 = box.y + Math.min(box.h * 0.35, 280)
+  await dragOn(box.x + 60, yDraw2, box.x + 160, yDraw2, 8)
+  check(
+    '收起之后在页面上拖拽也画不出东西',
+    (await annots()).length === nOpen,
+    `${(await annots()).length} 条（期望仍是 ${nOpen}）`,
+  )
+
+  // ---------------------------------------------------------------- 14. 徽标归零
+  /*
+   * 用户报的："保存之后批注条数没有归零" —— 他会以为没存上。
+   * 现在徽标的语义是**还没写回文件的条数**，保存成功后必须归零，且不能靠删批注来归零。
+   */
+  console.log('\n[14] 保存后「未保存条数」归零')
+  const badge = () =>
+    evaluate(`Number(document.querySelector('[data-tid="annot-count"]')?.textContent ?? 0)`)
+  check('有未保存批注时徽标 = 1', (await badge()) === 1, String(await badge()))
+  check('同时显示「未保存」标记', await evaluate(`!!document.querySelector('[data-tid="unsaved"]')`))
+  await evaluate(`globalThis.__eplViewer.markSaved()`)
+  await sleep(280)
+  check('保存收尾后徽标归零', (await badge()) === 0, String(await badge()))
+  check('「未保存」标记也消失', !(await evaluate(`!!document.querySelector('[data-tid="unsaved"]')`)))
+  check(
+    '批注本身还在屏幕上（归零 ≠ 把内容删掉）',
+    (await annots()).length === nOpen,
+    `${(await annots()).length} 条`,
+  )
+
+  await evaluate(clickByTidExpr('批注'))
+  await sleep(280)
+  await evaluate(clickByTidExpr('手写'))
+  await sleep(220)
+  const yDraw3 = box.y + Math.min(box.h * 0.45, 360)
+  await dragOn(box.x + 60, yDraw3, box.x + 150, yDraw3, 8)
+  check('保存后再画一笔 → 从 1 重新计数', (await badge()) === 1, String(await badge()))
+  await evaluate(clickByTidExpr('批注'))
+  await sleep(260)
+
+  console.log('\n[15] 控制台')
   check(
     '没有未捕获异常 / error',
     consoleErrors.length === 0,

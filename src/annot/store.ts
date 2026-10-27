@@ -54,6 +54,14 @@ export class AnnotationStore {
   private pageOf = new Map<string, number>()
   /** 有未保存改动的页 */
   private dirty = new Set<number>()
+  /**
+   * **上次落盘时**的批注快照（id → 那一条的对象引用）。
+   *
+   * 用途只有一个：算"还有几条没保存"。
+   * 为什么用**引用**而不是 id 集合：`replace()` / `commitEdit()` 每次都会换一个新对象，
+   * 于是"引用变了 == 改过了"，不用去比 `modified` 字符串（那个字段不是每次改动都更新）。
+   */
+  private saved = new Map<string, Annotation>()
   private listeners = new Set<() => void>()
   private undoStack: UndoOp[] = []
   private redoStack: UndoOp[] = []
@@ -85,6 +93,30 @@ export class AnnotationStore {
   /** 有未保存改动的页码集合 */
   dirtyPages(): Set<number> {
     return new Set(this.dirty)
+  }
+
+  /**
+   * **还没写回文件**的批注条数 —— 工具栏那个徽标显示的就是它。
+   *
+   * 为什么不是 `count()`：用户存完看到"还有 12 条"，会以为保存没生效
+   *（他报的就是这个）。保存之后徽标必须归零，之后新画的才重新计数。
+   *
+   * 三种都算一次未保存：
+   *   · 新加的（快照里没有）
+   *   · 改过的（对象换了 —— 拖动 / 改色 / 改字号 / 编辑文字都走 `replace`）
+   *   · 删掉的（快照里有、现在没了）
+   */
+  unsavedCount(): number {
+    let n = 0
+    const alive = new Set<string>()
+    for (const arr of this.byPage.values()) {
+      for (const a of arr) {
+        alive.add(a.id)
+        if (this.saved.get(a.id) !== a) n++
+      }
+    }
+    for (const id of this.saved.keys()) if (!alive.has(id)) n++
+    return n
   }
 
   // ---------------------------------------------------------------- 变更
@@ -249,8 +281,18 @@ export class AnnotationStore {
     else this.replace(op.before.id, op.before)
   }
 
-  /** 保存成功后调用：清脏标记、清历史（那些操作已经落盘了） */
+  /**
+   * 保存成功后调用：清脏标记、清历史（那些操作已经落盘了）。
+   *
+   * ⚠️ **不清 `byPage`** —— 批注还得留在屏幕上（页面上的浮层就是它）。
+   *    清掉的话用户会看到刚做的批注凭空消失，比"徽标没归零"糟糕得多。
+   *    所以这里只把当前状态记成**新的基线**，`unsavedCount()` 自然归零。
+   */
   markSaved(): void {
+    this.saved.clear()
+    for (const arr of this.byPage.values()) {
+      for (const a of arr) this.saved.set(a.id, a)
+    }
     this.dirty.clear()
     this.undoStack.length = 0
     this.redoStack.length = 0
@@ -261,6 +303,7 @@ export class AnnotationStore {
     this.byPage.clear()
     this.pageOf.clear()
     this.dirty.clear()
+    this.saved.clear()
     this.undoStack.length = 0
     this.redoStack.length = 0
     this.emit()
@@ -276,8 +319,10 @@ export class AnnotationStore {
       else this.byPage.set(a.pageNumber, [a])
       this.pageOf.set(a.id, a.pageNumber)
     }
-    // 载入的既不算脏、也不进历史
+    // 载入的既不算脏、也不进历史；**同时是新的基线**（文件里本来就有它们）
     this.dirty.clear()
+    this.saved.clear()
+    for (const a of list) this.saved.set(a.id, a)
     this.undoStack.length = 0
     this.redoStack.length = 0
     this.emit()

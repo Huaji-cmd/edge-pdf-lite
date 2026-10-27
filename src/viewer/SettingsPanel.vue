@@ -16,7 +16,7 @@ import { onMounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import { IS_TAURI } from '@/platform'
 import { pickSaveDir, revealInFolder, resolveSaveDir, settings, setTheme } from './settings'
-import type { SaveMode, ThemeMode } from './settings'
+import type { BackupPos, SaveMode, ThemeMode } from './settings'
 
 const emit = defineEmits<{
   /** 让上层弹提示（保存位置改动这类反馈统一走 toast） */
@@ -53,6 +53,10 @@ async function openDir(): Promise<void> {
 
 function setSaveMode(m: SaveMode): void {
   settings.value = { ...settings.value, saveMode: m }
+}
+
+function setBackupPos(p: BackupPos): void {
+  settings.value = { ...settings.value, backupPos: p }
 }
 
 const THEMES: { mode: ThemeMode; icon: 'auto' | 'sun' | 'moon'; label: string }[] = [
@@ -100,6 +104,33 @@ const THEMES: { mode: ThemeMode; icon: 'auto' | 'sun' | 'moon'; label: string }[
           </span>
         </span>
       </label>
+
+      <!--
+        `.bak` 放哪 —— 只在「覆盖原文件」有意义。
+        以前固定跟原文件同目录，用户把保存位置设到别处之后，同一本书的
+        原件和批注副本会分散在两个目录里。给个开关，自己选。
+      -->
+      <div v-if="IS_TAURI && settings.saveMode === 'overwrite'" class="bak">
+        <div class="bak-label">.bak 备份放在</div>
+        <div class="bak-row">
+          <button
+            class="seg"
+            :class="{ on: settings.backupPos === 'same' }"
+            data-tid="bak-same"
+            @click="setBackupPos('same')"
+          >
+            跟原文件同目录
+          </button>
+          <button
+            class="seg"
+            :class="{ on: settings.backupPos === 'saveDir' }"
+            data-tid="bak-savedir"
+            @click="setBackupPos('saveDir')"
+          >
+            跟保存位置一致
+          </button>
+        </div>
+      </div>
 
       <div class="dir">
         <div class="dir-label">
@@ -215,6 +246,38 @@ section + section {
   background: var(--sel-bg);
   color: var(--sel-fg);
   font-size: 10px;
+}
+
+/* ---- 备份位置（两选一） ---- */
+.bak {
+  margin: 4px 0 10px 26px;
+}
+.bak-label {
+  font-size: 11px;
+  color: var(--mute);
+  margin-bottom: 5px;
+}
+.bak-row {
+  display: flex;
+  gap: 6px;
+}
+.seg {
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--btn);
+  color: var(--dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+.seg:hover {
+  background: var(--btn-hover);
+  color: var(--fg);
+}
+.seg.on {
+  background: var(--sel-bg);
+  border-color: var(--accent);
+  color: var(--sel-fg);
 }
 
 /* ---- 目录 ---- */

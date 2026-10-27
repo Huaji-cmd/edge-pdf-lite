@@ -514,10 +514,32 @@ async function openBytes(bytes: Uint8Array, name: string): Promise<boolean> {
     if (prev) void prev.close()
     return true
   } catch (e) {
-    errorText.value = (e as Error).message
+    errorText.value = errTextOf(e)
     return false
   } finally {
     busy.value = false
+  }
+}
+
+/**
+ * 把「抛出来/拒掉的那个东西」变成一句能给人看的话。
+ *
+ * 🔴 这不是洁癖：Tauri 命令返回 `Result<_, String>` 时，**失败拒的是一个字符串**，
+ *    不是 `Error` 对象。前端写 `(e as Error).message` 拿到的是 `undefined` ——
+ *    用户看到的就是"保存失败：undefined"，真正的错误（拒绝访问 / 只读 / 不在白名单）
+ *    一个字都没露出来。这一条让用户白报了一次 bug，我这边也白猜了一轮。
+ */
+function errTextOf(e: unknown): string {
+  if (typeof e === 'string') return e
+  if (e instanceof Error) return e.message
+  if (e && typeof e === 'object' && 'message' in e) {
+    return String((e as { message: unknown }).message)
+  }
+  try {
+    const s = JSON.stringify(e)
+    return s && s !== '{}' ? s : String(e)
+  } catch {
+    return String(e)
   }
 }
 
@@ -546,7 +568,7 @@ async function openFromList(node: FileNode): Promise<void> {
   try {
     bytes = await readPdfBytes(node)
   } catch (e) {
-    errorText.value = (e as Error).message
+    errorText.value = errTextOf(e)
     return
   }
   if (await openBytes(bytes, node.name)) {
@@ -755,7 +777,22 @@ async function exportAnnotated(): Promise<void> {
   busy.value = true
   try {
     const { buildAnnotatedPdf, annotatedFileName } = await loadWriter()
-    const bytes = await buildAnnotatedPdf(d.originalBytes, list)
+
+    /*
+     * 中文必须**嵌入字体**才画得出来（标准 14 字体没有 CJK 字形）。
+     * 字体从系统读，读不到就退回占位横线 —— 所以要提前判断、提前说清楚，
+     * 不能让用户存完才发现"怎么全是灰条"。
+     */
+    const hasCjk = list.some((a) => a.kind === 'freetext' && !/^[\x20-\x7E\r\n\t]*$/.test(a.text))
+    const { loadCjkFont } = await import('./annot/cjkFont')
+    const cjkFont = hasCjk ? await loadCjkFont() : null
+    if (hasCjk && !cjkFont) {
+      showToast(
+        '这个环境里读不到系统中文字体（浏览器版没有文件系统），中文会存成占位横线 —— 用桌面版保存才能真的画出中文',
+      )
+    }
+
+    const bytes = await buildAnnotatedPdf(d.originalBytes, list, { cjkFont })
     const name = annotatedFileName(fileName.value)
 
     // 已经落到文件里了 —— 之后退出不再拦截
@@ -794,21 +831,45 @@ async function exportAnnotated(): Promise<void> {
       if (wantOverwrite) note = '（这个文件没有原路径，已改为另存）'
     }
 
+    /*
+     * `.bak` 放哪 —— 用户可以在设置里选「跟原文件同目录」还是「跟保存位置一致」。
+     * 默认 same（老行为）；选了 saveDir 才把目录传下去，Rust 侧还要再核对一次
+     * 白名单（备份 = 在目标目录里新建文件，同样要过闸门）。
+     *
+     * 具体备份成了哪个文件**由 Rust 回传**（它知道 .bak / .bak2 的排号），
+     * 前端不猜 —— 猜错的话提示里的路径就是假的。
+     */
+    let backupDir: string | undefined
+    if (overwrite && settings.value.backupPos === 'saveDir') {
+      const dir = await resolveSaveDir()
+      // 保存目录和原文件目录相同就没必要多传（Rust 会自己算出来）
+      if (dir && dir !== targetDirOf(target)) backupDir = dir
+    }
+
     // ⚠️ 参数名用 **camelCase**：Tauri v2 按前端 camelCase → Rust snake_case
     //    来匹配，写成 `make_backup` 会直接报 "missing required key"。
-    const written = await invoke<string>('write_pdf_b64', {
+    const res = await invoke<{
+      path: string
+      backup: string | null
+      readonly_cleared: boolean
+    }>('write_pdf_b64', {
       path: target,
       b64: bytesToBase64(bytes),
       makeBackup: overwrite,
+      // ⚠️ 显式给 `null` 而不是留 undefined：Tauri v2 对 `Option<T>` 参数
+      //    缺省行为不够明确，传 null 一定被当成 None
+      backupDir: backupDir ?? null,
     })
     done()
-    showToast(
-      `${overwrite ? '已覆盖原文件（原件备份为 .bak）' : '已保存'}${note}：${written}`,
-      written,
-    )
+
+    const parts: string[] = [overwrite ? '已覆盖原文件' : '已保存']
+    if (res.backup) parts.push(`原件备份：${res.backup}`)
+    // 只读文件写不进去 —— 我们取消了只读才写成功的，这件事必须说出来
+    if (res.readonly_cleared) parts.push('原文件是只读的，已取消只读')
+    showToast(`${parts.join(' · ')}${note}：${res.path}`, res.path)
   } catch (e) {
     console.error('[save] 失败', e)
-    errorText.value = `保存失败：${(e as Error).message}`
+    errorText.value = `保存失败：${errTextOf(e)}`
   } finally {
     busy.value = false
   }
@@ -821,6 +882,12 @@ function joinPath(dir: string, name: string): string {
   // 盘符根（D:\）不能把末尾的斜杠去掉，否则会变成"当前目录下的相对路径"
   if (/^[A-Za-z]:$/.test(base)) return dir.endsWith(sep) ? dir + name : dir + sep + name
   return base + sep + name
+}
+
+/** 一个路径所在的目录（不引入 node:path —— 浏览器里没有） */
+function targetDirOf(p: string): string {
+  const i = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'))
+  return i > 0 ? p.slice(0, i) : ''
 }
 
 /**
@@ -964,6 +1031,7 @@ onMounted(() => {
   // 桌面端：同步最大化状态，并跟着窗口变化更新（标题栏的图标要靠它切换）
   if (IS_TAURI) {
     void syncMaximized()
+    void installCloseGuard()
     void (async () => {
       try {
         const { getCurrentWindow } = await import('@tauri-apps/api/window')
@@ -977,6 +1045,62 @@ onMounted(() => {
   }
 })
 
+/**
+ * 桌面端**关窗口**时的未保存拦截。
+ *
+ * 🔴 为什么不能只靠 `beforeunload`：WebView2 里关窗口走的是 Tauri 的
+ *    `CloseRequested` → 直接销毁 webview，**不保证**跑页面的 beforeunload。
+ *    实测（用户报的）：画完批注直接点 ✕，窗口就没了，什么都没问。
+ *
+ * 做法：拦下 CloseRequested → 用自己的确认框问 → 用户确认后 `destroy()`
+ *（`destroy` 不会再触发一次 CloseRequested，避免死循环）。
+ *
+ * 🔴 **不能用 `window.confirm`**：WebView2 里它会让页面的 JS **整段阻塞**，
+ *    而且 CDP 收不到 `Page.javascriptDialogOpening` —— 表现是"点了 ✕ 之后
+ *    整个应用像死了一样，自动化测试也拿不到任何信号"。
+ *    改用 Tauri 自己的 dialog 插件（Rust 侧的原生对话框，`await` 不阻塞页面）。
+ *
+ * ⚠️ 用户选"取消"时要**把 beforeunload 监听装回去** —— 上面为了不弹第二次
+ *    临时摘掉过它；不装回去的话，之后刷新页面就不会再提醒了。
+ */
+let unlistenClose: (() => void) | null = null
+
+async function installCloseGuard(): Promise<void> {
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window')
+    const win = getCurrentWindow()
+    unlistenClose = await win.onCloseRequested(async (event) => {
+      if (!unsaved.value) return // 没有未保存的东西，直接放行
+      event.preventDefault()
+      // 先摘掉 beforeunload，避免"确认框一次 + 浏览器自己再弹一次"
+      window.removeEventListener('beforeunload', onBeforeUnload)
+      let ok = false
+      try {
+        const { ask } = await import('@tauri-apps/plugin-dialog')
+        ok = await ask(
+          `《${fileName.value}》上还有 ${annotCount.value} 条批注没有保存。\n\n` +
+            `关闭窗口会丢掉它们，确定关闭吗？`,
+          { title: '还有批注没有保存', kind: 'warning', okLabel: '仍然关闭', cancelLabel: '取消' },
+        )
+      } catch (e) {
+        // 权限没开 / 插件异常：宁可别把人关在窗口里 —— 放行并说明
+        console.warn('[close] 确认框弹不出来，按"继续关闭"处理：', e)
+        ok = true
+      }
+      if (!ok) {
+        window.addEventListener('beforeunload', onBeforeUnload)
+        return
+      }
+      flushSave()
+      await win.destroy()
+    })
+  } catch (e) {
+    // 权限没开（capabilities 少了 allow-destroy）会走到这里 —— 此时退回
+    // "只有 beforeunload"的老行为，不该让应用起不来
+    console.warn('[close] 关闭拦截没装上：', e)
+  }
+}
+
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('dragover', onDragOver)
@@ -986,6 +1110,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('pagehide', flushSave)
   window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt)
   window.removeEventListener('appinstalled', onInstalled)
+  unlistenClose?.()
+  unlistenClose = null
   flushSave()
   void doc.value?.close()
 })

@@ -24,7 +24,7 @@
  */
 
 import { PDFDocument, PDFString, PDFHexString } from '@cantoo/pdf-lib'
-import type { PDFRef } from '@cantoo/pdf-lib'
+import type { PDFRef, PDFFont } from '@cantoo/pdf-lib'
 import type { Annotation, InkAnnot, RectAnnot, FreeTextAnnot } from './types'
 import { isMarkup, normalizeRect, bboxOfQuads, bboxOfPoints } from './types'
 import { lineHeightOf, textPad } from './textWrap'
@@ -200,10 +200,10 @@ function textString(s: string): PDFString | PDFHexString {
 }
 
 /**
- * 中文批注的"占位横线"。
+ * 中文批注的"占位横线"（**只在拿不到中文字体时**用）。
  *
- * 画不了字，但也不能什么都不画 —— 详见 `freeTextAppearance` 里那段说明。
- * 每行长度递减，看起来像一段自然结束的文字，一眼能认出"这里是个文本批注"。
+ * 拿不到字体（比如浏览器版）时，画不了字但也不能什么都不画 —— 详见
+ * `freeTextAppearance` 里那段说明。每行长度递减，看起来像一段自然结束的文字。
  *
  * ⚠️ 内边距和行高**必须和英文文本框、以及应用内绘制取同一套值**
  *（`textPad` / `lineHeightOf`），否则中英文混排在同一页上会明显对不齐。
@@ -224,6 +224,9 @@ function placeholderLines(w: number, h: number, fs: number): string {
   return s + 'Q\n'
 }
 
+/** `/AP` 里给嵌入字体起的资源名（`/DA` 里也用它，两处必须一致） */
+const CJK_FONT_NAME = 'CJK'
+
 /**
  * 文本框的 `/AP` 外观流。
  *
@@ -235,41 +238,50 @@ function placeholderLines(w: number, h: number, fs: number): string {
  * ⚠️ 历史上这里画过白底，理由是"文字压在图片上会看不清" —— 但那个理由不成立到
  * 值得上边框的程度：真需要底色的场景应该由用户自己选（背景是内容的一部分），
  * 而不是我们替他加一个白板。
+ *
+ * ## 中文字形
+ *
+ * 标准 14 字体里没有 CJK 字形，所以：
+ *   · **有嵌入字体**（`cjkFont`）→ 用它逐行编码成 glyph id 写 `Tj`，中文真的画出来；
+ *   · **没有**（浏览器版 / 系统里找不到字体）→ 退回占位横线，**并让调用方提示用户**。
+ *     文字本身在 `/Contents` 里一个字节都没丢。
  */
-function freeTextAppearance(a: FreeTextAnnot, rect: [number, number, number, number]): string | null {
+function freeTextAppearance(
+  a: FreeTextAnnot,
+  rect: [number, number, number, number],
+  cjkFont: PDFFont | null,
+): string | null {
   const [r, g, b] = a.color
   const w = rect[2] - rect[0]
   const h = rect[3] - rect[1]
   const fs = a.fontSize
   const pad = textPad(fs)
   const lh = lineHeightOf(fs)
+  const ascii = isAscii(a.text)
 
-  if (!isAscii(a.text)) {
-    /*
-     * 中文：标准 14 字体里没有 CJK 字形，硬画会变成一串 "????"。
-     *
-     * ⚠️ 曾经这里注释写的是"交给查看器用系统字体渲染" —— **那是错的**：
-     *    只要给了 /AP，查看器就用 /AP，不会自己再补文字。实际结果是用户在
-     *    Edge / Acrobat 里看到一个莫名其妙的空框，根本不知道那里有批注。
-     *
-     * 现在改成画"占位横线"：看得出是一个文本批注、有多少内容，
-     * 文字本身在 /Contents 里一个字节都没丢（注释面板 / 应用内都能看全）。
-     *
-     * 要真把中文画出来，只能**子集化嵌入一份 CJK 字体**（需 fontkit +
-     * 一个几 MB 的字体文件）。那跟 lite 的定位冲突，见
-     * `docs/待办与验收清单.md` 里 B2 的说明。
-     */
-    return placeholderLines(w, h, fs)
-  }
+  if (!ascii && !cjkFont) return placeholderLines(w, h, fs)
 
-  const lines = a.text.split('\n')
-  // 首行基线 = 顶边 - 内边距 - 约 0.8em 的字身高度（14 标准字体的 ascent 近似值）
+  /*
+   * 首行基线 = 顶边 - 内边距 - 约 0.8em 的字身高度。
+   *
+   * ⚠️ 用 0.8em 而不是字体自己的 ascent：应用内绘制（canvas 的 textBaseline=top）
+   *    与这里必须对得上，而 canvas 那边没法按字体真实 ascent 摆。中英文字体
+   *    ascent 都在 0.75~0.88em 之间，取 0.8 是一致性最好的一档（实测偏离 <1pt）。
+   */
+  const fontName = ascii ? 'Helv' : CJK_FONT_NAME
   let text =
-    `q\nBT\n/Helv ${num(fs)} Tf\n${num(r)} ${num(g)} ${num(b)} rg\n${num(lh)} TL\n` +
+    `q\nBT\n/${fontName} ${num(fs)} Tf\n${num(r)} ${num(g)} ${num(b)} rg\n${num(lh)} TL\n` +
     `1 0 0 1 ${num(pad)} ${num(h - pad - fs * 0.8)} Tm\n`
-  lines.forEach((ln, i) => {
-    const esc = ln.replace(/[\\()]/g, (c) => '\\' + c)
-    text += i === 0 ? `(${esc}) Tj\n` : `T*\n(${esc}) Tj\n`
+  a.text.split('\n').forEach((ln, i) => {
+    if (i > 0) text += 'T*\n'
+    if (!ln) return
+    if (ascii) {
+      const esc = ln.replace(/[\\()]/g, (c) => '\\' + c)
+      text += `(${esc}) Tj\n`
+    } else {
+      // encodeText → `<00010002…>`（Identity-H 下的 glyph id），中英混排走同一个字体
+      text += `${cjkFont!.encodeText(ln).toString()} Tj\n`
+    }
   })
   text += 'ET\nQ\n'
   return text
@@ -306,7 +318,12 @@ function multiplyGs(pdf: PDFDocument): LitDict {
 }
 
 /** 把一条批注转成 PDF 注释字典 */
-function annotDict(pdf: PDFDocument, a: Annotation, fontRef: PDFRef | null): LitDict {
+function annotDict(
+  pdf: PDFDocument,
+  a: Annotation,
+  fontRef: PDFRef | null,
+  cjkFont: PDFFont | null,
+): LitDict {
   const rect = safeRect(a)
   const [x0, y0] = rect
   const created = pdfDate(new Date(a.created))
@@ -380,14 +397,20 @@ function annotDict(pdf: PDFDocument, a: Annotation, fontRef: PDFRef | null): Lit
     apContent = strokeRect(a, rect)
   } else {
     subtype = 'FreeText'
+    const ascii = isAscii(a.text)
+    const fontName = ascii ? 'Helv' : CJK_FONT_NAME
     extra = {
-      DA: textString(`/Helv ${a.fontSize} Tf ${a.color.map(num).join(' ')} rg`),
+      DA: textString(`/${fontName} ${a.fontSize} Tf ${a.color.map(num).join(' ')} rg`),
       Q: 0,
     }
-    apContent = freeTextAppearance(a, rect)
-    // 外观流里 Tf 引用了 /Helv，资源字典必须真的给上一个字体 ref，
-    // 否则查看器解析 /AP 时找不到字体（有的会整条不画）。
-    if (fontRef && isAscii(a.text)) resources = { Font: { Helv: fontRef } }
+    apContent = freeTextAppearance(a, rect, cjkFont)
+    /*
+     * 外观流里 Tf 引用了字体，资源字典必须真的给上一个字体 ref，
+     * 否则查看器解析 /AP 时找不到字体（有的会整条不画 / 画成豆腐块）。
+     * 中文那条用的是嵌入的子集字体，英文那条用共享的 Helvetica。
+     */
+    if (ascii && fontRef) resources = { Font: { Helv: fontRef } }
+    else if (!ascii && cjkFont) resources = { Font: { [CJK_FONT_NAME]: cjkFont.ref } }
   }
 
   const dict: LitDict = { ...common, Subtype: subtype, ...extra }
@@ -410,8 +433,11 @@ export async function buildAnnotatedPdf(
   /**
    * `incremental: false` 强制走全量重写 —— **只为做性能对照**。
    * 产品路径永远用增量（增量失败时 writer 自己会退回全量）。
+   *
+   * `cjkFont`：系统中文字体的字节。**只有含中文的文本框才需要**；
+   * 不给就退回"占位横线"（浏览器版的现状），不会报错。
    */
-  opts: { incremental?: boolean } = {},
+  opts: { incremental?: boolean; cjkFont?: Uint8Array | null } = {},
 ): Promise<Uint8Array> {
   const byPage = new Map<number, Annotation[]>()
   for (const a of annotations) {
@@ -420,9 +446,10 @@ export async function buildAnnotatedPdf(
     else byPage.set(a.pageNumber, [a])
   }
 
-  // 只有「ASCII 的浮动文本框」才真的需要往 /AP 里画字 —— 中文交给查看器自己渲染。
+  // Helvetica 只给纯 ASCII 文本框用；中文走嵌入字体。
   // 按需 embed，避免每个文件都白白多一个字体对象（增量更新下也是实打实的字节）。
-  const needsFont = annotations.some((a) => a.kind === 'freetext' && isAscii(a.text))
+  const needsHelv = annotations.some((a) => a.kind === 'freetext' && isAscii(a.text))
+  const needsCjk = annotations.some((a) => a.kind === 'freetext' && !isAscii(a.text))
 
   const tryBuild = async (incremental: boolean): Promise<Uint8Array> => {
     const pdf = await PDFDocument.load(original, {
@@ -430,14 +457,33 @@ export async function buildAnnotatedPdf(
       updateMetadata: false,
     })
 
-    const helvRef = needsFont ? (await pdf.embedFont('Helvetica')).ref : null
+    const helvRef = needsHelv ? (await pdf.embedFont('Helvetica')).ref : null
+
+    /*
+     * 嵌入中文字体。
+     *
+     * ⚠️ **必须 `subset: true`**：全量嵌入是 9.7 MB，一份 PDF 直接从几百 KB 变成
+     *    10 MB。子集化之后只带用到的字形，实测一份三行中文的 PDF 只多 ~3 KB。
+     *
+     * ⚠️ registerFontkit 是**实例方法**，每份新 PDFDocument 都要注册一次
+     *    （不能只在模块顶层注册到某个静态位置）。
+     *
+     * ⚠️ fontkit **按需动态加载**（约 370 KB）：绝大多数保存是纯高亮 / 手写，
+     *    不该为"可能有中文"付这笔下载/解析。项目定位就是"只在必须付的时候付一次"。
+     */
+    let cjkFont: PDFFont | null = null
+    if (needsCjk && opts.cjkFont && opts.cjkFont.length > 0) {
+      const fontkit = (await import('@cantoo/fontkit')).default
+      pdf.registerFontkit(fontkit)
+      cjkFont = await pdf.embedFont(opts.cjkFont, { subset: true })
+    }
 
     for (const [pageNumber, list] of byPage) {
       // addAnnot() 内部会 normalize：页面本来没有 /Annots 时自动建一个空数组。
       // 自己手写 lookup + push 容易漏掉「/Annots 是间接引用」这一种情况。
       const page = pdf.getPage(pageNumber - 1)
       for (const a of list) {
-        const ref = pdf.context.register(pdf.context.obj(annotDict(pdf, a, helvRef)))
+        const ref = pdf.context.register(pdf.context.obj(annotDict(pdf, a, helvRef, cjkFont)))
         page.node.addAnnot(ref)
       }
     }

@@ -18,7 +18,7 @@
  */
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -32,6 +32,12 @@ const PORT = 9333
 /** 测试用到的两个目录，提前定义 —— 下面启动 exe 时要拿它们拼白名单 */
 const TESTDATA_DIR = resolve(ROOT, 'public/testdata')
 const SAVE_DIR = resolve(ROOT, 'exe-shots', 'save-test')
+/**
+ * 「原件在哪」和「保存目录在哪」**故意分开**。
+ * 只有分开才测得出 `.bak` 到底跟着谁走（用户报的就是这个：设了保存目录，
+ * bak 还是掉在原书旁边）。
+ */
+const SRC_DIR = resolve(ROOT, 'exe-shots', 'src-test')
 /*
  * 路径白名单（见 src-tauri/src/lib.rs 的「路径闸门」一节）。
  *
@@ -39,7 +45,7 @@ const SAVE_DIR = resolve(ROOT, 'exe-shots', 'save-test')
  * 目录预先放行。注意它不是后门：环境变量是**启动进程的人**给的，前端 JS 改不了它 ——
  * 能改它的人本来就能直接换掉 exe。反过来，它也让"闸门真的生效"这件事可测了。
  */
-const ALLOW_ROOTS = [TESTDATA_DIR, SAVE_DIR].join(';')
+const ALLOW_ROOTS = [TESTDATA_DIR, SAVE_DIR, SRC_DIR].join(';')
 
 let pass = 0
 let fail = 0
@@ -140,6 +146,8 @@ await new Promise((resolve, reject) => {
 let id = 0
 const pending = new Map()
 const errors = []
+/** 页面上弹过的原生对话框（关窗口时的"未保存"确认就在这里） */
+const dialogs = []
 ws.addEventListener('message', (ev) => {
   const m = JSON.parse(ev.data)
   if (m.id && pending.has(m.id)) {
@@ -147,6 +155,21 @@ ws.addEventListener('message', (ev) => {
     pending.delete(m.id)
     m.error ? rej(new Error(JSON.stringify(m.error))) : res(m.result)
     return
+  }
+  if (m.method === 'Page.javascriptDialogOpening') {
+    dialogs.push({ type: m.params?.type, message: m.params?.message ?? '' })
+    /*
+     * 一律按「取消」关掉。
+     * 🔴 不处理的话，原生 confirm 会**阻塞页面** → CDP 的 evaluate 永远不返回，
+     *    整套测试的表现是"卡死"而不是"失败"（跟 beforeunload 那个坑同源）。
+     */
+    ws.send(
+      JSON.stringify({
+        id: ++id,
+        method: 'Page.handleJavaScriptDialog',
+        params: { accept: false },
+      }),
+    )
   }
   if (m.method === 'Runtime.exceptionThrown') {
     errors.push(m.params?.exceptionDetails?.text ?? 'unknown')
@@ -577,6 +600,118 @@ async function countAnnots(path) {
   }
 }
 
+/**
+ * 读一个 PDF 里所有 FreeText 注释：内容 + `/AP` 用的字体信息。
+ *
+ * 判"中文到底画出来了没有"**只能看结构**，不能看字节串：
+ *   · 嵌入的子集字体一定有 `Type0` + `DescendantFonts[0].FontDescriptor.FontFile2`；
+ *   · 退回"占位横线"时一个字体都不会有（横线是画出来的矩形）。
+ * 所以这两项就是"真的画了中文"的机器判据。
+ *
+ * ⚠️ `Contents` 不要用 `lookupMaybe(…, PDFString, PDFHexString)`：写成 `PDFName`
+ *    （历史版本的 bug）时会抛 `UnexpectedObjectTypeError`，整个测试崩掉。
+ */
+async function freeTextInfo(path) {
+  const { PDFDocument, PDFName, PDFDict, PDFArray, PDFStream } = await import('@cantoo/pdf-lib')
+  const p = await PDFDocument.load(await readFile(path), {
+    ignoreEncryption: true,
+    updateMetadata: false,
+  })
+  const out = []
+  for (const page of p.getPages()) {
+    const annots = page.node.Annots()
+    if (!annots) continue
+    for (let i = 0; i < annots.size(); i++) {
+      let d = null
+      try {
+        d = p.context.lookup(annots.get(i), PDFDict)
+      } catch {
+        continue
+      }
+      if (!d) continue
+      if (String(d.lookupMaybe(PDFName.of('Subtype'), PDFName)) !== '/FreeText') continue
+      const raw = d.get(PDFName.of('Contents'))
+      const contents = raw && typeof raw.decodeText === 'function' ? raw.decodeText() : ''
+      const fonts = { type0: 0, embedded: 0, base: [] }
+      const ap = d.lookupMaybe(PDFName.of('AP'), PDFDict)
+      const n = ap ? ap.lookupMaybe(PDFName.of('N'), PDFDict, PDFStream) : null
+      const nDict = n instanceof PDFDict ? n : (n?.dict ?? null)
+      const res = nDict ? nDict.lookupMaybe(PDFName.of('Resources'), PDFDict) : null
+      const fontDict = res ? res.lookupMaybe(PDFName.of('Font'), PDFDict) : null
+      if (fontDict) {
+        for (const k of fontDict.keys()) {
+          const f = fontDict.lookupMaybe(k, PDFDict)
+          if (!f) continue
+          fonts.base.push(String(f.lookupMaybe(PDFName.of('BaseFont'), PDFName)))
+          if (String(f.lookupMaybe(PDFName.of('Subtype'), PDFName)) === '/Type0') fonts.type0++
+          const desc = f.lookupMaybe(PDFName.of('DescendantFonts'), PDFArray)
+          const cid = desc ? p.context.lookupMaybe(desc.get(0), PDFDict) : null
+          const fd = cid ? cid.lookupMaybe(PDFName.of('FontDescriptor'), PDFDict) : null
+          if (fd && fd.has(PDFName.of('FontFile2'))) fonts.embedded++
+        }
+      }
+      out.push({ contents, fonts })
+    }
+  }
+  return out
+}
+
+/** 等提示条出现，返回它的文字（`until` 是正则，匹配不到就超时返回最后一次内容） */
+async function waitToast(until) {
+  let t = ''
+  for (let i = 0; i < 90; i++) {
+    await sleep(300)
+    t = await evaluate(`(document.querySelector('.toast') || {}).textContent || ''`)
+    if (until.test(t)) break
+  }
+  return t
+}
+
+/** 在第 1 页上按相对位置画一笔手写（调用前必须已经选中「手写」工具） */
+async function drawInkAt(fx = 0.5, fy = 0.45) {
+  const box = JSON.parse(
+    await evaluate(`(() => {
+      const s = document.querySelector('.page-slot[data-page="1"]');
+      if (!s) return 'null';
+      const r = s.getBoundingClientRect();
+      return JSON.stringify({ x: r.left, y: r.top, w: r.width, h: r.height });
+    })()`),
+  )
+  if (!box) return false
+  const cx = box.x + box.w * fx
+  const cy = box.y + Math.min(box.h * fy, 480)
+  const mouseAt = (type, x, y, buttons) =>
+    send('Input.dispatchMouseEvent', {
+      type,
+      x: Math.round(x),
+      y: Math.round(y),
+      button: 'left',
+      buttons,
+      clickCount: 1,
+    })
+  await mouseAt('mousePressed', cx - 50, cy, 1)
+  for (let i = 1; i <= 8; i++) {
+    await mouseAt('mouseMoved', cx - 50 + i * 12, cy + Math.sin(i / 2) * 10, 1)
+    await sleep(12)
+  }
+  await mouseAt('mouseReleased', cx + 46, cy, 0)
+  await sleep(350)
+  return true
+}
+
+/** 从文件列表打开当前唯一那一本，标题栏出现 `name` 就算成功 */
+async function openFromList(name) {
+  await evaluate(clickByTidExpr('文件'))
+  await sleep(700)
+  await evaluate(`document.querySelector('[data-tid="files-panel"] [data-kind="file"]')?.click()`)
+  for (let i = 0; i < 60; i++) {
+    await sleep(400)
+    const t = await evaluate(`(document.querySelector('[data-tid="file-name"]')||{}).textContent||''`)
+    if (t.includes(name)) return true
+  }
+  return false
+}
+
 // ---- 6a. 默认保存目录
 const defDir = await invoke('default_save_dir')
 check(
@@ -809,6 +944,180 @@ if (existsSync(bakPath)) {
     '.bak 的批注数与原件一致（备份是覆盖前的状态，不是覆盖后的）',
     (await countAnnots(bakPath)) === annotsBefore2,
     `${await countAnnots(bakPath)} vs ${annotsBefore2}`,
+  )
+}
+
+// ---------------------------------------------------------------- 6d/6e
+/*
+ * ---- 6d. 覆盖保存时 `.bak` 落在哪（设置里的开关）
+ *
+ * 用户报的："另存为的路径设置好了，但直接保存后的 bak 依然跟原文件在同一路径"。
+ * 原来的实现把 bak 固定写在**被覆盖文件的旁边**，跟他设的保存位置无关。
+ *
+ * 判据要**两个目录都看**：只断言"保存目录里有 bak"是不够的 ——
+ * 两边各写一份也能通过，而用户抱怨的恰恰是原目录里多出来那一份。
+ */
+console.log('\n[6d] 覆盖保存时 .bak 的落点（设置开关：同原目录 / 跟保存位置）')
+
+await rm(SRC_DIR, { recursive: true, force: true }).catch(() => {})
+await mkdir(SRC_DIR, { recursive: true })
+const srcPdf = join(SRC_DIR, 'bak-src.pdf')
+const bakBeside = join(SRC_DIR, 'bak-src.bak.pdf')
+const bakInSave = join(SAVE_DIR, 'bak-src.bak.pdf')
+await copyFile(PDF, srcPdf)
+
+const writeSettings = (extra) => evaluate(`
+  localStorage.setItem('epl.settings.v1', JSON.stringify(Object.assign({
+    saveMode: 'overwrite',
+    saveDir: ${JSON.stringify(SAVE_DIR)},
+    backupPos: 'same',
+    theme: 'dark',
+  }, ${JSON.stringify(extra)})))
+`)
+
+await evaluate(`
+  localStorage.setItem('epl:file-list', JSON.stringify([
+    { name: 'bak-src.pdf', path: ${JSON.stringify(srcPdf)}, kind: 'file' },
+  ]));
+`)
+await writeSettings({ backupPos: 'same' })
+await send('Page.reload')
+await sleep(2600)
+check('从文件列表打开了原件', await openFromList('bak-src'))
+
+await evaluate(clickByTidExpr('手写'))
+await sleep(250)
+await drawInkAt()
+await evaluate(clickByTidExpr('保存批注'))
+let toast6d = await waitToast(/已覆盖/)
+check('覆盖保存成功', /已覆盖/.test(toast6d), toast6d.replace(/\s+/g, ' ').slice(0, 80))
+check(
+  'backupPos=same → .bak 在**原文件目录**，保存目录里没有多余的一份',
+  existsSync(bakBeside) && !existsSync(bakInSave),
+  `原目录=${existsSync(bakBeside)} 保存目录=${existsSync(bakInSave)}`,
+)
+
+// 换成「跟保存位置一致」，再覆盖一次
+await rm(bakBeside, { force: true })
+await rm(bakInSave, { force: true })
+const sizeBefore2 = (await stat(srcPdf)).size
+await writeSettings({ backupPos: 'saveDir' })
+await send('Page.reload')
+await sleep(2600)
+check('重新打开原件（第二回合）', await openFromList('bak-src'))
+await evaluate(clickByTidExpr('手写'))
+await sleep(250)
+await drawInkAt(0.6, 0.55)
+await evaluate(clickByTidExpr('保存批注'))
+toast6d = await waitToast(/已覆盖/)
+check('第二次覆盖保存成功', /已覆盖/.test(toast6d), toast6d.replace(/\s+/g, ' ').slice(0, 80))
+check(
+  'backupPos=saveDir → .bak 落在**保存目录**，原目录里没有',
+  existsSync(bakInSave) && !existsSync(bakBeside),
+  `原目录=${existsSync(bakBeside)} 保存目录=${existsSync(bakInSave)}`,
+)
+if (existsSync(bakInSave)) {
+  const bakSize = (await stat(bakInSave)).size
+  check(
+    '.bak 是**这次覆盖前**的原件（字节数对得上，不是写完之后再拷的）',
+    bakSize === sizeBefore2,
+    `${bakSize} vs ${sizeBefore2}`,
+  )
+}
+
+/*
+ * ---- 6e. 中文文本框：字体必须真的嵌进去
+ *
+ * 用户报的（最严重那条）："打完字保存，中文全部变成灰条，只有纯英文能正常显示"。
+ * 根因是标准 14 字体没有 CJK 字形，旧实现干脆画"占位灰条"。
+ * 现在改成读系统字体 + 子集化嵌入 —— 判据要看**保存出来的 PDF 结构**。
+ */
+console.log('\n[6e] 中文文本框：嵌入字体（不再是灰条）')
+
+await writeSettings({ saveMode: 'copy' })
+/*
+ * 用**文件列表**打开原件，不走 `<input type=file>`：
+ * 前一版走 file input，结果 24 秒都没出现页面（reload 之后那个 input 的
+ * change 链路在某些时机会哑掉）。文件列表这条路径上面刚验证过是通的，
+ * 而且走真实路径更接近用户操作。
+ */
+await evaluate(`
+  localStorage.setItem('epl:file-list', JSON.stringify([
+    { name: 'real-1706.03762.pdf', path: ${JSON.stringify(PDF)}, kind: 'file' },
+  ]));
+  localStorage.removeItem('epl:last-doc');
+`)
+await send('Page.reload')
+await sleep(2600)
+check('中文测试用的 PDF 打开了', await openFromList('real-1706'))
+
+const origSize = (await stat(PDF)).size
+await evaluate(clickByTidExpr('文本框'))
+await sleep(260)
+{
+  const b = JSON.parse(
+    await evaluate(`(() => {
+      const s = document.querySelector('.page-slot[data-page="1"]');
+      const r = s.getBoundingClientRect();
+      return JSON.stringify({ x: r.left, y: r.top, w: r.width, h: r.height });
+    })()`),
+  )
+  const x0 = b.x + 60
+  const y0 = b.y + Math.min(b.h * 0.3, 200)
+  const mouseAt = (type, x, y, buttons) =>
+    send('Input.dispatchMouseEvent', {
+      type,
+      x: Math.round(x),
+      y: Math.round(y),
+      button: 'left',
+      buttons,
+      clickCount: 1,
+    })
+  await mouseAt('mousePressed', x0, y0, 1)
+  for (let i = 1; i <= 6; i++) {
+    await mouseAt('mouseMoved', x0 + (260 * i) / 6, y0 + (90 * i) / 6, 1)
+    await sleep(16)
+  }
+  await mouseAt('mouseReleased', x0 + 260, y0 + 90, 0)
+  await sleep(700)
+  check('拖出一个文本框并进入编辑态', await evaluate(`!!document.querySelector('[data-tid="text-edit"]')`))
+  await send('Input.insertText', { text: '中文渲染测试：中英混排 abc 123' })
+  await sleep(400)
+  // 点页面左上角空白处结束编辑（⚠️ 必须落在框外）
+  await mouseAt('mousePressed', b.x + 14, b.y + 14, 1)
+  await mouseAt('mouseReleased', b.x + 14, b.y + 14, 0)
+  await sleep(600)
+}
+
+const ftData = await evaluate(
+  `JSON.stringify((globalThis.__eplViewer?.annots?.() ?? []).filter(a => a.kind === 'freetext').map(a => a.text))`,
+)
+check('文本框内容进了批注数据', /中文渲染测试/.test(String(ftData)), String(ftData).slice(0, 80))
+
+await evaluate(clickByTidExpr('保存批注'))
+const toast6e = await waitToast(/已保存/)
+check('保存成功', /已保存/.test(toast6e), toast6e.replace(/\s+/g, ' ').slice(0, 90))
+
+const cjkPath = (toast6e.match(/[A-Za-z]:\\[^]*?\.pdf/) ?? [''])[0].trim()
+check('从提示里解析出落盘路径', !!cjkPath, cjkPath)
+if (cjkPath) {
+  const infos = await freeTextInfo(cjkPath)
+  const mine = infos.find((i) => i.contents.includes('中文渲染测试'))
+  check('保存出的 PDF 里有这条中文 FreeText（内容没丢）', !!mine, `共 ${infos.length} 条 FreeText`)
+  check(
+    '字体是 **Type0**（CID 字体），不是标准 Helvetica',
+    !!mine && mine.fonts.type0 > 0,
+    mine ? mine.fonts.base.join(',') : '',
+  )
+  check(
+    '字体**真的嵌入**了（FontDescriptor 里有 FontFile2）—— 这才叫"画出来"而不是灰条',
+    !!mine && mine.fonts.embedded > 0,
+  )
+  const grown = (await stat(cjkPath)).size - origSize
+  check(
+    '只嵌了用到的字形（子集化）：文件没有暴涨到 +9MB',
+    grown > 0 && grown < 3 * 1024 * 1024,
+    `+${(grown / 1024).toFixed(1)} KB`,
   )
 }
 
@@ -1050,10 +1359,159 @@ check(
   existsSync(WHITELIST) ? WHITELIST : '文件不存在',
 )
 
+/*
+ * ---- 6g. 只读原文件 / 带 `\\?\` 的旧保存目录
+ *
+ * 用户报的："为什么保存位置前面会有 `\\?\`，然后我就保存失败了，报错是 undefined"。
+ * 真因是两条独立的毛病叠在一起：
+ *   ① 他那个 PDF **是只读的**（网盘/压缩包解出来的）→ `fs::write` 报"拒绝访问"；
+ *   ② 前端 `(e as Error).message` 对**字符串** rejection 取不到内容 → 显示 undefined。
+ * （`\\?\` 本身不影响写入 —— 下面第 1 条就是拿它当对照组。）
+ */
+console.log('\n[6g] 只读原文件 / 带 \\\\?\\ 前缀的路径')
+
+{
+  // 对照组：直接用扩展长度前缀写一个新文件，必须成功（证明 `\\?\` 无罪）
+  const small = await readFile(resolve(ROOT, 'public/testdata/annot-fixture.pdf'))
+  const tinyB64 = small.toString('base64')
+  const LONG = '\\\\?\\'
+  const probe = (p) => `(async () => {
+    try {
+      const r = await window.__TAURI_INTERNALS__.invoke('write_pdf_b64', {
+        path: ${JSON.stringify(p)},
+        b64: ${JSON.stringify(tinyB64)},
+        makeBackup: false,
+        backupDir: null,
+      })
+      return 'OK ' + JSON.stringify(r)
+    } catch (e) {
+      return 'ERR ' + (typeof e === 'string' ? e : JSON.stringify(e))
+    }
+  })()`
+  const plain = await evaluate(probe(join(SAVE_DIR, 'prefix-plain.pdf')))
+  const longPath = await evaluate(probe(LONG + join(SAVE_DIR, 'prefix-long.pdf')))
+  check('普通路径写入成功（对照）', /^OK/.test(plain), String(plain).slice(0, 120))
+  check('带 \\\\?\\ 前缀也能写入（它不是失败的原因）', /^OK/.test(longPath), String(longPath).slice(0, 120))
+  check(
+    '返回值是结构化结果，且路径**不带** `\\?\` 前缀',
+    /"path":"[A-Za-z]:/.test(longPath),
+    String(longPath).slice(0, 160),
+  )
+}
+
+// ---- 只读文件覆盖保存（走完整 UI）
+const roPath = join(SRC_DIR, 'readonly-src.pdf')
+// 上一轮可能留下只读文件 —— 先恢复可写再删
+await chmod(roPath, 0o666).catch(() => {})
+await rm(roPath, { force: true }).catch(() => {})
+await copyFile(PDF, roPath)
+// Node 在 Windows 上就是靠写位来表示"只读"
+await chmod(roPath, 0o444)
+const roModeBefore = (await stat(roPath)).mode
+check('测试用副本已经设成只读', (roModeBefore & 0o200) === 0, (roModeBefore & 0o777).toString(8))
+
+await evaluate(`
+  localStorage.setItem('epl:file-list', JSON.stringify([
+    { name: 'readonly-src.pdf', path: ${JSON.stringify(roPath)}, kind: 'file' },
+  ]));
+`)
+// saveDir 故意塞成老版本那种带 `\\?\` 的脏值 —— 前端要能洗干净再显示/使用
+await writeSettings({ saveDir: '\\\\?\\' + SAVE_DIR })
+await send('Page.reload')
+await sleep(2600)
+
+// 顺手验一下"旧数据里的 \\?\ 会被洗干净再显示"
+await evaluate(clickByTidExpr('设置'))
+await sleep(700)
+const shownDir = await evaluate(`(document.querySelector('.dir-path') || {}).textContent || ''`)
+check(
+  '设置里显示的是干净路径（没有 `\\?\` 前缀）',
+  !!shownDir && !String(shownDir).includes(String.fromCharCode(92, 92, 63, 92)),
+  String(shownDir),
+)
+
+check('从文件列表打开了只读那份', await openFromList('readonly-src'))
+await evaluate(clickByTidExpr('手写'))
+await sleep(250)
+await drawInkAt()
+await evaluate(clickByTidExpr('保存批注'))
+const toastRo = await waitToast(/已覆盖/)
+check('只读原文件也**保存成功**了', /已覆盖/.test(toastRo), toastRo.replace(/\s+/g, ' ').slice(0, 120))
+check(
+  '提示里说清了"原文件是只读的，已取消只读"',
+  /取消只读/.test(toastRo),
+  toastRo.replace(/\s+/g, ' ').slice(0, 120),
+)
+check(
+  '提示里的路径也是干净的',
+  !toastRo.includes(String.fromCharCode(92, 92, 63, 92)),
+)
+const roModeAfter = (await stat(roPath)).mode
+check(
+  '只读属性真的被取消了（否则下次还会失败一次）',
+  (roModeAfter & 0o200) !== 0,
+  (roModeAfter & 0o777).toString(8),
+)
+check(
+  '内容确实写进去了（批注数 +1）',
+  (await countAnnots(roPath)) === (await countAnnots(PDF)) + 1,
+  `${await countAnnots(PDF)} → ${await countAnnots(roPath)}`,
+)
+
 // ---------------------------------------------------------------- 8. 控制台
 console.log('\n[8] 控制台')
-const real = errors.filter((e) => !/favicon/i.test(e))
-check('没有未捕获异常 / error', real.length === 0, real.slice(0, 3).join(' | ') || '干净')
+const realErrors = errors.filter((e) => !/favicon/i.test(e))
+check(
+  '没有未捕获异常 / error',
+  realErrors.length === 0,
+  realErrors.slice(0, 3).join(' | ') || '干净',
+)
+
+/*
+ * ---- 6f. 点 ✕ 关窗口时的未保存拦截（**刻意放最后**）
+ *
+ * 用户报的："做了批注没有保存时没有弹出未保存警告"。
+ * 根因：桌面端关窗口走 Tauri 的 CloseRequested → 直接销毁 webview，
+ * **不保证**跑页面里的 `beforeunload`。必须显式 `win.onCloseRequested()` 拦。
+ *
+ * 🔴 这一段之后**不能再有任何页面操作**：
+ *    确认框走 Tauri 的原生 dialog（`plugin-dialog` 的 ask），在 Windows 上是
+ *    主线程的模态 MessageBox —— 它一弹出来，WebView 的 JS 消息循环就停了，
+ *    CDP 的 `Runtime.evaluate` 永远不返回（第一次跑就是在这里把后面全卡死的）。
+ *    所以判据只能用**浏览器级**的 `Target.getTargets`，它不经过页面。
+ *
+ *    反过来说，这也解释了用户报的另一半："点了 ✕ 像死机" —— 以前用
+ *    `window.confirm` 是**同样**的效果（页面 JS 整段阻塞）。
+ */
+console.log('\n[6f] 点 ✕ 关窗口：未保存的批注要拦一下')
+// 先回到一个干净状态（上一段结束时工具/面板/批注都攒了一堆历史，
+// 直接接着画容易受它们影响；reload 一次最省事）
+await send('Page.reload')
+await sleep(2600)
+check('重新打开只读那份（本次直接用原文件）', await openFromList('readonly-src'))
+await evaluate(clickByTidExpr('批注'))
+await sleep(320)
+await evaluate(clickByTidExpr('手写'))
+await sleep(260)
+await drawInkAt()
+check(
+  '现在有未保存的批注（前提）',
+  await evaluate(`!!document.querySelector('[data-tid="unsaved"]')`),
+)
+
+await evaluate(`document.querySelector('[data-tid="win-close"]')?.click()`)
+await sleep(2000)
+const alive = await Promise.race([
+  send('Target.getTargets')
+    .then((t) => (t.targetInfos ?? []).some((x) => x.type === 'page'))
+    .catch(() => false),
+  sleep(6000).then(() => null),
+])
+check(
+  '点 ✕ 被拦下来了（窗口还在 → 说明弹了"还有批注没保存，确定关闭吗"）',
+  alive === true,
+  alive === null ? '连浏览器级命令都没响应' : alive === false ? '窗口直接被关掉了' : '',
+)
 
 console.log(`\n==================================================`)
 console.log(`结果：${pass} 通过 / ${fail} 失败`)

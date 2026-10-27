@@ -20,6 +20,17 @@ import { IS_TAURI } from '@/platform'
 /** 保存方式：另存一份到指定目录 / 直接覆盖原文件 */
 export type SaveMode = 'copy' | 'overwrite'
 
+/**
+ * 覆盖原文件时，`.bak` 放哪。
+ *
+ * · `same`    —— 跟被覆盖的文件同目录（老行为，也是默认）
+ * · `saveDir` —— 跟「保存位置」一致
+ *
+ * 用户报的问题：把「保存位置」设到 D:\笔记，覆盖保存之后 .bak 还是掉在原书旁边，
+ * 于是同一本书的两个目录里各有一半东西，找起来很别扭。给个开关让他自己定。
+ */
+export type BackupPos = 'same' | 'saveDir'
+
 /** 主题：跟随系统 / 日间 / 夜间 */
 export type ThemeMode = 'system' | 'light' | 'dark'
 
@@ -28,6 +39,8 @@ export interface Settings {
   saveMode: SaveMode
   /** 另存的目录。空串 = 用默认目录（由 Rust 侧算，见 defaultSaveDir） */
   saveDir: string
+  /** `.bak` 放哪（只在「覆盖原文件」时有意义） */
+  backupPos: BackupPos
   theme: ThemeMode
 }
 
@@ -36,7 +49,26 @@ const KEY = 'epl.settings.v1'
 const DEFAULTS: Settings = {
   saveMode: 'copy',
   saveDir: '',
+  backupPos: 'same',
   theme: 'system',
+}
+
+/**
+ * 洗掉路径里的 Windows **扩展长度前缀** `\\?\`。
+ *
+ * 为什么需要：`pick_folder` 那边以前把 Rust 的规范化形式（`\\?\D:\…`）直接返回给前端，
+ * 于是它进了 localStorage，设置面板里就显示成 `\\?\D:\some\dir` —— 用户第一反应是
+ * "路径坏了"。Rust 侧已经改成返回干净路径，这里负责**把老数据洗干净**。
+ *
+ * ⚠️ 只是显示与存储用。真正读写时 `allowed.check()` 会再规范化一次，
+ *    拿干净路径回来照样过闸门。
+ */
+function cleanPath(p: string): string {
+  // `\\?\UNC\server\share` → `\\server\share`
+  if (p.startsWith('\\\\?\\UNC\\')) return '\\\\' + p.slice(8)
+  // `\\?\C:\…` → `C:\…`（卷 GUID 形式 `\\?\Volume{…}` 不动）
+  if (/^\\\\\?\\[A-Za-z]:[\\/]/.test(p)) return p.slice(4)
+  return p
 }
 
 function load(): Settings {
@@ -47,7 +79,8 @@ function load(): Settings {
     return {
       // ⚠️ 逐字段兜底：老版本存的 JSON 可能缺字段，直接展开会把新字段变成 undefined
       saveMode: o.saveMode === 'overwrite' ? 'overwrite' : 'copy',
-      saveDir: typeof o.saveDir === 'string' ? o.saveDir : '',
+      saveDir: cleanPath(typeof o.saveDir === 'string' ? o.saveDir : ''),
+      backupPos: o.backupPos === 'saveDir' ? 'saveDir' : 'same',
       theme: o.theme === 'light' || o.theme === 'dark' ? o.theme : 'system',
     }
   } catch {

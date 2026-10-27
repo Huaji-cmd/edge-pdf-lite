@@ -359,9 +359,19 @@ impl Allowed {
                     let p = PathBuf::from(line);
                     // ⚠️ 只收绝对路径。相对路径没有意义，而且 `..` 这种
                     //    一旦进了列表就是"放行本级以上的任意东西"。
-                    if p.is_absolute() {
-                        persisted.push(p);
+                    if !p.is_absolute() {
+                        continue;
                     }
+                    /*
+                     * 统一成**规范化形式**再存。
+                     *
+                     * 老版本落盘的条目可能没带 `\\?\` 前缀，也可能写的是正斜杠；
+                     * 而 `check()` 拿进来的一律是 `\\?\D:\…`。两边形式不一致时
+                     * `starts_with` 永远不成立 —— 症状是"我明明选过这个目录，
+                     * 它却说不在允许范围内"。这里解析不了（比如文件被删了）
+                     * 就保留原样，至少不丢信息。
+                     */
+                    persisted.push(resolveish(&p).unwrap_or(p));
                 }
             }
         }
@@ -429,7 +439,7 @@ impl Allowed {
         Err(format!(
             "拒绝访问：{} 不在允许范围内。\n\
              只允许用户通过「添加文件 / 添加文件夹 / 选择保存目录」亲手选过的位置。",
-            want.display()
+            display_path(&want)
         ))
     }
 }
@@ -453,9 +463,35 @@ fn resolveish(p: &Path) -> Option<PathBuf> {
     Some(parent.canonicalize().ok()?.join(name))
 }
 
+/// 给人看的路径：把 Windows 的**扩展长度前缀** `\\?\` 去掉。
+///
+/// 为什么要有它：`resolveish()` 走 `canonicalize()`，Windows 上返回的一律是
+/// `\\?\D:\…`。这个前缀对 `std::fs` 无害（写/读都正常），但它会**漏到界面上** ——
+/// 设置里显示成 `\\?\D:\some\dir`，用户第一反应是"路径坏了"。
+/// 而且 `explorer /select,` **不认**这个前缀。
+///
+/// ⚠️ 只用于"显示 / 存设置 / 交给 explorer"。**白名单比对仍用规范化形式**
+///    （`check()` 会再 resolveish 一次，所以拿干净路径回来也能过闸门）。
+///
+/// ⚠️ UNC 是 `\\?\UNC\server\share\…`，去掉前缀要还原成 `\\server\share\…`；
+///    `\\?\Volume{…}` 这种卷 GUID 路径保持原样（去掉前缀就不是同一个东西了）。
+fn display_path(p: &Path) -> String {
+    let s = p.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{}", rest);
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        let b = rest.as_bytes();
+        // 只认盘符形式：`C:\…`
+        if b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+            return rest.to_string();
+        }
+    }
+    s
+}
+
 /// 只收 `.pdf`。这是 PDF 阅读器，别的文件没有理由走到这几个命令上。
-fn ensure_pdf_ext(p: &Path) -> Result<(), String> {
-    let ok = p
+fn ensure_pdf_ext(p: &Path) -> Result<(), String> {    let ok = p
         .extension()
         .map(|e| e.to_string_lossy().eq_ignore_ascii_case("pdf"))
         .unwrap_or(false);
@@ -491,8 +527,12 @@ fn register_picked(picked: Vec<FilePath>, allowed: &Allowed) -> Vec<String> {
     for f in picked {
         let Ok(p) = f.into_path() else { continue };
         let Some(real) = resolveish(&p) else { continue };
-        allowed.add(real.clone());
-        out.push(real.to_string_lossy().into_owned());
+        // 白名单里存**规范化形式**（`\\?\…`），但返回给前端的必须是**干净路径** ——
+        // 这个值会进 localStorage、显示在设置面板、拼成保存路径。
+        // 把 `\\?\` 漏出去过一次，用户直接问"为什么前面有这个"。
+        let shown = display_path(&real);
+        allowed.add(real);
+        out.push(shown);
     }
     out
 }
@@ -570,7 +610,10 @@ fn list_dir(allowed: State<Allowed>, path: String) -> Result<Vec<DirEntry>, Stri
         if !is_dir && !is_pdf {
             continue;
         }
-        let full = entry.path().to_string_lossy().into_owned();
+        // ⚠️ 这里也要去掉 `\\?\`：`path` 会进文件列表的 localStorage、
+        //    显示在右键菜单和标题上。带前缀的话用户看到的是一堆 `\\?\D:\…`。
+        //    （闸门那边不受影响：`check()` 会再规范化一次。）
+        let full = display_path(&entry.path());
         out.push(DirEntry {
             name,
             path: full,
@@ -610,6 +653,45 @@ fn read_pdf_bytes(allowed: State<Allowed>, path: String) -> Result<tauri::ipc::R
     ensure_size(len)?;
     let bytes = std::fs::read(p).map_err(|e| format!("读不了 {}: {}", path, e))?;
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/*
+ * 读一份**系统中文字体**，给「把中文写进 PDF」用。
+ *
+ * 为什么需要它：PDF 的标准 14 字体里**没有 CJK 字形**，硬写中文要么是乱码，
+ * 要么是查看器里一片空白/灰条。唯一可靠的做法是**嵌入字体**（子集化之后
+ * 一份 PDF 只多几十 KB），而嵌入总得先有字体字节。
+ *
+ * 🔴 **不能**把字体打进安装包：完整中文字体 10 MB 左右，跟"lite"的定位冲突，
+ *    而且用户机器上本来就有。所以运行时从 `%WINDIR%\Fonts` 读。
+ *
+ * 🔴 **这条命令刻意没有路径参数、也不进白名单闸门**：它能读的只有下面
+ *    候选列表里的三个文件名，不是"通用读文件"。加参数就变成了新的洞。
+ *
+ * ⚠️ 返回 `tauri::ipc::Response` 的理由同 `read_pdf_bytes`：
+ *    `Vec<u8>` 会被序列化成数字数组（9.7 MB 的字体 → 30 MB 的 JSON）。
+ *
+ * ⚠️ 候选顺序：`simhei.ttf`（黑体，单文件 TTF、字形覆盖最稳）优先。
+ *    `msyh.ttc` / `simsun.ttc` 是**字体集合**，fontkit 打开要额外指定索引，
+ *    这里不用它们。
+ */
+#[tauri::command]
+fn read_system_font() -> Result<tauri::ipc::Response, String> {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let fonts_dir = Path::new(&windir).join("Fonts");
+    const CANDIDATES: [&str; 3] = ["simhei.ttf", "Deng.ttf", "simkai.ttf"];
+    for name in CANDIDATES {
+        let p = fonts_dir.join(name);
+        if !p.is_file() {
+            continue;
+        }
+        match std::fs::read(&p) {
+            Ok(bytes) => return Ok(tauri::ipc::Response::new(bytes)),
+            // 某个文件读不了（权限/占用）不算致命，继续试下一个
+            Err(_) => continue,
+        }
+    }
+    Err("这台机器上没找到可用的中文字体（simhei.ttf / Deng.ttf / simkai.ttf）".into())
 }
 
 /// 打开文件时判断：这个路径还在不在（上次记住的文件可能被删了）。
@@ -672,14 +754,54 @@ fn dirs_next() -> Option<String> {
  *
  * ⚠️ `make_backup`：覆盖**原文件**时要先留一份 .bak。
  *    这是不可逆操作唯一的后悔药，由调用方按"是不是覆盖原文件"决定。
+ *
+ * 🔴 **只读文件**：从网盘 / 压缩包解出来的 PDF 经常带 `FILE_ATTRIBUTE_READONLY`，
+ *    `std::fs::write` 直接报"拒绝访问"。用户看到的只是"保存失败"，根本猜不到是属性问题
+ *    （实测他就卡在这上面，而且因为前端把错误吞成了 undefined，连原因都看不到）。
+ *    现在的做法：写之前**取消只读**（备份已经先做过了，有后悔药），
+ *    并在返回值里说一声，让界面能提示"已帮你取消只读"。
  */
+#[derive(serde::Serialize)]
+struct WriteResult {
+    /** 实际写入的路径（`\\?\` 已去掉，能直接显示/显示给用户） */
+    path: String,
+    /** 备份文件的完整路径；没备份就是 null */
+    backup: Option<String>,
+    /** 目标文件原来是只读的、被我们取消了 */
+    readonly_cleared: bool,
+}
+
+/// 去掉只读属性。返回**是否真的改过**（本来就可写 → false）
+fn clear_readonly(p: &Path) -> bool {
+    let Ok(md) = std::fs::metadata(p) else {
+        return false;
+    };
+    let mut perm = md.permissions();
+    if !perm.readonly() {
+        return false;
+    }
+    perm.set_readonly(false);
+    std::fs::set_permissions(p, perm).is_ok()
+}
+
 #[tauri::command]
 fn write_pdf_b64(
     allowed: State<Allowed>,
     path: String,
     b64: String,
     make_backup: bool,
-) -> Result<String, String> {
+    /*
+     * 备份放哪。
+     *
+     * 空 / None = 跟被覆盖的文件放同一个目录（老行为）。
+     * 有值 = 放到这个目录（用户把「另存目录」设成别处时，.bak 也该跟着过去，
+     *        否则原件目录里会莫名其妙多出一堆 .bak）。
+     *
+     * ⚠️ 这个目录**也要过白名单闸门** —— 备份等于在目标目录里**新建**一个文件。
+     *    闸门没过就退回原目录（不能让"备份位置不合规"演变成"保存整体失败"）。
+     */
+    backup_dir: Option<String>,
+) -> Result<WriteResult, String> {
     // 闸门 ①：写到哪里必须在放行范围内（覆盖原文件 = 那个文件本身；
     //          另存 = 保存目录之内。两种都被白名单覆盖得到）
     allowed.check(&path)?;
@@ -693,21 +815,45 @@ fn write_pdf_b64(
     // 父目录可能不存在（用户手填了一个路径）
     if let Some(parent) = Path::new(&path).parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("建不了目录 {}: {}", parent.display(), e))?;
+            .map_err(|e| format!("建不了目录 {}: {}", display_path(parent), e))?;
     }
 
+    let mut backup_out: Option<String> = None;
     if make_backup && Path::new(&path).exists() {
-        let bak = backup_path(&path);
+        let mut target_dir: Option<PathBuf> = backup_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from);
+        // 备份目录也必须是自己被放行过的地方；没登记就老老实实退回原目录
+        if let Some(dir) = target_dir.as_ref() {
+            let probe = dir.join("__epl_backup_probe__.pdf");
+            if allowed.check(&probe.to_string_lossy()).is_err() || !dir.is_dir() {
+                target_dir = None;
+            }
+        }
+        let bak = backup_path(&path, target_dir.as_deref());
         std::fs::copy(&path, &bak)
             .map_err(|e| format!("备份失败（已中止保存，原文件没动）：{}", e))?;
+        backup_out = Some(display_path(&bak));
     }
 
-    std::fs::write(&path, &bytes).map_err(|e| format!("写不了 {}: {}", path, e))?;
-    Ok(path)
+    // 备份已经落好了，所以这里清只读是安全的
+    let readonly_cleared = clear_readonly(Path::new(&path));
+
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("写不了 {}：{}", display_path(Path::new(&path)), e))?;
+    Ok(WriteResult {
+        path: display_path(Path::new(&path)),
+        backup: backup_out,
+        readonly_cleared,
+    })
 }
 
-/// 备份文件名：`书.pdf` → `书.bak.pdf`（放在同一个目录里）
-fn backup_path(path: &str) -> std::path::PathBuf {
+/// 备份文件名：`书.pdf` → `书.bak.pdf`
+///
+/// @param dir 备份放在哪个目录；`None` = 跟源文件同目录
+fn backup_path(path: &str, dir: Option<&Path>) -> std::path::PathBuf {
     let p = Path::new(path);
     let stem = p
         .file_stem()
@@ -717,13 +863,20 @@ fn backup_path(path: &str) -> std::path::PathBuf {
         .extension()
         .map(|s| format!(".{}", s.to_string_lossy()))
         .unwrap_or_default();
+    let base: PathBuf = match dir {
+        Some(d) => d.to_path_buf(),
+        None => p
+            .parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
     let mut name = format!("{}.bak{}", stem, ext);
-    let mut out = p.with_file_name(&name);
+    let mut out = base.join(&name);
     // 已经有一份 .bak 就往后排，别把上一份悄悄盖掉
     let mut i = 2;
     while out.exists() {
         name = format!("{}.bak{}{}", stem, i, ext);
-        out = p.with_file_name(&name);
+        out = base.join(&name);
         i += 1;
     }
     out
@@ -783,7 +936,8 @@ fn rename_file(allowed: State<Allowed>, path: String, new_name: String) -> Resul
 
     std::fs::rename(&path, &target)
         .map_err(|e| format!("重命名失败（原文件没动）：{}", e))?;
-    Ok(target.to_string_lossy().into_owned())
+    // 这个返回值会被前端写回文件列表 → 再去掉一次前缀（同 register_picked）
+    Ok(display_path(&target))
 }
 
 /// 在文件管理器里选中这个文件（Windows 自带 explorer，不用额外插件）
@@ -791,10 +945,16 @@ fn rename_file(allowed: State<Allowed>, path: String, new_name: String) -> Resul
 fn reveal_in_folder(allowed: State<Allowed>, path: String) -> Result<(), String> {
     // 闸门：explorer 的参数来自这个字符串。不加这一条，它就成了
     // "让系统去打开任意路径"的入口（也是给人看的一份路径存在性回显）。
-    allowed.check(&path)?;
+    let real = allowed.check(&path)?;
+    /*
+     * ⚠️ 交给 explorer 的必须是**去掉 `\\?\` 的路径**。
+     *    explorer 不认扩展长度前缀：传 `\\?\D:\tmp\x` 它会打开"此电脑"（甚至没反应），
+     *    而用户看到的现象只是"点了打开文件夹，位置不对"。
+     */
+    let shown = display_path(&real);
     // explorer 的 /select, 开关后面直接跟路径，逗号不能分开
     std::process::Command::new("explorer")
-        .args(["/select,", &path])
+        .args(["/select,", &shown])
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("打不开文件管理器：{}", e))
@@ -895,6 +1055,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_dir,
             read_pdf_bytes,
+            read_system_font,
             path_exists,
             default_save_dir,
             write_pdf_b64,

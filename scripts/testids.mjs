@@ -103,6 +103,8 @@ export const LABEL_TO_TID = {
   侧边栏: TID.sidebarToggle,
   选择: TID.pmSelect,
   高亮: TID.toolHighlight,
+  // 「批注」是右侧那个开合按钮（点开才露出 8 个工具）
+  批注: TID.annotToggle,
   缩略图: TID.sideThumbs,
   下划线: TID.toolUnderline,
   删除线: TID.toolStrikeout,

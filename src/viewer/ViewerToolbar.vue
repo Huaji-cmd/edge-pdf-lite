@@ -10,7 +10,7 @@
  *    实测功能区总宽需要约 1290px，而侧边栏占掉 260px 后只剩约 1150px，
  *    不腾地方一行放不下（放不下就会压扁「未保存」标记、冒横向滚动条）。
  */
-import { computed, ref, onMounted, onBeforeUnmount } from 'vue'
+import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import Icon from './Icon.vue'
 import type { ViewMode } from './types'
 import type { ToolKind, ToolColors, PointerMode, Rgb } from '@/annot/types'
@@ -71,6 +71,19 @@ const emit = defineEmits<{
 // ---------------------------------------------------------------- 批注面板开合
 
 const annotOpen = ref(false)
+
+/**
+ * 收起批注面板 = **退出批注模式**。
+ *
+ * 用户报的问题：收起之后工具还亮着（只是按钮藏起来了），在页面上照样能画 ——
+ * 他得重新展开面板、再点一次同一个工具才能关掉，等于"收起"根本没关掉东西。
+ *
+ * 所以这里主动把工具清成 `none`。反过来说：收起之后想接着批注，
+ * 就得重新展开并选一个工具 —— 这正是"收起"应该有的语义。
+ */
+watch(annotOpen, (open) => {
+  if (!open && props.tool !== 'none') emit('set-tool', 'none')
+})
 
 /** 点同一个工具就退回阅读模式 —— 省掉"忘了关工具导致误画" */
 function pickTool(t: ToolKind): void {
@@ -435,8 +448,16 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
       -->
       <Icon :name="annotOpen ? 'chevron-right' : 'chevron-left'" class="caret" />
       <span class="annot-label">批注</span>
-      <!-- 批注总数。0 条时不显示 —— 一个"0"占地方还容易误读成禁用 -->
-      <span v-if="annotCount" class="badge" data-tid="annot-count" title="已有批注数">
+      <!--
+        徽标显示的是**还没写回文件的条数**（不是总数）—— 保存成功后归零。
+        0 条时不显示 —— 一个"0"占地方还容易误读成禁用。
+      -->
+      <span
+        v-if="annotCount"
+        class="badge"
+        data-tid="annot-count"
+        title="还没写回文件的批注数（保存后归零）"
+      >
         {{ annotCount }}
       </span>
       <span class="dot" :style="dotStyle" />

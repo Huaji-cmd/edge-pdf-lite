@@ -1213,8 +1213,21 @@ function onTextHandleUp(e: PointerEvent): void {
 // ---- 变更通知
 
 function pushAnnotCount(): void {
-  annotCount.value = annotStore.count()
+  // ⚠️ 给 UI 的是**未保存条数**，不是总数 —— 保存成功后必须归零，
+  //    否则用户会以为没存上（他报的就是这个）。
+  annotCount.value = annotStore.unsavedCount()
   emit('annot-count', annotCount.value)
+}
+
+/**
+ * 保存成功后的收尾：把当前状态记成新基线（徽标归零），批注本身**留在屏幕上**。
+ *
+ * 抽成函数是因为有两个入口：App 走 `expose`，调试抓手 `__eplViewer` 直接调。
+ * 两边各自实现过一次的话，"漏掉 pushAnnotCount" 这种错只会出现在其中一边。
+ */
+function markSavedNow(): void {
+  annotStore.markSaved()
+  pushAnnotCount()
 }
 
 /** 撤销 / 重做按钮的可用态由 store 实时给，不靠"上次有没有操作过"猜 */
@@ -1657,15 +1670,13 @@ defineExpose({
   /**
    * 有没有**还没写回文件**的批注 —— 退出拦截的唯一依据。
    *
-   * 两个条件都要：
-   *   · `count() > 0` 排掉"画了一条又撤销掉"的情况（那种时候页已被标脏，
-   *     但一条批注都没有，拦下来纯属骚扰）
-   *   · `dirty` 排掉"已经导出过"的情况
+   * `unsavedCount()` 已经把三种情况算全了（新增 / 改过 / 删掉），
+   * 比"count>0 且某页脏"更准：删掉一条已保存的批注也算没保存。
    */
-  hasUnsaved: () => annotStore.count() > 0 && annotStore.dirtyPages().size > 0,
-  /** 导出成功后调用：清脏标记，之后退出不再拦截 */
+  hasUnsaved: () => annotStore.unsavedCount() > 0,
+  /** 导出成功后调用：清脏标记 + 把当前状态记成新基线（徽标归零） */
   markSaved: () => {
-    annotStore.markSaved()
+    markSavedNow()
   },
   /** 供导出用：取出全部批注（普通数组，非响应式） */
   getAnnotations: () => annotStore.all(),
@@ -1754,6 +1765,8 @@ onMounted(() => {
   ;(globalThis as unknown as Record<string, unknown>).__eplViewer = {
     /** 批注浮层的 slot 状态（诊断"删了还在"这类问题用） */
     annotSlots: () => annotLayer?.debugState() ?? null,
+    /** 保存成功的收尾（测试用：正常路径走 App → expose.markSaved） */
+    markSaved: () => markSavedNow(),
     /** 最近几次 onAnnotChanged 的调用（有没有进来、带了什么 action） */
     annotLog: () => annotChangeLog.slice(),
     snapshot: () => {
