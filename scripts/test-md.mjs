@@ -270,9 +270,9 @@ try {
   check('代码块真的被高亮了（有 token span）', hl.kw >= 2, `keyword span=${hl.kw}`)
   check('高亮不改变代码文本', hl.text.includes('function demo'), hl.text.slice(0, 40))
   /*
-   * 纸面结构（日间）：阅读区灰底 + 白纸 + 纸面上的灰代码块。
-   * 🔴 颜色判据读**计算样式**，不靠眼睛 —— 之前"整个背景是灰的"就是因为
-   *    Markdown 缺了纸面，整片都漏出了灰底。
+   * 背景结构（日间，用户定的）：**整个阅读区都是白的**，只有代码块是浅灰。
+   * 🔴 颜色判据读**计算样式**，不靠眼睛 —— 第一版 Markdown 直接铺在 PDF 的
+   *    灰底（--viewport-bg）上，整片都是灰的。
    */
   const surfaces = JSON.parse(
     await evaluate(`(() => {
@@ -288,10 +288,10 @@ try {
     })()`),
   )
   check(
-    '日间：灰底 + 白纸 + 纸面上的灰代码块（三层分得开）',
+    '日间：阅读区是白的（左右不露灰边），代码块是浅灰',
     surfaces.page === 'rgb(255, 255, 255)' &&
-      surfaces.view === 'rgb(223, 226, 232)' &&
-      surfaces.code === 'rgb(230, 233, 238)',
+      surfaces.view === 'rgb(255, 255, 255)' &&
+      surfaces.code === 'rgb(238, 240, 243)',
     JSON.stringify(surfaces),
   )
 

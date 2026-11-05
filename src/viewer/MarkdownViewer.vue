@@ -805,7 +805,12 @@ onBeforeUnmount(() => {
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  background: var(--viewport-bg);
+  /*
+   * 整个阅读区就是"纸面"（用户定的：左右不露灰边，只有代码块是灰的）。
+   * ⚠️ 不用 --viewport-bg —— 那是 PDF 的"灰底托白纸"结构，Markdown 没有页，
+   *    铺灰底会变成"整片灰"。
+   */
+  background: var(--md-page-bg);
   /* 滚动的容器必须能拿到焦点链上的滚动锚定；关掉自动锚定，
      否则缩放后浏览器会自作主张保持某段文字不动，和"按比例恢复"打架 */
   overflow-anchor: none;

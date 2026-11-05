@@ -86,7 +86,7 @@
    */
   --viewport-bg: #dfe2e8;
   --md-page-bg: #ffffff; /* Markdown 的"纸面"：和 PDF 的白纸同一档 */
-  --md-code-bg: #e6e9ee; /* Markdown 代码块：纸面上的灰块 */
+  --md-code-bg: #eef0f3; /* Markdown 代码块：纸面上的浅灰块 */
 
   --line: #d8dce3;
   --line-strong: #c8cdd6;
