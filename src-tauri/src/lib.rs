@@ -880,6 +880,118 @@ fn read_doc_asset(
 }
 
 /*
+ * 会话级"图片白名单"：允许显示**笔记文件夹之外**的图片（Typora 绝对路径场景）。
+ *
+ * ## 它怎么同时解决可用性和安全性
+ * 可用性：Typora 等编辑器默认往笔记里写绝对路径，一概拒绝等于这类笔记永远看不到图。
+ * 安全性：路径来自笔记内容（不可信），所以放行必须过三道关：
+ *   ① **弹窗列出完整路径清单**，用户亲眼看过、亲手点"允许" ——
+ *      沿用本文件开头"登记只能在 Rust 侧、前端不能有登记能力"的哲学；
+ *   ② 每个路径过**扩展名 + 大小 + 存在性**校验，清单里存的是**文件本身**（精确匹配），
+ *      不是它们的文件夹 —— 授权一张图不会顺带放开整个目录；
+ *   ③ **仅本次运行有效**：不落盘、重启即清空。想长期用？把图片挪进笔记文件夹用相对路径。
+ *
+ * ⚠️ 前端没有直接登记能力 —— `allow_image_paths` 只做"校验 + 登记"，
+ *    弹窗是不是真弹过它管不着，但弹窗组件在我们的前端里，绕过它的唯一方式
+ *    是先攻破前端 —— 和路径闸门同一威胁模型，可接受。
+ */
+#[derive(Default)]
+struct ImageAllowed {
+    list: Mutex<Vec<PathBuf>>,
+}
+
+impl ImageAllowed {
+    /// 精确匹配（清单里存的是文件，不是目录 —— starts_with 对文件条目天然只命中自己）
+    fn check(&self, path: &Path) -> Result<PathBuf, String> {
+        let real = resolveish(path)
+            .ok_or_else(|| format!("找不到这张图片：{}", path.display()))?;
+        let list = self.list.lock().unwrap_or_else(|p| p.into_inner());
+        if list.iter().any(|p| p == &real) {
+            Ok(real)
+        } else {
+            Err(format!(
+                "这张图片不在本次允许显示的清单里：{}（清单只在弹窗授权后建立）",
+                path.display()
+            ))
+        }
+    }
+}
+
+/// 弹窗"允许"后登记图片。只做校验 + 登记，读文件走 `read_absolute_image`。
+#[tauri::command]
+fn allow_image_paths(
+    image_allowed: State<ImageAllowed>,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Err("没有要授权的图片".to_string());
+    }
+    if paths.len() > 500 {
+        return Err("一次最多授权 500 张图片".to_string());
+    }
+    let mut shown: Vec<String> = Vec::new();
+    for t in &paths {
+        let t = t.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.len() > 1024 {
+            return Err("图片路径过长，已拒绝".to_string());
+        }
+        if t.chars().any(|c| c.is_control()) {
+            return Err("图片路径里含控制字符，已拒绝".to_string());
+        }
+        let real = PathBuf::from(t)
+            .canonicalize()
+            .map_err(|_| format!("找不到这张图片：{}", t))?;
+        ensure_image_ext(&real)?;
+        let len = std::fs::metadata(&real)
+            .map_err(|e| format!("读不了图片 {}: {}", t, e))?
+            .len();
+        if len > MAX_ASSET_BYTES {
+            return Err(format!(
+                "图片太大（{} MB），上限是 {} MB：{}",
+                len / (1 << 20),
+                MAX_ASSET_BYTES / (1 << 20),
+                t
+            ));
+        }
+        let mut list = image_allowed.list.lock().unwrap_or_else(|p| p.into_inner());
+        if !list.contains(&real) {
+            if list.len() >= 2000 {
+                return Err("已授权的图片太多，请把图片挪进笔记文件夹用相对路径".to_string());
+            }
+            list.push(real.clone());
+        }
+        shown.push(display_path(&real));
+    }
+    Ok(shown)
+}
+
+/// 读一张**已授权**的笔记外图片。清单是会话级的，重启即清空。
+#[tauri::command]
+fn read_absolute_image(
+    image_allowed: State<ImageAllowed>,
+    path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let real = image_allowed.check(Path::new(&path))?;
+    ensure_image_ext(&real)?;
+    let len = std::fs::metadata(&real)
+        .map_err(|e| format!("读不了 {}: {}", path, e))?
+        .len();
+    if len > MAX_ASSET_BYTES {
+        return Err(format!(
+            "图片太大（{} MB），上限是 {} MB：{}",
+            len / (1 << 20),
+            MAX_ASSET_BYTES / (1 << 20),
+            path
+        ));
+    }
+    let bytes = std::fs::read(&real).map_err(|e| format!("读不了 {}: {}", path, e))?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/*
  * 用系统默认程序打开一个**外部链接**。
  *
  * 🔴 为什么不直接在页面里 `<a target="_blank">`：WebView2 会按它自己的窗口策略
@@ -1400,6 +1512,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(Allowed::load(allowed_store))
+        .manage(ImageAllowed::default())
         /*
          * 🔴 **单实例保护，必须是第一个注册的插件**（插件文档要求）。
          *
@@ -1450,6 +1563,8 @@ pub fn run() {
             read_pdf_bytes,
             read_doc_bytes,
             read_doc_asset,
+            allow_image_paths,
+            read_absolute_image,
             open_external_url,
             read_system_font,
             path_exists,

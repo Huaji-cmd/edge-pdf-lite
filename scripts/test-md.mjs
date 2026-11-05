@@ -787,6 +787,12 @@ try {
     safe.blocked.join(','),
   )
   check('正常内容仍然渲染（净化不是把整篇吃掉）', safe.normal)
+  // 绝对路径图（盘符）在浏览器端**不弹授权框** —— 那是桌面端的能力
+  check(
+    '浏览器端绝对路径图片不弹授权框',
+    !(await evaluate(`!!document.querySelector('[data-tid="md-allow-dialog"]')`)) &&
+      safe.blocked.includes('absolute'),
+  )
   await shot('04-md-unsafe')
 
   // ---------------------------------------------------------------- 7. 转 PDF 引导

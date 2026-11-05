@@ -14,6 +14,7 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
+import ImageAllowDialog from './ImageAllowDialog.vue'
 import { mdImgBlockedText } from './markdownDocument'
 import type { MdImgReason, MarkdownDocument } from './markdownDocument'
 import { anchorOf, clampMdScale } from './mdReadingState'
@@ -49,6 +50,16 @@ const emit = defineEmits<{
 
 const scroller = ref<HTMLElement | null>(null)
 const body = ref<HTMLElement | null>(null)
+
+/*
+ * 桌面端：绝对路径图片（Typora 场景）的授权状态，按**文档指纹**记在会话里。
+ * module 级（不是组件级）：同一篇文档重新打开（组件重建）不应该再弹一次；
+ * 应用重启自然清空 —— "仅本次运行有效"的承诺就靠这个兑现。
+ */
+const absApprovedDocs = new Set<string>()
+/** 非 null 时显示授权确认框；answered 防止"取消"后同一篇反复弹 */
+const absDialogPaths = ref<string[] | null>(null)
+let absDialogAnswered = false
 
 /** 缩放进 style 用对象形式绑，避免 `--md-fs` 这种自定义属性进 TS 的类型检查 */
 const pageStyle = computed<Record<string, string>>(() => ({
@@ -205,7 +216,28 @@ async function loadImages(): Promise<void> {
   const root = body.value
   if (!root) return
   const slots = [...root.querySelectorAll<HTMLElement>('[data-md-img]')]
-  if (!slots.length) return
+
+  /*
+   * 🔴 绝对路径图片（Typora 场景）必须**先于**"没有相对路径槽就早退"处理：
+   *    一篇只有绝对路径图的笔记，`slots` 是空的，早退会把弹窗整个跳过
+   *    （[7d] 就是这么红的——弹窗永远不出现）。它不依赖相对路径槽，
+   *    闸门是授权弹窗 + 会话清单，与打开方式无关；**仅桌面端**有这条链路。
+   */
+  const absSlots = [
+    ...root.querySelectorAll<HTMLElement>('span[data-md-blocked="absolute"][data-md-src]'),
+  ]
+  const absReady =
+    IS_TAURI && absSlots.length > 0 && absApprovedDocs.has(props.doc.fingerprint)
+  if (IS_TAURI && absSlots.length > 0 && !absReady && !absDialogAnswered) {
+    absDialogPaths.value = absSlots
+      .map((el) => el.getAttribute('data-md-src') ?? '')
+      .filter((p) => p.length > 0)
+  }
+
+  if (!slots.length) {
+    if (IS_TAURI && absReady) await loadAbsoluteImages(absSlots)
+    return
+  }
 
   if (!IS_TAURI) {
     /*
@@ -221,11 +253,13 @@ async function loadImages(): Promise<void> {
     await loadBrowserImages(slots)
     return
   }
-  // 桌面版拖进来的文件：有字节、没路径（见 blockedText 里 'no-path' 的说明）
+  // 桌面版拖进来的文件：有字节、没路径 —— **相对路径**图只能标记 no-path
+  // （没有真实路径就解析不出"文档所在目录"）；绝对路径图走上面的弹窗，不受影响。
   if (!props.doc.path) {
     for (const el of slots) {
       markBlocked(el, 'no-path', el.getAttribute('data-md-alt') ?? '')
     }
+    if (absReady) await loadAbsoluteImages(absSlots)
     return
   }
 
@@ -280,7 +314,61 @@ async function loadImages(): Promise<void> {
       }
     }
   }
+
   await Promise.all(Array.from({ length: 4 }, worker))
+
+  /*
+   * 相对路径已处理完（或没有）。这里收尾绝对路径那批（已授权的情况）。
+   * 未授权的情况在前面已经弹了确认框。
+   */
+  if (absReady) await loadAbsoluteImages(absSlots)
+}
+
+/** 把已授权的绝对路径图片换成真正的 `<img>`（读走 Rust 的会话清单） */
+async function loadAbsoluteImages(absSlots: HTMLElement[]): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  for (const el of absSlots) {
+    const alt = el.getAttribute('data-md-alt') ?? ''
+    const p = el.getAttribute('data-md-src') ?? ''
+    if (!p) continue
+    try {
+      const res = await invoke<ArrayBuffer | number[]>('read_absolute_image', { path: p })
+      const bytes = res instanceof ArrayBuffer ? new Uint8Array(res) : new Uint8Array(res)
+      const url = URL.createObjectURL(new Blob([bytes as unknown as BlobPart], { type: mimeOf(p) }))
+      blobUrls.push(url)
+      const img = new Image()
+      img.src = url
+      img.alt = alt
+      const title = el.getAttribute('data-md-title')
+      if (title) img.title = title
+      img.loading = 'lazy'
+      img.addEventListener('load', markOffsetsDirty, { once: true })
+      el.replaceWith(img)
+    } catch {
+      markBlocked(el, 'missing', alt)
+    }
+  }
+}
+
+/** 弹窗"允许"：把清单交给 Rust 校验登记，然后整篇重装一遍图 */
+async function approveAbsImages(): Promise<void> {
+  const paths = absDialogPaths.value ?? []
+  absDialogPaths.value = null
+  absDialogAnswered = true
+  if (!paths.length) return
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('allow_image_paths', { paths })
+    absApprovedDocs.add(props.doc.fingerprint)
+    await loadImages()
+  } catch {
+    emit('toast', '授权失败：请确认图片存在且是 png/jpg/webp/gif/bmp，然后重试')
+  }
+}
+
+function cancelAbsDialog(): void {
+  absDialogPaths.value = null
+  absDialogAnswered = true
 }
 
 function revokeAll(): void {
@@ -887,6 +975,15 @@ onBeforeUnmount(() => {
         <Icon name="close" />
       </button>
     </div>
+
+    <!-- 桌面端：绝对路径图片的授权确认（安全模型的一部分，见 ImageAllowDialog） -->
+    <ImageAllowDialog
+      v-if="absDialogPaths"
+      :file-name="doc.name"
+      :paths="absDialogPaths"
+      @allow="approveAbsImages"
+      @cancel="cancelAbsDialog"
+    />
   </div>
 </template>
 

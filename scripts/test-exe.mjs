@@ -1415,6 +1415,25 @@ if (existsSync(MD_DOC) && existsSync(MD_BASIC_ASSET)) {
   await rm(NOT_DOC, { force: true }).catch(() => {})
 
   /*
+   * ---- 7b-3. 笔记外图片的授权清单（allow_image_paths / read_absolute_image）
+   *
+   * Typora 场景：笔记里写的是**绝对路径**，路径来自笔记内容（不可信）。
+   * 所以放行必须过弹窗（用户拍板）+ 这里的逐条校验（扩展名/大小/存在性），
+   * 且清单只存**文件本身**、仅本次运行有效 —— 三条判据分别守住。
+   */
+  const ABS_PNG = resolve(TESTDATA_DIR, 'md-assets', 'diagram.png')
+  r = await tryInvoke('read_absolute_image', { path: ABS_PNG })
+  check('没授权前读不到（清单是空的）', !r.ok && /清单/.test(r.err), r.err)
+  r = await tryInvoke('allow_image_paths', { paths: [join(TESTDATA_DIR, 'md-basic.md')] })
+  check('授权清单拒绝非图片（扩展名那一道）', !r.ok && /只支持/.test(r.err), r.err)
+  r = await tryInvoke('allow_image_paths', { paths: [join(TESTDATA_DIR, 'no-such.png')] })
+  check('授权清单拒绝不存在的图片', !r.ok, r.err)
+  r = await tryInvoke('allow_image_paths', { paths: [ABS_PNG] })
+  check('（对照）授权真实图片成功', r.ok, r.err)
+  r = await tryInvoke('read_absolute_image', { path: ABS_PNG })
+  check('授权后读得到（只此一张，不放开目录）', r.ok && r.len > 1000, r.ok ? `${r.len} 字节` : r.err)
+
+  /*
    * 桌面端最关键的一条：**本地图片真的能画出来**。
    *
    * 它同时穿过三道关：CSP 的 `img-src` 允许 `blob:`、`read_doc_asset` 返回真字节、
@@ -1611,6 +1630,58 @@ console.log('\n[7c] 桌面版打开 Markdown：拖入的文件没有真实路径
   )
   check('确实没有去磁盘读图片（没有 img 元素）', noPath.imgs === 0, `img=${noPath.imgs}`)
   check('Markdown 下批注 / 保存入口都不存在', !noPath.annot && !noPath.save)
+}
+
+// ---------------------------------------------------------------- 7d. 绝对路径图片：授权弹窗全流程
+console.log('\n[7d] Typora 绝对路径图片：弹窗 → 允许 → 显示')
+/*
+ * 走的是**真实 UI**：打开 md-absolute.md（内容里就是绝对路径）→ 弹窗列出路径 →
+ * 点「允许」→ Rust 登记 → 图片以 Blob URL 显示。
+ * 前面 [7b-3] 已把同一张 PNG 授权过，这里验证的是"弹窗 → 登记 → 显示"整条 UI 链。
+ */
+{
+  const d = await send('DOM.getDocument', { depth: -1 })
+  const inp = await send('DOM.querySelector', {
+    nodeId: d.root.nodeId,
+    selector: 'input[data-tid="open-input"]',
+  })
+  const MD_ABS = join(TESTDATA_DIR, 'md-absolute.md')
+  await send('DOM.setFileInputFiles', { files: [MD_ABS], nodeId: inp.nodeId })
+
+  let dlgOk = false
+  for (let i = 0; i < 60; i++) {
+    await sleep(200)
+    dlgOk = await evaluate(`!!document.querySelector('[data-tid="md-allow-dialog"]')`)
+    if (dlgOk) break
+  }
+  check('打开了授权确认框（列出了笔记外的图片）', dlgOk)
+  const dlg = JSON.parse(
+    await evaluate(`(() => {
+      const dlg = document.querySelector('[data-tid="md-allow-dialog"]');
+      return JSON.stringify({
+        text: dlg?.textContent || '',
+        yes: !!dlg?.querySelector('[data-tid="md-allow-yes"]'),
+        no: !!dlg?.querySelector('[data-tid="md-allow-no"]'),
+        pathShown: /diagram\.png/.test(dlg?.textContent || ''),
+        onlyOnce: /仅本次/.test(dlg?.textContent || ''),
+      });
+    })()`),
+  )
+  check('弹窗里有完整路径与「仅本次有效」的说明', dlg.pathShown && dlg.onlyOnce && dlg.yes && dlg.no)
+  await evaluate(`document.querySelector('[data-tid="md-allow-yes"]')?.click()`)
+
+  let absImg = { ok: false, w: 0 }
+  for (let i = 0; i < 40; i++) {
+    await sleep(200)
+    absImg = JSON.parse(
+      await evaluate(`(() => {
+        const img = document.querySelector('.md-body img');
+        return JSON.stringify({ ok: !!img, w: img ? img.naturalWidth : 0 });
+      })()`),
+    )
+    if (absImg.ok && absImg.w > 0) break
+  }
+  check('允许后图片真的显示（Blob URL 解码成功）', absImg.ok && absImg.w === 240, `${absImg.w}px`)
 }
 
 // ---------------------------------------------------------------- 8. 控制台

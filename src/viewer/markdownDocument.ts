@@ -53,6 +53,22 @@ const SANITIZE = {
   // `srcset` 是浏览器自己挑 URL 的入口，也要去掉
   FORBID_ATTR: ['style', 'srcset', 'formaction', 'action'],
   ALLOW_DATA_ATTR: true,
+  /*
+   * 🔴 默认的 URI 白名单只认 http/https/mailto/ftp 等协议 —— **盘符绝对路径
+   *    （`D:/xxx/img.png`）会被整条剥掉**，src 变空 → 分类成"图片地址是空的"，
+   *    用户看到的提示完全误导（真实用户就这么踩的）。
+   *
+   * 追加两条放行（危险协议仍然进不来）：
+   *   · `[a-z]:[\\/]` —— 单字母 + 冒号 + 斜杠的盘符形态。`javascript:`/`data:`
+   *     冒号前有多个字母，撞不上这条；`file:` 的协议判断仍在 classifyImg。
+   *   · `data:` —— 只为 `<img>` 的内联图；`<a href="data:...">` 会在
+   *     upgradeDom 的链接重写里被移除（只留 http/https/mailto），不构成执行面。
+   *
+   * 最终的放行 / 拒绝决策仍然全部在 classifyImg + 链接重写里，这里只是
+   * "别让净化器把我们要分类的原料扔掉"。
+   */
+  ALLOWED_URI_REGEXP:
+    /^(?:(?:https?|mailto|ftp|tel|callto|sms|cid|xmpp|data):|[^a-z]|[a-z+.-]+(?:[^a-z+.-:]|$)|[a-z]:[/\\])/i,
 }
 
 /** GitHub 风格的标题 slug：小写、去标点、空格转连字符；中文原样保留 */
@@ -74,7 +90,7 @@ export function mdImgBlockedText(reason: MdImgReason): string {
     case 'remote':
       return '远程图片不自动加载'
     case 'absolute':
-      return '不支持绝对路径图片（请把图片放进笔记文件夹，用相对路径引用）'
+      return '笔记文件夹之外的图片（桌面端会弹出授权确认，允许后显示）'
     case 'scheme':
       return '不支持这种链接形式的图片'
     case 'empty':
@@ -86,27 +102,55 @@ export function mdImgBlockedText(reason: MdImgReason): string {
 function classifyImg(src: string):
   | { kind: 'data'; value: string }
   | { kind: 'relative'; value: string }
-  | { kind: 'blocked'; reason: MdImgReason } {
+  | { kind: 'blocked'; reason: MdImgReason; absolutePath?: string } {
   const s = src.trim()
   if (!s) return { kind: 'blocked', reason: 'empty' }
   // 内联 data:image 不联网、也不经过文件系统 —— 直接放行（CSP 已允许 data:）
   if (/^data:image\//i.test(s)) return { kind: 'data', value: s }
-  // 远程（含协议相对的 //host/x.png）：v1 不自动联网
-  if (/^https?:/i.test(s) || s.startsWith('//')) return { kind: 'blocked', reason: 'remote' }
-  // 其他协议（file: / javascript: / 自定义）
-  if (/^[a-z][a-z0-9+.-]*:/i.test(s)) return { kind: 'blocked', reason: 'scheme' }
-  // 绝对路径 / UNC：桌面端也不给读（会被 Rust 侧的目录包含校验拒掉，这里提前说清）
-  if (s.startsWith('/') || s.startsWith('\\') || /^[a-z]:[\\/]/i.test(s)) {
-    return { kind: 'blocked', reason: 'absolute' }
-  }
-  // 相对路径：解码百分号转义（`my%20pic.png` → `my pic.png`），失败就按原文
-  let rel = s
+  /*
+   * 🔴 分类前必须先解一份**百分号解码**的探测串：
+   *    markdown-it 会把目的地里的 `\`、空格等编码成 %5C / %20
+   *    （`C:\Windows\win.ini` → `C:%5CWindows%5Cwin.ini`）——
+   *    不解码的话所有盘符/UNC 路径都会被误判成"协议不允许"或"空地址"
+   *    （真实用户就是这么看到满屏占位的）。原始 `src` 只在 data 分支里用。
+   */
+  let probe = s
   try {
-    rel = decodeURIComponent(s)
+    probe = decodeURIComponent(s)
   } catch {
-    /* 畸形的 % 序列：保留原文，交给 Rust 侧报"找不到" */
+    /* 畸形的 % 序列：按原文探测 */
   }
-  rel = rel.replace(/^\.\//, '')
+  // 远程（含协议相对的 //host/x.png）：v1 不自动联网
+  if (/^https?:/i.test(probe) || probe.startsWith('//')) {
+    return { kind: 'blocked', reason: 'remote' }
+  }
+  /*
+   * file:///C:/dir/img.png —— Typora / 从网页复制时常见。
+   * 剥掉协议、还原成绝对路径，按 absolute 处理（桌面端走授权弹窗）；
+   * 还原不出本地路径的（非 Windows 盘符等）仍按"协议不允许"拦。
+   */
+  if (/^file:\/\//i.test(probe)) {
+    try {
+      const p = decodeURIComponent(probe.replace(/^file:\/\/\/?/i, ''))
+      if (/^[a-z]:[\\/]/i.test(p) || p.startsWith('/')) {
+        return { kind: 'blocked', reason: 'absolute', absolutePath: p }
+      }
+    } catch {
+      /* 畸形转义 → 按协议不允许 */
+    }
+    return { kind: 'blocked', reason: 'scheme' }
+  }
+  /*
+   * 盘符绝对路径 / UNC / 根路径：**必须排在协议判断之前** ——
+   * `D:` 单字母+冒号会被下面的通用协议正则当成自定义协议吃掉。
+   */
+  if (/^[a-z]:[\\/]/i.test(probe) || probe.startsWith('\\\\') || probe.startsWith('/')) {
+    return { kind: 'blocked', reason: 'absolute', absolutePath: probe }
+  }
+  // 其他协议（javascript: / 自定义）
+  if (/^[a-z][a-z0-9+.-]*:/i.test(probe)) return { kind: 'blocked', reason: 'scheme' }
+  // 相对路径：probe 已经解码过（`my%20pic.png` → `my pic.png`）
+  const rel = probe.replace(/^\.\//, '')
   return { kind: 'relative', value: rel }
 }
 
@@ -171,6 +215,8 @@ function upgradeDom(box: HTMLElement): MdHeading[] {
        *    原始地址挂 title，悬停可查（照着改笔记就能修）。
        */
       ph.setAttribute('data-md-blocked', cls.reason)
+      // absolute 类带上**可读的本地路径**（file:// 已剥协议）——授权弹窗和读取都按它来
+      if (cls.absolutePath) ph.setAttribute('data-md-src', cls.absolutePath)
       const t = mdImgBlockedText(cls.reason)
       ph.textContent = alt ? `${alt}（${t}）` : t
       ph.title = src

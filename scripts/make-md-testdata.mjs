@@ -191,6 +191,8 @@ const unsafe = `# 安全用例：这些都不该生效
 
 ![远程图片](https://example.com/track.png)
 
+![盘符路径](D:/some/other/place.png)
+
 ## 代码块里的内容也只是文本
 
 \`\`\`html
@@ -237,16 +239,29 @@ code block ${i}
   return out
 }
 
+// ---------------------------------------------------------------- md-absolute.md（Typora 场景）
+
+// 用**运行时**的绝对路径引用样本图片 —— 模拟 Typora 默认行为。
+// 路径用正斜杠（Windows API 都认，还能避开 markdown 转义反斜杠的坑）。
+const absImg = resolve(outDir, 'md-assets/diagram.png').replaceAll('\\', '/')
+const absolute = `# 绝对路径图片样本
+
+![本地示意图](${absImg})
+
+这张图用的是**绝对路径** —— 桌面版会弹授权确认，允许后显示。
+`
+
 // ---------------------------------------------------------------- 落盘
 
 await mkdir(resolve(outDir, 'md-assets'), { recursive: true })
 await writeFile(resolve(outDir, 'md-basic.md'), basic, 'utf8')
 await writeFile(resolve(outDir, 'md-unsafe.md'), unsafe, 'utf8')
 await writeFile(resolve(outDir, 'md-large.md'), makeLarge(2 * 1024 * 1024), 'utf8')
+await writeFile(resolve(outDir, 'md-absolute.md'), absolute, 'utf8')
 await writeFile(resolve(outDir, 'md-assets/diagram.png'), makePng(240, 120))
 
 const sizes = await Promise.all(
-  ['md-basic.md', 'md-unsafe.md', 'md-large.md', 'md-assets/diagram.png'].map(async (f) => {
+  ['md-basic.md', 'md-unsafe.md', 'md-absolute.md', 'md-large.md', 'md-assets/diagram.png'].map(async (f) => {
     const { stat } = await import('node:fs/promises')
     const s = await stat(resolve(outDir, f))
     return `${f}: ${(s.size / 1024).toFixed(1)} KB`
