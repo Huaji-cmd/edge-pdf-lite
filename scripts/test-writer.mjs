@@ -300,6 +300,58 @@ try {
     await writeFile(join(SHOTS, '03-downloaded.pdf'), bytes)
   }
 
+  // ---------------------------------------------------------------- 4c. 保存耗时
+  /*
+   * 用户报的："扫描件 18 条批注十几秒能接受；md 转 pdf 28 条跨几十页特别慢"。
+   * 根因不是"跨页"，是**每条批注构造对象时都要遍历一遍整个对象表**
+   * （write-check 里那条"找父对象的次数"是主判据，量的是结构，跟机器快慢无关）。
+   * 这里只做一次耗时的冒烟，防止哪天又退化到秒级。
+   *
+   * 样本用 `real-1706.03762.pdf`：15 页 / **5957 个对象**，页密度接近"md 转 pdf"那一类。
+   */
+  console.log('\n[4c] 保存耗时（5957 个对象的样本）')
+  // ⚠️ 上面 [4] 把页面导到了主应用（阅读器），这里得回到自检页才拿得到 write 钩子
+  await send('Page.navigate', { url: TARGET })
+  await sleep(2200)
+  const perf = JSON.parse(
+    await evaluate(`(async () => {
+      const buf = await (await fetch('/testdata/real-1706.03762.pdf')).arrayBuffer()
+      const original = new Uint8Array(buf)
+      const iso = new Date().toISOString()
+      const mk = (n) => Array.from({ length: n }, (_, i) => ({
+        id: 'perf-' + i,
+        pageNumber: 1 + Math.floor((i * 15) / n),
+        kind: 'highlight',
+        rect: [72, 700, 300, 714],
+        color: [1, 0.92, 0.23],
+        opacity: 0.6,
+        quads: [72, 714, 300, 714, 72, 700, 300, 700],
+        contents: 'perf ' + i,
+        created: iso,
+        modified: iso,
+      }))
+      const once = async (n) => {
+        const t = performance.now()
+        const out = await window.__eplWriteCheck.buildAnnotatedPdf(original, mk(n))
+        return { ms: performance.now() - t, size: out.length }
+      }
+      await once(28) // 预热：解析器 + JIT
+      const four = await once(4)
+      const many = await once(28)
+      return JSON.stringify({
+        four: Math.round(four.ms),
+        many: Math.round(many.ms),
+        size: many.size,
+      })
+    })()`),
+  )
+  check('28 条批注写出来了（产物比原文件大）', perf.size > 0, `${(perf.size / 1024).toFixed(0)} KB`)
+  check(
+    '28 条批注在 1.5 秒内完成（冒烟；真正的判据是上面那条结构断言）',
+    perf.many < 1500,
+    `28 条 ${perf.many} ms / 4 条 ${perf.four} ms`,
+  )
+
   console.log('\n[5] 控制台')
   check('没有未捕获异常 / error', consoleErrs.length === 0, consoleErrs.slice(0, 3).join(' | '))
 } catch (e) {

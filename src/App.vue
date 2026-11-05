@@ -846,20 +846,53 @@ async function exportAnnotated(): Promise<void> {
       if (dir && dir !== targetDirOf(target)) backupDir = dir
     }
 
+    /*
+     * 🔴 大文件**不能**走"整份 base64 + IPC"。
+     *
+     * 实测（一本 92 MB / 376 页的扫描书，18 条批注）：
+     *   · pdf-lib 自己 load + 加批注 + commit + Buffer base64 = **128 ms**
+     *   · 但浏览器里 `bytesToBase64`（92 MB → 123 MB 字符串）+ `JSON.stringify`
+     *     **超过 3 分钟**，用户就是在这一步干等的。
+     *
+     * 增量更新的产物 = 原文件字节 + 几千字节尾巴。所以只把尾巴传过去，
+     * 让 Rust 复制原文件再追加 —— IPC 从 123 MB 降到几 KB。
+     *
+     * 三种情况会自动退回老路（整份 b64）：没有真实路径（拖进来的文件）、
+     * 产物不是增量（writer 回退到全量重写）、文件头对不上。
+     */
+    const srcPath = currentSourcePath.value
+    const originalLen = d.originalBytes.length
+    const canTail =
+      srcPath !== '' && bytes.length > originalLen && sameHead(bytes, d.originalBytes, 4096)
+
     // ⚠️ 参数名用 **camelCase**：Tauri v2 按前端 camelCase → Rust snake_case
     //    来匹配，写成 `make_backup` 会直接报 "missing required key"。
-    const res = await invoke<{
-      path: string
-      backup: string | null
-      readonly_cleared: boolean
-    }>('write_pdf_b64', {
-      path: target,
-      b64: bytesToBase64(bytes),
-      makeBackup: overwrite,
-      // ⚠️ 显式给 `null` 而不是留 undefined：Tauri v2 对 `Option<T>` 参数
-      //    缺省行为不够明确，传 null 一定被当成 None
-      backupDir: backupDir ?? null,
-    })
+    const res = canTail
+      ? await invoke<{
+          path: string
+          backup: string | null
+          readonly_cleared: boolean
+        }>('write_pdf_tail', {
+          path: target,
+          srcPath,
+          // Rust 会核对原文件长度：读完之后被改过就拒绝写（宁可让它重开）
+          srcLen: originalLen,
+          tailB64: bytesToBase64(bytes.subarray(originalLen)),
+          makeBackup: overwrite,
+          backupDir: backupDir ?? null,
+        })
+      : await invoke<{
+          path: string
+          backup: string | null
+          readonly_cleared: boolean
+        }>('write_pdf_b64', {
+          path: target,
+          b64: bytesToBase64(bytes),
+          makeBackup: overwrite,
+          // ⚠️ 显式给 `null` 而不是留 undefined：Tauri v2 对 `Option<T>` 参数
+          //    缺省行为不够明确，传 null 一定被当成 None
+          backupDir: backupDir ?? null,
+        })
     done()
 
     const parts: string[] = [overwrite ? '已覆盖原文件' : '已保存']
@@ -896,6 +929,19 @@ function targetDirOf(p: string): string {
  * ⚠️ 必须**分块**再 `fromCharCode`：一次性把 20 MB 展开成 apply 的参数
  *    会直接爆栈（V8 的参数个数上限）。8 KB 一块是常规做法。
  */
+/**
+ * 比较两个字节数组的前 `n` 个字节是否一致。
+ *
+ * 用来判断"产物是不是以原文件为前缀" —— 增量更新一定满足，全量重写一定不满足
+ * （全量会把整个文件重新序列化，头部的对象编号/xref 位置都变了）。
+ * 只比 4 KB 足够，且是 O(1) 级别的开销（相对 92 MB 来说）。
+ */
+function sameHead(a: Uint8Array, b: Uint8Array, n: number): boolean {
+  if (a.length < n || b.length < n) return false
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
 function bytesToBase64(bytes: Uint8Array): string {
   let s = ''
   const CHUNK = 0x8000

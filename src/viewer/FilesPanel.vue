@@ -194,12 +194,15 @@ async function onRefresh(): Promise<void> {
   try {
     const r = await refreshList()
     emit('change')
+    /*
+     * 只在**真的有事发生**时提示。
+     * 用户明确说过："刷新时不用提示扫了几个文件夹" —— 扫了多少个是实现细节，
+     * 对读者没有意义；没有新文件时更是纯噪音（他自己点的刷新，心里有数）。
+     */
     if (r.scanned === 0) {
       emit('toast', '还没有展开过的文件夹，点开一个再刷新')
     } else if (r.added > 0) {
-      emit('toast', `已刷新：新增 ${r.added} 项（扫了 ${r.scanned} 个文件夹）`)
-    } else {
-      emit('toast', `已刷新：没有新文件（扫了 ${r.scanned} 个文件夹）`)
+      emit('toast', `已刷新：新增 ${r.added} 项`)
     }
   } catch (e) {
     emit('toast', `刷新失败：${String(e)}`)

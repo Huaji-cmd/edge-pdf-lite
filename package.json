@@ -1,6 +1,6 @@
 {
   "name": "edge-pdf-lite",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "type": "module",
   "description": "轻量 PDF 阅读 + 批注编辑器（面向低配 Windows）",
   "license": "MIT",
@@ -52,7 +52,8 @@
     "tauri": "node scripts/tauri.mjs",
     "exe": "node scripts/tauri.mjs build --no-bundle",
     "test:exe": "node scripts/test-exe.mjs",
-    "test:exe:heal": "node scripts/test-exe-heal.mjs"
+    "test:exe:heal": "node scripts/test-exe-heal.mjs",
+    "test:exe:big": "node scripts/test-big-save.mjs"
   },
   "dependencies": {
     "@cantoo/fontkit": "^2.0.12",

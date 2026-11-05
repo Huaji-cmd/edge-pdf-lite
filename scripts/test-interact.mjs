@@ -761,6 +761,157 @@ try {
     )
   const parseRgb = (s) => (String(s).match(/[\d.]+/g) ?? []).map(Number)
 
+  /*
+   * ---- 3b. 划选锚点（用户报的两条手感问题）
+   *
+   * 现象一：想选第 1~2 行，鼠标划过两行之间的**空隙**，结果下面所有行都被选中。
+   * 现象二：刚按下、还没碰到字，蓝底已经是一大片。
+   *
+   * 根因是浏览器原生 drag 的锚点：pointerdown 那一点没落在这行字的**字形盒**里时，
+   * 锚点会被吸到整块的边界（这一页的第一个字或最后一个字），于是"从块首拖到鼠标处"。
+   * 现在鼠标划选也走 `caretAtLoose`（吸附到最近一行），这里把行为钉住。
+   */
+  console.log('\n[3b] 划选锚点：在行间隙按下，不该「选中整页」')
+  // ⚠️ 不要盲点工具栏：已经选中的工具再点一次是**取消**，这里会变成 tool=none
+  const st0 = JSON.parse(await evaluate(`JSON.stringify(globalThis.__eplViewer.snapshot())`))
+  console.log(`   起点状态：tool=${st0.tool} pointerMode=${st0.pointerMode}`)
+  if (st0.tool !== 'highlight') check('切到「高亮」', await toolbarBtn('高亮'))
+  await sleep(200)
+
+  const rows = JSON.parse(
+    await evaluate(`
+      (() => {
+        const slot = document.querySelector('.page-slot[data-page="1"]');
+        if (!slot) return JSON.stringify(null);
+        // ⚠️ 必须用 getClientRects()（**每行一个**矩形），不能用 getBoundingClientRect：
+        //    多行 span 的包围盒会跨两行，按 top 聚类时两行被并成一行，
+        //    于是"两行之间的缝隙"其实落在某一行中间 —— 这条用例就测不出锚点问题了。
+        const boxes = [];
+        for (const s of slot.querySelectorAll('.text-layer span')) {
+          if ((s.textContent || '').trim().length < 4) continue;
+          for (const r of s.getClientRects()) {
+            if (r.width > 20 && r.height > 4) boxes.push(r);
+          }
+        }
+        // 按 top 聚成"视觉行"
+        const acc = [];
+        for (const r of boxes) {
+          const hit = acc.find(x => Math.abs(x.top - r.top) < 4);
+          if (hit) {
+            hit.left = Math.min(hit.left, r.left);
+            hit.right = Math.max(hit.right, r.right);
+            hit.bottom = Math.max(hit.bottom, r.bottom);
+          } else {
+            acc.push({ top: r.top, bottom: r.bottom, left: r.left, right: r.right });
+          }
+        }
+        acc.sort((a, b) => a.top - b.top);
+        const slotRect = slot.getBoundingClientRect();
+        return JSON.stringify({ rows: acc.slice(0, 4), right: slotRect.right });
+      })()
+    `),
+  )
+  check(
+    '拿到前几行的位置（判据没空转）',
+    !!rows && Array.isArray(rows.rows) && rows.rows.length >= 3,
+    rows ? `${rows.rows.length} 行` : 'null',
+  )
+
+  if (rows && rows.rows.length >= 3) {
+    const [r1, r2, r3] = rows.rows
+    const beforeAll = (await annots()).length
+
+    // ① 从**两行之间的缝隙**按下 → 拖到第 2 行中部
+    const before1 = (await annots()).length
+    /*
+     * 记一下这次 pointerdown 有没有被 preventDefault。
+     *
+     * 这是"锚点由我们自己控制"的**结构证据**：原生 drag 不会 preventDefault，
+     * 而原生 drag 正是用户报的那个 bug 的来源（鼠标没落在字形盒里时，
+     * 浏览器把锚点甩到整块边界）。
+     * ⚠️ CDP 的合成鼠标坐标很"准"，靠行为断言区分不出这两种实现
+     *    （变异测试实测：改回原生，上面那两条行为判据照样绿）——所以需要这一条。
+     */
+    await evaluate(`
+      window.__pdPrevented = null;
+      document.querySelector('.viewport').addEventListener(
+        'pointerdown',
+        (e) => setTimeout(() => { window.__pdPrevented = e.defaultPrevented }, 0),
+        { once: true },
+      );
+    `)
+    const gapY = (r1.bottom + r2.top) / 2
+    const startX = Math.min(r1.left + 40, r1.right - 2)
+    await mouseAt('mousePressed', startX, gapY, 1)
+    await sleep(70)
+    check(
+      '按下的那一刻还没有选区（蓝底不该先出现）',
+      (await evaluate(`window.getSelection().isCollapsed`)) === true,
+    )
+    await mouseAt('mouseMoved', startX + 50, (r2.top + r2.bottom) / 2, 1)
+    await sleep(50)
+    const selText = String(await evaluate(`window.getSelection().toString()`))
+    await mouseAt('mouseReleased', startX + 50, (r2.top + r2.bottom) / 2, 0)
+    await sleep(320)
+
+    const hl = (await annots()).slice(before1).find((a) => a.kind === 'highlight')
+    // ⚠️ `__eplViewer.annots()` 里**没有** quads，只有 rect —— 用高度判"覆盖几行"：
+    //    一行 12~14pt，整页 700+pt。150pt ≈ 2~3 行（含行间空白），够用。
+    const hlH = hl ? Math.abs(hl.rect[3] - hl.rect[1]) : -1
+    check('圈住的高度只有两三行（整页会是几百 pt）', !!hl && hlH < 150, `高度 ${hlH.toFixed(1)}pt`)
+    check('选中的文字量很小（整页会是上千字符）', selText.length < 300, `${selText.length} 字符`)
+    /*
+     * ⚠️ 曾经想在这里加一条"文本层 DOM 顺序必须全局单调"的结构判据，**放弃了**：
+     *    这个样本是双栏论文（1706.03762），一页里有左右两套行序列，
+     *    按 top 排完必然是"左栏 100→800、右栏 100→800" —— 中间一定出现一处大跨度逆序。
+     *    全局单调在双栏文档上根本不成立，拿它当判据只会制造假红。
+     *    重排的收益由上面的行为判据（高度 / 字符数 / 反向）和下面这条兜住。
+     */
+    // 划选交还给浏览器原生 drag —— 但前提是文本层的 DOM 顺序已经摆正（见 pageRenderer.reorderTextLayer）
+
+    // ①b 反向：从第 3 行往上拖到第 1 行 —— 页脚（视觉在底部、DOM 在后面）不能被带进来
+    const before1b = (await annots()).length
+    await mouseAt('mousePressed', Math.min(r3.left + 40, r3.right - 2), (r3.top + r3.bottom) / 2, 1)
+    await sleep(60)
+    await mouseAt('mouseMoved', Math.min(r1.left + 40, r1.right - 2), (r1.top + r1.bottom) / 2, 1)
+    await sleep(60)
+    const selBack = String(await evaluate(`window.getSelection().toString()`))
+    await mouseAt('mouseReleased', Math.min(r1.left + 40, r1.right - 2), (r1.top + r1.bottom) / 2, 0)
+    await sleep(320)
+    const hlBack = (await annots()).slice(before1b).find((a) => a.kind === 'highlight')
+    const backH = hlBack ? Math.abs(hlBack.rect[3] - hlBack.rect[1]) : -1
+    check('反向拖也只在 1~3 行之间（不是整页）', !!hlBack && backH < 150, `高度 ${backH.toFixed(1)}pt`)
+    check(
+      '反向拖的选中文字量同样很小',
+      selBack.length < 300,
+      `${selBack.length} 字符`,
+    )
+
+    // ② 拖到页面**右外侧**再松手 → 靠"选区所在页"兜底，批注不能丢
+    const before2 = (await annots()).length
+    const y3 = (r3.top + r3.bottom) / 2
+    await mouseAt('mousePressed', r3.left + 5, y3, 1)
+    await sleep(50)
+    await mouseAt('mouseMoved', rows.right + 40, y3, 1)
+    await sleep(50)
+    await mouseAt('mouseReleased', rows.right + 40, y3, 0)
+    await sleep(320)
+    const added2 = (await annots()).slice(before2)
+    check(
+      '松手时指针已经拖到页外，批注照样落在这一页',
+      added2.length === 1 && added2[0].pageNumber === 1,
+      `新增 ${added2.length} 条${added2.length ? `，第 ${added2[0].pageNumber} 页` : ''}`,
+    )
+
+    /*
+     * 收尾：把这一节加的批注撤掉。
+     * 后面 [11] 要数 under 层上的像素判"删掉之后有没有残影"，
+     * 多两条高亮会让那个基线和预期都对不上。
+     */
+    let guard = 0
+    while ((await annots()).length > beforeAll && guard++ < 8) await UNDO()
+  }
+
   console.log('\n[4] 文本框：点页面就地出现编辑框（复刻 Edge）')
   check('切到「文字」', await toolbarBtn('文字'))
   await sleep(200)

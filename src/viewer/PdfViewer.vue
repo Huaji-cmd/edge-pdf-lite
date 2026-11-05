@@ -467,14 +467,18 @@ function renderAnnotsIfScaleChanged(): void {
 
 // ---------------------------------------------------------------- 批注交互
 
-function locatePage(e: { clientX: number; clientY: number }): {
+function locatePage(
+  e: { clientX: number; clientY: number },
+  /** 兜底：坐标命中不到页时用它（拖到页外松手的场景） */
+  preferSlot?: HTMLElement | null,
+): {
   pageNumber: number
   slotEl: HTMLElement
 } | null {
   // 用 elementFromPoint 而不是 e.target：事件可能来自文本层的 span，
   // 也可能来自被捕获后的任意元素，逐个判 parent 不可靠。
   const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null
-  const slot = el?.closest?.('.page-slot') as HTMLElement | null
+  const slot = ((el?.closest?.('.page-slot') as HTMLElement | null) ?? preferSlot) || null
   if (!slot) return null
   const pn = Number(slot.dataset.page)
   return pn ? { pageNumber: pn, slotEl: slot } : null
@@ -523,10 +527,21 @@ const touchPointers = new Map<number, { x: number; y: number }>()
  *   ② 原生选区没了，就得自己算：用 `caretRangeFromPoint` 把屏幕坐标换算成
  *      文本层里的字符位置，再用 Range 拼出选区。
  *
- * ⚠️ 只对 `pointerType === 'touch'` 生效。鼠标继续走原生选区 ——
- *    那条路径本来就顺，改了反而会破坏已有的鼠标划选行为。
+ * ⚠️ 原本只有触屏走这套，鼠标留给浏览器原生选区。2026-11 用户报了两条手感问题，
+ *    说明"留给原生"是错的：
+ *      · 想选第 1~2 行，鼠标划过两行之间的空隙，结果**下面所有行**都被选中；
+ *      · 刚按下还没碰到字，蓝底已经是**一大片**。
+ *    根因是原生 drag 的锚点：pointerdown 那一坐标没落在这行字的**字形盒**里时，
+ *    浏览器把锚点吸到**整块的边界**（这一页的第一个字或最后一个字），
+ *    于是"从块首拖到鼠标处" —— 视觉上就是整页蓝。
+ *    现在鼠标也走同一套（`markupMouse`），锚点由 `caretAtLoose` 决定：
+ *    **吸附到离点击点最近的那一行**，不会甩到整块边界上。
  */
 let markupTouch: { startX: number; startY: number; moved: boolean } | null = null
+
+/** 鼠标划选的状态（同 `markupTouch`，只是事件源不同、要额外管 pointer capture） */
+let markupMouse: { startX: number; startY: number; moved: boolean; id: number; el: HTMLElement } | null =
+  null
 
 /** 屏幕坐标 → 文本层里的字符位置。没命中文本层返回 null */
 function caretAt(x: number, y: number): { node: Node; offset: number } | null {
@@ -556,11 +571,91 @@ function caretAt(x: number, y: number): { node: Node; offset: number } | null {
   return { node, offset }
 }
 
-/** 把「起点 → 终点」设成当前选区（手指划到哪，蓝底就跟到哪） */
-function applyTouchRange(x0: number, y0: number, x1: number, y1: number): void {
-  const a = caretAt(x0, y0)
-  const b = caretAt(x1, y1)
-  if (!a || !b) return
+/**
+ * 取 caret，**点在文字层外面也能取到**。
+ *
+ * 🔴 为什么需要"宽松"版：`caretAt` 要求命中 `.text-layer`，于是一行字左侧
+ *    几像素的空白、行与行之间的间隙，都会返回 null。以前鼠标划选交给浏览器原生处理，
+ *    而原生 drag 在"起点不在任何文字上"时会把**锚点甩到整块的边界**（这一页的开头或结尾），
+ *    于是用户看到"我才刚按下，整页下面全蓝了"、"我想选一二行，结果选中下面所有行"。
+ *
+ * 兜底做法：找到离点击点最近的那一行（垂直距离权重更高），把点吸附到该行的竖直中线上，
+ * 再取一次 caret —— 得到的就是"这一行最靠近鼠标的那个字"。
+ */
+function caretAtLoose(x: number, y: number): { node: Node; offset: number } | null {
+  const direct = caretAt(x, y)
+  if (direct) return direct
+
+  // 只有落在某一页上才吸附；点在页外（灰色背景）就老实返回 null
+  const hit = document.elementFromPoint(x, y) as HTMLElement | null
+  const slot = (hit?.closest('.page-slot') ??
+    (document.elementFromPoint(x, Math.max(0, y - 60)) as HTMLElement | null)?.closest(
+      '.page-slot',
+    )) as HTMLElement | null
+  if (!slot) return null
+
+  let best: { r: DOMRect; d: number } | null = null
+  for (const s of slot.querySelectorAll<HTMLElement>('.text-layer span')) {
+    const r = s.getBoundingClientRect()
+    if (r.width < 1 || r.height < 1) continue
+    // 行内点 dy=0；行外按"离最近边缘多远"算。垂直权重 ×4：
+    // 宁可横向跑远一点，也要贴住同一行 —— 跨行吸附出来的高亮一定是错的。
+    const dy = y < r.top ? r.top - y : y > r.bottom ? y - r.bottom : 0
+    const dx = x < r.left ? r.left - x : x > r.right ? x - r.right : 0
+    const d = dy * 4 + dx
+    if (!best || d < best.d) best = { r, d }
+  }
+  if (!best) return null
+
+  /*
+   * 吸附到这一行之后，**必须落到文本节点上**。
+   *
+   * 🔴 踩过：点在行间空白时，`caretRangeFromPoint` 会给出**元素级** caret
+   *    （container 是 `.text-layer` 或 span，offset 是子节点下标）。用它去
+   *    `range.setStart/setEnd` 时起点和终点很容易落在"同一个元素、同一个 offset"上，
+   *    结果是个 collapsed 空选区 —— `sel.toString()` 返回空字符串，
+   *    用户看到的就是"拖了半天什么都没生成"。
+   *    所以这里在行内多试几个横坐标，只要有一次落在真正的文本节点上就用它。
+   */
+  const midY = (best.r.top + best.r.bottom) / 2
+  const candidates: number[] = []
+  if (x > best.r.left && x < best.r.right) candidates.push(x)
+  for (const f of [0.5, 0.3, 0.7, 0.12, 0.88]) {
+    candidates.push(best.r.left + best.r.width * f)
+  }
+  for (const cx of candidates) {
+    const at = caretAt(cx, midY)
+    if (at && at.node.nodeType === Node.TEXT_NODE) return at
+  }
+  // 整行都是元素级 caret（极少见）—— 退回元素级，至少锚点在同一行内
+  return caretAt(candidates[0]!, midY)
+}
+
+/** 把「起点 → 终点」设成当前选区（手指/鼠标划到哪，蓝底就跟到哪） */
+/** 一行文字最右边的 caret（拖到页外时用它收尾） */
+function lineEndCaret(node: Node): { node: Node; offset: number } | null {
+  const el = node.nodeType === Node.TEXT_NODE ? node.parentElement : (node as Element)
+  const r = el?.getBoundingClientRect()
+  if (!r || r.width < 1) return null
+  return caretAt(r.right - 1, (r.top + r.bottom) / 2)
+}
+
+/** 把「起点 → 终点」设成当前选区（手指/鼠标划到哪，蓝底就跟到哪） */
+function applyCaretRange(x0: number, y0: number, x1: number, y1: number): void {
+  const a = caretAtLoose(x0, y0)
+  if (!a) return
+  const aSlot = slotOfNode(a.node)
+  let b = caretAtLoose(x1, y1)
+  /*
+   * 终点落在页外 / 另一页时，**不能直接 return** —— 那会让整个选区塌掉，
+   * 用户"划到页边松手"就什么都没生成（实测报过：新增 0 条）。
+   * 收到起点那一行的行尾：既不会跨页，也保住这次划选。
+   */
+  if (!b || slotOfNode(b.node) !== aSlot) {
+    const end = lineEndCaret(a.node)
+    if (!end || slotOfNode(end.node) !== aSlot) return
+    b = end
+  }
   const range = document.createRange()
   const pos = a.node.compareDocumentPosition(b.node)
   // 同节点时 compareDocumentPosition 返回 0，这时只能比 offset
@@ -576,6 +671,12 @@ function applyTouchRange(x0: number, y0: number, x1: number, y1: number): void {
   if (!sel) return
   sel.removeAllRanges()
   sel.addRange(range)
+}
+
+/** 节点属于哪一页（`.page-slot`）；不在任何页里就返回 null */
+function slotOfNode(node: Node): HTMLElement | null {
+  const el = node.nodeType === Node.TEXT_NODE ? node.parentElement : (node as Element)
+  return (el?.closest?.('.page-slot') as HTMLElement | null) ?? null
 }
 
 /** 双指手势的参考系 —— 手势开始时测一次，之后每帧都相对它算 */
@@ -742,6 +843,30 @@ function onPointerDown(e: PointerEvent): void {
     startPan(e)
     return
   }
+
+  /*
+   * 鼠标 + 标记类工具：**自己建选区**，不交给浏览器原生 drag。
+   *
+   * 🔴 用户报过两个现象：想选第 1~2 行、鼠标划过两行之间的空隙，结果下面所有行都被选中；
+   *    刚按下还没碰到字，蓝底已经一大片。根因是原生 drag 的**锚点**：pointerdown 那个坐标
+   *    没落在这行字的字形盒里时，浏览器会把锚点吸到整块的边界（页首或页尾）。
+   *    这里改成和触屏同一套算法（caretAtLoose 吸附到最近一行），锚点就稳了。
+   */
+  if (e.pointerType === 'mouse' && isMarkupTool(props.tool)) {
+    if (caretAtLoose(e.clientX, e.clientY)) {
+      const el = e.currentTarget as HTMLElement
+      markupMouse = { startX: e.clientX, startY: e.clientY, moved: false, id: e.pointerId, el }
+      window.getSelection()?.removeAllRanges()
+      e.preventDefault()
+      try {
+        el.setPointerCapture(e.pointerId)
+      } catch {
+        /* 个别环境不支持，忽略：划到窗口外会丢 move 事件，但不会选错 */
+      }
+      return
+    }
+  }
+
   void annotEditor?.pointerDown(e, { mode: props.pointerMode, ...hint })
 }
 
@@ -758,9 +883,14 @@ function onPointerMove(e: PointerEvent): void {
     }
     if (markupTouch) {
       markupTouch.moved = true
-      applyTouchRange(markupTouch.startX, markupTouch.startY, e.clientX, e.clientY)
+      applyCaretRange(markupTouch.startX, markupTouch.startY, e.clientX, e.clientY)
       return
     }
+  }
+  if (markupMouse) {
+    markupMouse.moved = true
+    applyCaretRange(markupMouse.startX, markupMouse.startY, e.clientX, e.clientY)
+    return
   }
   if (pan) {
     movePan(e)
@@ -789,6 +919,23 @@ function onPointerUp(e: PointerEvent): void {
     if (m.moved) void annotEditor?.commitMarkup(e)
     return
   }
+  // 鼠标划选：同样的收尾，但要解开 pointer capture
+  if (markupMouse) {
+    const m = markupMouse
+    markupMouse = null
+    try {
+      m.el.releasePointerCapture(m.id)
+    } catch {
+      /* ignore */
+    }
+    if (m.moved) {
+      void annotEditor?.commitMarkup(e)
+    } else {
+      // 只是点了一下：不留批注，也别让蓝底挂着
+      window.getSelection()?.removeAllRanges()
+    }
+    return
+  }
   if (pan) {
     endPan()
     return
@@ -805,6 +952,14 @@ function onPointerCancel(e: PointerEvent): void {
     }
     // 被系统抢走手势（比如边缘滑动）→ 放弃这次划选，别留下半个选区
     if (touchPointers.size === 0) markupTouch = null
+  }
+  if (markupMouse) {
+    try {
+      markupMouse.el.releasePointerCapture(markupMouse.id)
+    } catch {
+      /* ignore */
+    }
+    markupMouse = null
   }
   if (pan) endPan()
   annotEditor?.cancelSession()
@@ -1011,7 +1166,7 @@ function onTextInput(): void {
   const raw = el.innerText.replace(/\n$/, '')
   const next = rewrap(a as FreeTextAnnot, raw)
   applyTextEdit(next)
-  emit('annot-count', annotStore.count())
+  pushAnnotCount()
   void refreshTextEditBox()
 }
 
@@ -1093,7 +1248,7 @@ function endTextEdit(): void {
     if (before) annotStore.remove(id)
     else annotStore.collapseNewAnnot(id, null)
     textEditBefore = null
-    emit('annot-count', annotStore.count())
+    pushAnnotCount()
     emit('history-change', { canUndo: annotStore.canUndo(), canRedo: annotStore.canRedo() })
     annotLayer?.invalidate(a.pageNumber, true)
     void annotLayer?.render(a.pageNumber, scale.value, true)
@@ -1141,7 +1296,7 @@ function deleteTextAnnot(): void {
   textEditAnnotRef.value = null
   annotStore.remove(a.id)
   annotEditor?.setSelected(null)
-  emit('annot-count', annotStore.count())
+  pushAnnotCount()
   emit('history-change', { canUndo: true, canRedo: false })
   /*
    * 🔴 这条路径（文本框工具条上的垃圾桶）测出过一个真 bug：
@@ -1295,7 +1450,7 @@ function deleteSelected(): void {
     const a = id ? annotStore.get(id) : null
     if (a) {
       annotStore.remove(a.id)
-      emit('annot-count', annotStore.count())
+      pushAnnotCount()
       emit('history-change', { canUndo: annotStore.canUndo(), canRedo: annotStore.canRedo() })
     }
     annotEditor?.setSelected(null)

@@ -318,6 +318,80 @@ const run = async (): Promise<void> => {
         `全量 ${full.ms.toFixed(0)} ms / ${(full.bytes.length / 1024).toFixed(1)} KB`,
     )
 
+    /*
+     * ---------------------------------------------------------------- 全库扫描次数
+     *
+     * 🔴 这条量的是**结构**，不是时间 —— 机器快慢不影响结论。
+     *
+     * 背景（用户报的"批注多了保存特别慢"）：`context.obj({...})` 是逐字段 `dict.set()`，
+     * 每个 set 都 `registerChange()` → 新对象还没有对象号 →
+     * `findContainingIndirectObject()` **遍历整个对象表递归深搜**。
+     * 一条高亮 = 10 个字段 + 3 个数组 ≈ 25 次扫描；600 页文字版（2.8 万对象）
+     * 一次约 4 ms，于是 100 ms/条，28 条就是 3 秒。
+     *
+     * writer 现在把"造对象"放进 `snapshot = undefined` 的窗口里（新对象靠对象号判定必存），
+     * 所以剩下的扫描只该有「每页挂一次」的量级。
+     */
+    const { PDFContext } = await import('@cantoo/pdf-lib')
+    const proto = PDFContext.prototype as unknown as {
+      findContainingIndirectObject: (obj: unknown) => unknown
+    }
+    /*
+     * 数的是 `findContainingIndirectObject` —— **真正那个"全库递归深搜"**。
+     *
+     * 试过数别的，都被无关成本污染了：
+     *  · `registerObjectChange`：屏蔽期照样被调用（函数体第一行 return），实测 932 次；
+     *  · `getObjectRef`：`prepareForSave` / 字体里也会调到，实测固定 157 次，
+     *    改动前后一个数 —— 完全分不出好坏。
+     * 只有这个函数的调用意味着"某个对象没有对象号、只能去全表里找谁装着它"。
+     */
+    const origFind = proto.findContainingIndirectObject
+    let scans = 0
+    const installSpy = (): void => {
+      proto.findContainingIndirectObject = function (this: unknown, obj: unknown) {
+        scans++
+        return origFind.call(this, obj)
+      }
+    }
+    const removeSpy = (): void => {
+      proto.findContainingIndirectObject = origFind
+    }
+
+    /*
+     * ⚠️ 判据用**差值**，不用绝对值。
+     *
+     * 绝对值里混着一大块固定成本（`commit()` 内部的 prepareForSave 之类，
+     * 实测 130 多次），跟"批注怎么写"没关系，会把结论冲淡。
+     * 跑两遍（1 条 / N 条）取差，剩下的才是**每条批注额外引发的扫描**：
+     *   · 现在的实现 ≈ 1～2 次/条（`/Annots` 那一下）
+     *   · 旧实现 ≈ 24 次/条（10 个字段 + 3 个数组的每一次 set/push）
+     */
+    const countScans = async (list: Annotation[]): Promise<number> => {
+      scans = 0
+      installSpy()
+      try {
+        await buildAnnotatedPdf(original, list)
+      } finally {
+        removeSpy()
+      }
+      return scans
+    }
+
+    const oneCount = await countScans([NEW[0]!])
+    const allCount = await countScans(NEW)
+    const extraPerAnnot = (allCount - oneCount) / Math.max(NEW.length - 1, 1)
+    /*
+     * 阈值 25 是**量出来的**，不是拍的（变异测试：把 `ctx.snapshot = undefined`
+     * 注释掉，同一台机器上变成 **63.4 次/条**；正常实现是 **11.3 次/条**）。
+     * 11.3 而不是 0，是因为 freetext 的 `/AP` 里还要 `flateStream` 造流对象，
+     * 那条路径上有几次躲不开的扫描 —— 但它已经跟"字段多少"无关了。
+     */
+    check(
+      '每条批注额外引发的"全库深搜" < 25 次（改之前实测 63 次/条）',
+      extraPerAnnot < 25,
+      `1 条 ${oneCount} 次 → ${NEW.length} 条 ${allCount} 次，平均多 ${extraPerAnnot.toFixed(1)} 次/条`,
+    )
+
     // ---------------------------------------------------------------- ① 结构（pdf.js 侧）
     const newDoc = await loadDoc(written)
     check('页数不变', newDoc.numPages === baseDoc.numPages, `${baseDoc.numPages} → ${newDoc.numPages}`)
@@ -739,3 +813,15 @@ function bboxOfInk(a: Annotation): [number, number, number, number] {
 }
 
 runBtn.addEventListener('click', () => void run())
+
+/**
+ * 测试钩子：给 `scripts/test-writer.mjs` 直接调 writer（做性能对照用）。
+ *
+ * 和主应用里的 `__eplViewer` 一个路子 —— **只挂在自检页上**，产品入口不暴露。
+ * 有了它，性能用例可以直接拿 `real-1706.03762.pdf`（5957 个对象，页密度接近
+ * "md 转 pdf"那一类）来量，而不必在页面上再造一个 600 页的大样本。
+ */
+;(window as unknown as Record<string, unknown>).__eplWriteCheck = {
+  buildAnnotatedPdf,
+  annotCount: () => NEW.length,
+}

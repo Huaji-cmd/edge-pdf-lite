@@ -371,7 +371,8 @@ try {
     //      没有批注时点保存会**直接返回**（"还没有批注"），writer 的动态 import
     //      根本不会发生 —— 那样后面那条"另存成功"就是假绿。
     await clickTid(TID.toolHighlight)
-    await sleep(400)
+    // 缩放刚改过，文本层可能还在重建（含按视觉顺序重排）—— 等它稳定再取坐标
+    await sleep(1500)
     const drag = await evaluate(`(() => {
       const vp = document.querySelector('.viewport').getBoundingClientRect();
       // ⚠️ 必须挑**当前视口内**的 span：视口外的取不到坐标（这条踩过）
@@ -401,10 +402,16 @@ try {
       await mouse('mouseReleased', drag.x2, drag.y, 0)
       await sleep(500)
     }
-    const annotCount = Number(
-      await evaluate(`Number(document.querySelector('[data-tid="annot-count"]')?.textContent.trim() ?? 0)`),
-    )
-    check('画出了一条批注（后面"另存"才有意义）', annotCount > 0, `count=${annotCount}`)
+    // 轮询等徽标更新（Vue 更新 DOM 是异步的，固定 sleep 会时快时慢）
+    let annotCount = 0
+    for (let i = 0; i < 24; i++) {
+      annotCount = Number(
+        await evaluate(`Number(document.querySelector('[data-tid="annot-count"]')?.textContent.trim() ?? 0)`),
+      )
+      if (annotCount > 0) break
+      await sleep(150)
+    }
+    check('画出了一条批注（后面"另存"才有意义）', annotCount > 0, `count=${annotCount} annots=${await evaluate(`globalThis.__eplViewer ? globalThis.__eplViewer.annots().length : 'nohook'`)} sel=${await evaluate(`window.getSelection().toString().length`)}` )
 
     // ---- 双页：重算版面
     await clickTid(TID.modeDual)

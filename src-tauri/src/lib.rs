@@ -818,25 +818,11 @@ fn write_pdf_b64(
             .map_err(|e| format!("建不了目录 {}: {}", display_path(parent), e))?;
     }
 
-    let mut backup_out: Option<String> = None;
-    if make_backup && Path::new(&path).exists() {
-        let mut target_dir: Option<PathBuf> = backup_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from);
-        // 备份目录也必须是自己被放行过的地方；没登记就老老实实退回原目录
-        if let Some(dir) = target_dir.as_ref() {
-            let probe = dir.join("__epl_backup_probe__.pdf");
-            if allowed.check(&probe.to_string_lossy()).is_err() || !dir.is_dir() {
-                target_dir = None;
-            }
-        }
-        let bak = backup_path(&path, target_dir.as_deref());
-        std::fs::copy(&path, &bak)
-            .map_err(|e| format!("备份失败（已中止保存，原文件没动）：{}", e))?;
-        backup_out = Some(display_path(&bak));
-    }
+    let backup_out = if make_backup {
+        backup_before_write(&allowed, Path::new(&path), backup_dir.as_deref())?
+    } else {
+        None
+    };
 
     // 备份已经落好了，所以这里清只读是安全的
     let readonly_cleared = clear_readonly(Path::new(&path));
@@ -845,6 +831,134 @@ fn write_pdf_b64(
         .map_err(|e| format!("写不了 {}：{}", display_path(Path::new(&path)), e))?;
     Ok(WriteResult {
         path: display_path(Path::new(&path)),
+        backup: backup_out,
+        readonly_cleared,
+    })
+}
+
+/// 给一个**已经存在**的文件留 `.bak`，返回备份路径（给人看的形式）。
+///
+/// 抽出来的原因：`write_pdf_b64`（整份写）和 `write_pdf_tail`（增量追加）
+/// 都要这段逻辑，各写一份迟早会在"备份目录没过闸门时怎么办"上分叉。
+fn backup_before_write(
+    allowed: &Allowed,
+    file: &Path,
+    backup_dir: Option<&str>,
+) -> Result<Option<String>, String> {
+    if !file.exists() {
+        return Ok(None);
+    }
+    let mut target_dir: Option<PathBuf> = backup_dir
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
+    // 备份目录也必须是自己被放行过的地方；没登记就老老实实退回原目录
+    if let Some(dir) = target_dir.as_ref() {
+        let probe = dir.join("__epl_backup_probe__.pdf");
+        if allowed.check(&probe.to_string_lossy()).is_err() || !dir.is_dir() {
+            target_dir = None;
+        }
+    }
+    let bak = backup_path(&file.to_string_lossy(), target_dir.as_deref());
+    std::fs::copy(file, &bak)
+        .map_err(|e| format!("备份失败（已中止保存，原文件没动）：{}", e))?;
+    Ok(Some(display_path(&bak)))
+}
+
+/*
+ * 保存「增量更新」的结果：**原文件 + 一小段增量**。
+ *
+ * 🔴 为什么需要它（一本 92 MB 的扫描书实测）：
+ *    增量更新下产物 = 原文件字节 + 几千字节。前端原本把**整份**产物编成 base64
+ *    再走 IPC —— 92 MB 在这台机器上光 `bytesToBase64` + `JSON.stringify`
+ *    就超过 **3 分钟**（pdf-lib 自己只要 128 ms）。
+ *    所以改成：前端只传那一小段，Rust 把原文件复制/原地追加。
+ *
+ * ⚠️ `src_len` 是前端**解析时**原文件的字节数。对不上就拒绝 —— 说明读完之后
+ *    文件被改过，此时拿旧字节拼新内容会写出坏文件。宁可让用户重开，也不写坏的。
+ *
+ * ⚠️ 只对"增量产物"成立（产物以原文件字节为前缀）。前端在调用前先比过文件头，
+ *    不是增量就走老命令。
+ */
+#[tauri::command]
+fn write_pdf_tail(
+    allowed: State<Allowed>,
+    path: String,
+    src_path: String,
+    src_len: u64,
+    tail_b64: String,
+    make_backup: bool,
+    backup_dir: Option<String>,
+) -> Result<WriteResult, String> {
+    let dst = allowed.check(&path)?;
+    ensure_pdf_ext(&dst)?;
+    let src = allowed.check(&src_path)?;
+    ensure_pdf_ext(&src)?;
+
+    let meta = std::fs::metadata(&src)
+        .map_err(|e| format!("读不了原文件 {}：{}", display_path(&src), e))?;
+    if meta.len() != src_len {
+        return Err(format!(
+            "原文件在保存前被改动过（读到 {} 字节，现在是 {} 字节），为了不把它写坏，这次没有保存。\
+             重新打开这个文件后再保存一次。",
+            src_len,
+            meta.len()
+        ));
+    }
+
+    let tail = decode_base64(&tail_b64).map_err(|e| format!("数据解码失败：{}", e))?;
+    if tail.is_empty() {
+        return Err("增量部分为空，已中止保存（原文件没动）".to_string());
+    }
+    // 正常增量只有几 KB；真出现一个离谱的尾巴，说明上游出了错，别硬写
+    if tail.len() > 64 * 1024 * 1024 {
+        return Err("增量部分异常大（超过 64 MB），已中止保存（原文件没动）".to_string());
+    }
+
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("建不了目录 {}：{}", display_path(parent), e))?;
+    }
+
+    let same_file = dst == src;
+    // 备份的永远是**要被改动的那个文件**（覆盖原文件时是原件；另存时是目标位置上已有的旧文件）
+    let backup_out = if make_backup {
+        backup_before_write(&allowed, &dst, backup_dir.as_deref())?
+    } else {
+        None
+    };
+
+    if !same_file {
+        /*
+         * 另存一份：增量产物就是"原文件 + 尾巴"，所以直接复制原文件再追加。
+         * 复制而不是"新建空文件"—— 前面那 92 MB 一个字节都不用传到 JS 里来。
+         */
+        std::fs::copy(&src, &dst).map_err(|e| {
+            format!(
+                "复制原文件到 {} 失败：{}（原文件没动）",
+                display_path(&dst),
+                e
+            )
+        })?;
+    }
+
+    // 复制过来的文件会继承只读属性；写之前清掉（备份已经先做过）
+    let readonly_cleared = clear_readonly(&dst);
+
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&dst)
+            .map_err(|e| format!("打不开 {} 追加写入：{}", display_path(&dst), e))?;
+        f.write_all(&tail)
+            .map_err(|e| format!("写入 {} 失败：{}", display_path(&dst), e))?;
+        f.flush()
+            .map_err(|e| format!("写入 {} 失败：{}", display_path(&dst), e))?;
+    }
+
+    Ok(WriteResult {
+        path: display_path(&dst),
         backup: backup_out,
         readonly_cleared,
     })
@@ -1059,6 +1173,7 @@ pub fn run() {
             path_exists,
             default_save_dir,
             write_pdf_b64,
+            write_pdf_tail,
             reveal_in_folder,
             rename_file,
             app_ready,

@@ -369,6 +369,8 @@ export class PageRenderer {
 
       const old = slot.textEl
       slot.el?.appendChild(div)
+      // 必须在 append 之后：量位置要它已经在布局里
+      reorderTextLayer(div)
       slot.textEl = div
       slot.textKey = key
       old?.remove()
@@ -396,4 +398,72 @@ export class PageRenderer {
       ready: this.everRendered && this.running === 0 && queued === 0,
     })
   }
+}
+
+/**
+ * 把文本层的**直接子元素**按视觉位置（自上而下、自左而右）重新排序。
+ *
+ * 🔴 为什么必须做 —— 用户报过两次"我只是划过两行之间的空白，下面三行全被选中"。
+ *
+ * pdf.js 的 TextLayer 按 **PDF 内容流顺序** 生成 span，而内容流顺序经常**不等于**
+ * 视觉顺序。实测 `annot-fixture.pdf` 第 4 页：
+ *
+ *   索引  文本                             视觉 top
+ *   0     "P4 Ink (freehand) + /AP"        140
+ *   1     "Expected: a red wavy stroke…"   176
+ *   2     "NM prefix: epl:"                1283   ← 页脚
+ *   3     "author: edge-pdf-lite"          1283   ← 页脚
+ *   4     "Line 1 — …"                     280
+ *   5     "Line 2 — HIGHLIGHT TARGET…"     313
+ *   6     "Line 3 — HIGHLIGHT TARGET…"     346
+ *   7     "Line 4 — …"                     379
+ *
+ * Line 1~4 在 DOM 里排在页脚**之后**。于是从 Line 2 拖到 Line 3，
+ * Range 会跨过 DOM 中间那些节点 —— 视觉上就是"上面几行 + 下面几行一起变蓝"。
+ * 这是 Range 的硬约束（只能按 DOM 顺序），浏览器原生选区和我们自建的 Range 都一样。
+ *
+ * 重排之后 DOM 顺序 = 视觉顺序，选择范围才是连续的。
+ * span 都是绝对定位的，重排**不影响任何视觉表现**，只影响"选区的连续性"。
+ *
+ * ⚠️ 只动**直接子元素**（可能是 span，也可能是 `includeMarkedContent` 带来的包裹层），
+ *    不碰嵌套结构 —— 那些是同一个文本片段内部的层次，拆开就散了。
+ */
+function reorderTextLayer(root: HTMLElement): void {
+  const kids = Array.from(root.children) as HTMLElement[]
+  if (kids.length < 2) return
+
+  const items = kids
+    .map((el) => {
+      /*
+       * ⚠️ 用 `getClientRects()[0]`（**首行**的盒子），不能用 `getBoundingClientRect()`：
+       *    一个 span 跨两行时，包围盒的 top 落在两行中间，排序就会把它插到别的行里，
+       *    排完仍然有逆序（实测 69 个 span 里还剩 1 处）。
+       */
+      const rs = el.getClientRects()
+      return { el, r: rs.length ? rs[0]! : el.getBoundingClientRect() }
+    })
+    .filter((it) => it.r.width > 0 && it.r.height > 0)
+  if (items.length < 2) return
+
+  // 先按 top 排（同一 top 再按 left），再把"top 相差不到半行高"的归成一行
+  items.sort((a, b) => a.r.top - b.r.top || a.r.left - b.r.left)
+  const lines: Array<{ top: number; h: number; items: typeof items }> = []
+  for (const it of items) {
+    const last = lines[lines.length - 1]
+    const tol = Math.max(it.r.height, last?.h ?? 0, 1) * 0.5
+    if (last && Math.abs(it.r.top - last.top) < tol) last.items.push(it)
+    else lines.push({ top: it.r.top, h: it.r.height, items: [it] })
+  }
+
+  const ordered: HTMLElement[] = []
+  for (const line of lines) {
+    line.items.sort((a, b) => a.r.left - b.r.left)
+    for (const it of line.items) ordered.push(it.el)
+  }
+
+  // 本来就有序就别动 —— append 会触发布局，还会打断正在进行的选区
+  if (ordered.every((el, i) => kids[i] === el)) return
+
+  // 按新顺序 append：append 一个已存在的节点 = 移动它，顺序 append 即可
+  for (const el of ordered) root.appendChild(el)
 }

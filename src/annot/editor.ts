@@ -61,7 +61,11 @@ export interface EditorHost {
   layer: AnnotLayer
   scale(): number
   /** 指针落在哪一页；不在任何页上返回 null */
-  locate(e: { clientX: number; clientY: number }): { pageNumber: number; slotEl: HTMLElement } | null
+  locate(
+    e: { clientX: number; clientY: number },
+    /** 兜底：鼠标坐标命中不到页时用它（划选结束拖到页外的情况） */
+    preferSlot?: HTMLElement | null,
+  ): { pageNumber: number; slotEl: HTMLElement } | null
   transform(pageNumber: number, scale: number): Promise<PageTransform | null>
   /** 擦除容差（页面空间 pt）—— 由宿主按当前缩放换算，保证屏幕手感一致 */
   eraserTolerance(): number
@@ -513,7 +517,21 @@ export class AnnotEditor {
   async commitMarkup(e: PointerEvent): Promise<void> {
     const tool = this.tool
     if (tool === 'none') return
-    const loc = this.host.locate(e)
+    /*
+     * 定位优先用**选区所在的页**，鼠标坐标只作兜底。
+     *
+     * 划选结束时指针很可能已经拖到页面外面（或者刚好压在页边框上），
+     * 这时 `locate(e)` 会 elementFromPoint 失败 → 白白丢掉这次批注。
+     * 而选区是我们自己建的，锚点就一定在某一页的文本层里。
+     */
+    const anchorNode = window.getSelection()?.anchorNode ?? null
+    const anchorEl = anchorNode
+      ? anchorNode.nodeType === Node.TEXT_NODE
+        ? anchorNode.parentElement
+        : (anchorNode as Element)
+      : null
+    const selSlot = (anchorEl?.closest?.('.page-slot') as HTMLElement | null) ?? null
+    const loc = this.host.locate(e, selSlot)
     if (!loc) return
     const tf = await this.host.transform(loc.pageNumber, this.host.scale())
     if (!tf) return
