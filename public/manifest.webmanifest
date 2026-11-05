@@ -2,7 +2,7 @@
   "id": "/",
   "name": "edge-pdf-lite",
   "short_name": "edge-pdf-lite",
-  "description": "轻量 PDF 阅读 + 批注编辑器",
+  "description": "轻量 PDF / Markdown 阅读器 + PDF 批注编辑器",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

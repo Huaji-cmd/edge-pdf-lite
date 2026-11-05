@@ -28,6 +28,7 @@ interact-shots/
 touch-shots/
 preview-shots/
 exe-shots/
+md-shots/
 spike-out/
 # 手工收集的安装包（拷到别的机器测试用，十几 MB 的二进制不入库）
 out-test/

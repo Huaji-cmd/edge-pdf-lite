@@ -41,6 +41,8 @@ export const TID = {
   pageInput: 'page-input',
   zoomOut: 'zoom-out',
   zoomIn: 'zoom-in',
+  // 中间的百分比读数（点一下回 100%）
+  zoom: 'zoom',
   fitWidth: 'fit-width',
   fitPage: 'fit-page',
 
@@ -76,6 +78,26 @@ export const TID = {
   deleteSelected: 'delete-selected',
   unsaved: 'unsaved',
   save: 'save',
+
+  // ---------------------------------------------------------------- Markdown
+  // 阅读器根节点（断言"文档真的渲染出来了"）
+  mdViewer: 'md-viewer',
+  // App 里那个隐藏的文件选择器（浏览器版打开文档的唯一入口）
+  openInput: 'open-input',
+  // 标题大纲面板
+  mdOutline: 'md-outline',
+  // 「转 PDF 后批注」入口与说明框里的三个按钮
+  mdConvert: 'md-convert',
+  mdConvertCopy: 'md-convert-copy',
+  mdConvertReveal: 'md-convert-reveal',
+  mdConvertClose: 'md-convert-close',
+  // 页内查找
+  mdFind: 'md-find',
+  mdFindInput: 'md-find-input',
+  mdFindCount: 'md-find-count',
+  mdFindPrev: 'md-find-prev',
+  mdFindNext: 'md-find-next',
+  mdFindClose: 'md-find-close',
 }
 
 /**

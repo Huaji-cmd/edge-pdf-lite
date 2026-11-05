@@ -10,6 +10,7 @@
  */
 import { computed, ref } from 'vue'
 import Icon from './Icon.vue'
+import { docKindTag } from './documentKind'
 import type { FileNode } from './fileList'
 
 const props = defineProps<{
@@ -82,7 +83,9 @@ function pick(node: FileNode): void {
         :title="h.node.name"
         @click="pick(h.node)"
       >
-        <Icon name="file" class="leaf" />
+        <span class="kind-badge" :data-kind-badge="docKindTag(h.node.name)">{{
+          docKindTag(h.node.name)
+        }}</span>
         <span class="col">
           <span class="nm">{{ h.node.name }}</span>
           <span v-if="h.dir" class="dir">{{ h.dir }}</span>
@@ -187,5 +190,20 @@ function pick(node: FileNode): void {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 和文件面板同一个徽标（FilesPanel.vue）：替代文件图标，站到文件名前面 */
+.kind-badge {
+  flex: 0 0 auto;
+  min-width: 30px;
+  padding: 0 4px;
+  text-align: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 16px;
+  color: var(--mute);
+  letter-spacing: 0.05em;
+  user-select: none;
 }
 </style>

@@ -5,7 +5,7 @@
  * 能拿到**真实路径**，所以可以做三件浏览器做不到的事：
  *   1. 持久化 —— 路径是字符串，存 localStorage 就能跨会话记住
  *   2. 目录懒加载 —— 点开箭头才扫**那一层**（`list_dir` 命令）
- *   3. 直接读文件 —— `read_pdf_bytes` 命令，不用经过 `<input>`
+ *   3. 直接读文件 —— `read_doc_bytes` 命令，不用经过 `<input>`
  *
  * ## 浏览器端
  * `<input type=file>` 只给一个**临时 File 对象**：没有路径、刷新即丢。
@@ -16,6 +16,7 @@
  */
 import { computed, ref } from 'vue'
 import { IS_TAURI } from '@/platform'
+import { isSupportedDocument } from './documentKind'
 
 export interface FileNode {
   id: string
@@ -32,10 +33,11 @@ export interface FileNode {
   key: string
 }
 
-/** 只收 PDF —— 这是 PDF 阅读器，混进一堆 docx 只会让列表变噪音 */
-function isPdf(name: string): boolean {
-  return /\.pdf$/i.test(name)
-}
+/**
+ * 只收本应用能读的文档（PDF / Markdown）。
+ * 判断统一走 `documentKind.ts` —— 拖放、对话框、目录扫描必须用同一套规则，
+ * 否则会出现"能打开但列表里看不见"的半坏状态。
+ */
 
 const nodes = ref<FileNode[]>([])
 let seq = 0
@@ -62,7 +64,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
  * 前端连"自己弹窗"的能力都不留。
  */
 async function pickPaths(directory: boolean): Promise<string[]> {
-  return invoke<string[]>(directory ? 'pick_folder' : 'pick_pdfs')
+  return invoke<string[]>(directory ? 'pick_folder' : 'pick_documents')
 }
 
 function baseName(p: string): string {
@@ -129,7 +131,7 @@ export async function addFilesViaDialog(): Promise<number> {
   let added = 0
   for (const p of paths) {
     const name = baseName(p)
-    if (!isPdf(name)) continue
+    if (!isSupportedDocument(name)) continue
     if (nodes.value.some((n) => n.kind === 'file' && n.path === p)) continue
     nodes.value.push({ id: newId(), name, kind: 'file', path: p, key: `p:${p}` })
     added++
@@ -271,7 +273,7 @@ export async function refreshList(): Promise<RefreshResult> {
 }
 
 /**
- * 按**真实路径**读一份 PDF（桌面端）。
+ * 按**真实路径**读一份文档的字节（桌面端，PDF / Markdown 都走这条）。
  *
  * 单独抽出来是因为它有两个调用方：文件列表里的条目，以及
  * 「上次打开的文档」启动恢复（那个只有路径、没有 FileNode）。两条路必须读同一份实现，
@@ -279,20 +281,20 @@ export async function refreshList(): Promise<RefreshResult> {
  */
 export async function readBytesByPath(path: string): Promise<Uint8Array> {
   /*
-   * ⚠️ `read_pdf_bytes` 现在回的是**原始字节**（Tauri 的 `ipc::Response` → ArrayBuffer），
+   * ⚠️ `read_doc_bytes` 回的是**原始字节**（Tauri 的 `ipc::Response` → ArrayBuffer），
    *    不是 JSON 数字数组。改这条是为了内存：98 MB 的 PDF 走数字数组时
    *    webview 的 JS 堆会从 10 MB 涨到 1638 MB（实测），二进制直传只多一份等大的 buffer。
    *
    *    两种形态都接住 —— 万一以后有人把 Rust 那边改回 `Vec<u8>`，
    *    这里不会静默拿到一堆数字当成字节用。
    */
-  const res = await invoke<ArrayBuffer | number[]>('read_pdf_bytes', { path })
+  const res = await invoke<ArrayBuffer | number[]>('read_doc_bytes', { path })
   if (res instanceof ArrayBuffer) return new Uint8Array(res)
   return new Uint8Array(res)
 }
 
 /** 读一个文件的字节。桌面端走 Rust，浏览器端读 File 对象 */
-export async function readPdfBytes(node: FileNode): Promise<Uint8Array> {
+export async function readDocBytes(node: FileNode): Promise<Uint8Array> {
   if (node.path) return readBytesByPath(node.path)
   if (node.file) return new Uint8Array(await node.file.arrayBuffer())
   throw new Error('这个条目既没有路径也没有文件，读不了')
@@ -438,7 +440,7 @@ function ensureFolder(into: FileNode[], name: string, key: string): FileNode {
 export function addFiles(files: readonly File[]): number {
   let added = 0
   for (const f of files) {
-    if (!isPdf(f.name)) continue
+    if (!isSupportedDocument(f.name)) continue
     if (pushFile(f, nodes.value)) added++
   }
   return added
@@ -453,7 +455,7 @@ export function addFiles(files: readonly File[]): number {
 export function addFolder(files: readonly File[]): number {
   let added = 0
   for (const f of files) {
-    if (!isPdf(f.name)) continue
+    if (!isSupportedDocument(f.name)) continue
     const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name
     const parts = rel.split('/').filter(Boolean)
     const dirs = parts.slice(0, -1)

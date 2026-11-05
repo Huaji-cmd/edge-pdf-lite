@@ -30,7 +30,7 @@
         "connect-src": "'self' ipc: http://ipc.localhost",
         "script-src": "'self'",
         "style-src": "'self'",
-        "img-src": "'self' data:",
+        "img-src": "'self' data: blob:",
         "font-src": "'self' data:",
         "worker-src": "'self'",
         "object-src": "'none'",

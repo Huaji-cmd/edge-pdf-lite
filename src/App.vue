@@ -2,14 +2,25 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { PdfDocument } from './viewer/pdfDocument'
 import PdfViewer from './viewer/PdfViewer.vue'
+import { MarkdownDocument } from './viewer/markdownDocument'
+import type { MdHeading } from './viewer/markdownDocument'
+import MarkdownViewer from './viewer/MarkdownViewer.vue'
+import ConvertGuideDialog from './viewer/ConvertGuideDialog.vue'
 import ViewerToolbar from './viewer/ViewerToolbar.vue'
 import SidePanel from './viewer/SidePanel.vue'
 import TitleBar from './viewer/TitleBar.vue'
 import Icon from './viewer/Icon.vue'
 import { initTheme, resolveSaveDir, settings } from './viewer/settings'
+import { docKindOf, MD_MAX_BYTES, OPEN_ACCEPT, UNSUPPORTED_HINT } from './viewer/documentKind'
+import type { DocKind } from './viewer/documentKind'
+import {
+  loadMdReadingState,
+  saveMdReadingState,
+  clampMdScale,
+} from './viewer/mdReadingState'
 import {
   useFileList,
-  readPdfBytes,
+  readDocBytes,
   readBytesByPath,
   pathExists,
   stillExists,
@@ -44,6 +55,34 @@ import {
 const loadWriter = () => import('./annot/writer')
 
 const doc = shallowRef<PdfDocument | null>(null)
+/*
+ * 两种文档各自一套会话状态，**刻意不合并成"万能 Document"**。
+ *
+ * `doc` 仍然是 PDF 专用（批注、页数、指纹、书签都挂在它上面），`mdDoc` 是新增的；
+ * `docKind` 只用来决定"界面上该出现哪些控件"。合并的想法很好听，但 PDF 那条链路上
+ * 已经有 2900 行 PdfViewer + 批注写回 + 保存增量，任何"统一抽象"都得从那里改起。
+ * 并列的好处是：PDF 的代码路径**一行都不用动**，出问题时边界很清楚。
+ */
+const docKind = ref<DocKind | null>(null)
+const mdDoc = shallowRef<MarkdownDocument | null>(null)
+/** Markdown 的字号缩放（1 = 100%）。与 PDF 的 `scale` 分开，语义不同、区间不同 */
+const mdScale = ref(1)
+/** 当前所在标题（大纲高亮） */
+const mdActiveHeading = ref<string | null>(null)
+const mdViewerRef = ref<InstanceType<typeof MarkdownViewer> | null>(null)
+/**
+ * 每次打开 Markdown 都 +1，作为阅读器组件的 `key`。
+ *
+ * ⚠️ **不能拿内容指纹当 key**：同一份文件再打开一次，指纹一样 ——
+ *    Vue 会认为"还是那个组件"，只更新 props，于是 `onMounted` 不再执行：
+ *    图片不会加载、`ready` 不会发出、阅读位置也不会恢复。
+ *    症状是"第二次打开同一篇 md，图片全是占位、还停在上一处"。
+ */
+const mdOpenSeq = ref(0)
+const mdHeadings = computed<readonly MdHeading[]>(() => mdDoc.value?.headings ?? [])
+/** 「转 PDF 后批注」说明框 */
+const showConvertGuide = ref(false)
+
 const fileName = ref('')
 const scale = ref(1.5)
 const mode = ref<ViewMode>('single')
@@ -347,6 +386,74 @@ function scheduleSave(): void {
   }, 600)
 }
 
+// ---------------------------------------------------------------- Markdown 的阅读位置
+
+/**
+ * Markdown 的落盘走**独立的一套**（键前缀 `epl:md-reading:`）。
+ *
+ * ⚠️ 千万不要复用到 `flushSave()` 里：那个读 `doc.value.fingerprint`，
+ *    Markdown 期间 `doc` 是 `null`，写进去的会是一份"页码=1"的 PDF 记录，
+ *    下次打开**同名 PDF** 还会被打回第一页。两套状态、两把键，边界才清。
+ */
+let mdSaveTimer: number | null = null
+/** 恢复过程中不要回写（否则会把"还没恢复完的默认值"当成用户位置存下来） */
+let mdRestoring = false
+
+function flushMdSave(): void {
+  if (mdSaveTimer !== null) {
+    clearTimeout(mdSaveTimer)
+    mdSaveTimer = null
+  }
+  const d = mdDoc.value
+  if (!d || mdRestoring) return
+  const snap = mdViewerRef.value?.snapshot()
+  if (!snap) return
+  saveMdReadingState(d.fingerprint, { ...snap, scale: mdScale.value })
+}
+
+function scheduleMdSave(): void {
+  if (mdRestoring) return
+  if (mdSaveTimer !== null) clearTimeout(mdSaveTimer)
+  mdSaveTimer = window.setTimeout(() => {
+    mdSaveTimer = null
+    flushMdSave()
+  }, 600)
+}
+
+watch(mdScale, scheduleMdSave)
+
+/** 离开页面前把**两种**阅读位置都落盘（防抖可能还没到点） */
+function flushAllReading(): void {
+  flushSave()
+  flushMdSave()
+}
+
+/**
+ * Markdown 排版完成 → 恢复上次的缩放与位置。
+ *
+ * ⚠️ 顺序：**先改缩放，再恢复位置**。
+ *    字号一变，同一段文字的滚动坐标就全变了；反过来做会先按旧字号定位、
+ *    再重排一次把位置推走（用户看到的是"打开了，但不在上次那一段"）。
+ */
+async function onMdReady(): Promise<void> {
+  const d = mdDoc.value
+  if (!d) return
+  const saved = loadMdReadingState(d.fingerprint)
+  try {
+    /*
+     * 只恢复**位置**：缩放已经在 `openMarkdown` 里定好了（挂载前），
+     * 这里再改会触发重排并把刚恢复的位置推走。
+     */
+    if (saved) mdViewerRef.value?.restore(saved)
+  } finally {
+    // ⚠️ 无论有没有可恢复的记录都要解除（没有记录时也得允许后续落盘），
+    //    且要等一帧 —— 恢复引起的 scroll 事件会补一次落盘，别把中间态写进去
+    void nextTick(() => {
+      mdRestoring = false
+    })
+  }
+}
+
 /** 版面就绪后恢复上次的阅读位置 */
 async function onViewerReady(): Promise<void> {
   const d = doc.value
@@ -443,7 +550,7 @@ function onBeforeInstallPrompt(e: Event): void {
  *     有未保存批注就一定点过或画过。
  */
 function onBeforeUnload(e: BeforeUnloadEvent): void {
-  flushSave()
+  flushAllReading()
   if (!unsaved.value) return
   e.preventDefault()
   e.returnValue = ''
@@ -472,14 +579,27 @@ watch([page, scale, mode, spreadOffset], scheduleSave)
 // ---------------------------------------------------------------- 打开文件
 
 /**
- * 打开一份 PDF。
+ * 打开任何一个**本应用支持**的文档（PDF / Markdown）。
+ *
+ * 这里是唯一的分流点：按扩展名决定走 PDF 还是 Markdown。
+ * 两个分支各自维护自己的会话状态，**不共享**页码/缩放/批注。
+ *
  * @returns 真的打开了返回 true；用户取消（未保存确认框点了取消）或失败返回 false
  *          —— 文件列表要靠这个决定要不要把高亮切过去，不然"点了取消但列表已跳走"
  */
-async function openBytes(bytes: Uint8Array, name: string): Promise<boolean> {
+async function openDocument(bytes: Uint8Array, name: string, path = ''): Promise<boolean> {
+  const kind = docKindOf(name)
+  if (!kind) {
+    errorText.value = UNSUPPORTED_HINT
+    return false
+  }
+
   /*
    * 换文档会**清空整个批注 store**（批注按文档归属，不能跨文件漂）。
    * 这一步浏览器不会卸载页面，所以 `beforeunload` 拦不到 —— 必须自己问一句。
+   *
+   * ⚠️ 判定放在分流**之前**：从"有未保存批注的 PDF"切到 Markdown，同样会丢掉这些批注，
+   *    不能因为"Markdown 没有批注"就跳过这一问。
    */
   if (
     unsaved.value &&
@@ -492,16 +612,29 @@ async function openBytes(bytes: Uint8Array, name: string): Promise<boolean> {
     return false
   }
 
+  if (kind === 'markdown') return openMarkdown(bytes, name, path)
+  return openPdf(bytes, name)
+}
+
+/** 打开一份 PDF（原逻辑，行为不变） */
+async function openPdf(bytes: Uint8Array, name: string): Promise<boolean> {
   errorText.value = ''
   // 打开新文档 = 原路径作废。桌面端从列表打开的会由调用方在成功后重新设上
   currentSourcePath.value = ''
+  busyLabel.value = '正在打开…'
   busy.value = true
   try {
     const next = await PdfDocument.open(bytes, name)
     const prev = doc.value
-    // 换文档前先把旧的阅读位置落盘
+    // 换文档前先把旧的阅读位置落盘（PDF 和 Markdown 各存一份）
     flushSave()
+    flushMdSave()
+    // 同一个会话里只能有一个"活着的文档"：把 Markdown 会话关掉，
+    // 否则侧边栏的目录 / 标题高亮会指向一份已经看不见的文档
+    const prevMd = mdDoc.value
+    mdDoc.value = null
     doc.value = next
+    docKind.value = 'pdf'
     fileName.value = name
     pageSizes.value = null
     // 目录要重新解析 —— 批注和书签都是按文档归属的，不能跨文件漂
@@ -512,8 +645,89 @@ async function openBytes(bytes: Uint8Array, name: string): Promise<boolean> {
     spreadOffset.value = 0
     // 新文档接管之后再关掉旧的，避免中间出现空白
     if (prev) void prev.close()
+    if (prevMd) prevMd.close()
     return true
   } catch (e) {
+    errorText.value = errTextOf(e)
+    return false
+  } finally {
+    busy.value = false
+  }
+}
+
+/**
+ * 打开一份 Markdown（只读）。
+ *
+ * 与 PDF 分支的差别不只是"渲染方式"：这里**必须**把 PDF 会话整个拆掉 ——
+ * 批注计数、未保存标记、页码、缩略图尺寸都还挂在 `doc` 上，留着就会出现
+ * "Markdown 页面上显示着一个未保存批注徽标"这种鬼东西。
+ */
+async function openMarkdown(bytes: Uint8Array, name: string, path: string): Promise<boolean> {
+  /*
+   * 大小闸门（前端这一层是给**拖进来的 File** 用的：它没有真实路径，
+   * 到不了 Rust 的 stat 闸门）。桌面端从列表打开时 Rust 已经拦过一遍，
+   * 这里再拦一次不亏 —— 两道闸门的存在意义就是"任一道坏了还有另一道"。
+   */
+  if (bytes.length > MD_MAX_BYTES) {
+    errorText.value = `这个 Markdown 有 ${(bytes.length / (1 << 20)).toFixed(1)} MB，超过 ${
+      MD_MAX_BYTES / (1 << 20)
+    } MB 上限。这类文件要一次性解析完，太大在低配机上会卡住界面。`
+    return false
+  }
+
+  errorText.value = ''
+  currentSourcePath.value = ''
+  busyLabel.value = '正在解析 Markdown…'
+  busy.value = true
+  try {
+    const next = await MarkdownDocument.open(bytes, name, path)
+    const prevPdf = doc.value
+    const prevMd = mdDoc.value
+
+    flushSave()
+    flushMdSave()
+
+    // 先把 PDF 会话完全关掉，再换 Markdown —— 顺序反了会有一帧"两个文档都在"
+    doc.value = null
+    pageSizes.value = null
+    outline.value = []
+    outlineLoading.value = false
+
+    /*
+     * 🔴 缩放必须在**挂载之前**就设成上次的值。
+     *    挂载后再改会触发 MarkdownViewer 里"改字号保住锚点"的 watch，
+     *    而那一刻组件刚建好、锚点还是文档开头 —— 两边会抢同一个滚动位置。
+     *    先把初值摆对，`onMdReady` 就只需要恢复"位置"这一件事。
+     */
+    /*
+     * 🔴 从现在起就"别回写"：接下来会改 mdScale（会触发 watch -> scheduleMdSave），
+     *    而此刻正文还没挂载、也没恢复位置。若这时落盘，会把"顶部 = 0"写成用户的
+     *    阅读位置 —— 一次打开就把记录冲掉。这个标志在 `onMdReady` 里解除。
+     */
+    mdRestoring = true
+    const saved = loadMdReadingState(next.fingerprint)
+    mdScale.value = saved ? clampMdScale(saved.scale) : 1
+
+    mdDoc.value = next
+    mdOpenSeq.value++
+    docKind.value = 'markdown'
+    fileName.value = name
+    mdActiveHeading.value = null
+    page.value = 1
+    tool.value = 'none'
+    selected.value = null
+    annotCount.value = 0
+    unsaved.value = false
+
+    // 缩略图面板对 Markdown 不存在：停在那一页会是一片空白
+    if (panel.value === 'thumbs') panel.value = 'outline'
+
+    if (prevPdf) void prevPdf.close()
+    if (prevMd) prevMd.close()
+    return true
+  } catch (e) {
+    // 打开失败：别让"暂停回写"的闸门卡住（否则当前这份文档的位置再也不会落盘）
+    mdRestoring = false
     errorText.value = errTextOf(e)
     return false
   } finally {
@@ -566,15 +780,15 @@ async function openFromList(node: FileNode): Promise<void> {
   }
   let bytes: Uint8Array
   try {
-    bytes = await readPdfBytes(node)
+    bytes = await readDocBytes(node)
   } catch (e) {
     errorText.value = errTextOf(e)
     return
   }
-  if (await openBytes(bytes, node.name)) {
+  if (await openDocument(bytes, node.name, node.path ?? '')) {
     currentFileId.value = node.id
     currentSourcePath.value = node.path ?? ''
-    // 记住"上次打开的是这一本" —— 下次启动会自动打开它（见 restoreLastDocument）
+    // 记住"上次打开的是这一份" —— 下次启动会自动打开它（见 restoreLastDocument）
     if (node.path) saveLastDocument(node.path, node.name)
   }
 }
@@ -590,8 +804,8 @@ async function openFromList(node: FileNode): Promise<void> {
  */
 async function restoreLastDocument(): Promise<void> {
   const last = loadLastDocument()
-  // doc 已有值说明用户手快已经打开了别的，别抢
-  if (!last || doc.value) return
+  // 已经有文档打开说明用户手快已经打开了别的，别抢
+  if (!last || doc.value || mdDoc.value) return
   if (!(await pathExists(last.path))) {
     clearLastDocument()
     showToast(`上次打开的《${last.name}》已经不在原来的位置了`)
@@ -599,10 +813,11 @@ async function restoreLastDocument(): Promise<void> {
   }
   try {
     const bytes = await readBytesByPath(last.path)
-    if (await openBytes(bytes, last.name)) {
+    if (await openDocument(bytes, last.name, last.path)) {
       currentSourcePath.value = last.path
       // 文件列表里已经有这一条的话，顺手把高亮也切过去
-      currentFileId.value = fileNodes.value.find((n) => n.path === last.path)?.id ?? null
+      currentFileId.value =
+        fileNodes.value.find((n) => n.path === last.path)?.id ?? findNodeIdByPath(last.path)
     }
   } catch (e) {
     // 读不出来（权限/损坏）也清掉，免得每次启动都白试一遍
@@ -611,12 +826,29 @@ async function restoreLastDocument(): Promise<void> {
   }
 }
 
+/**
+ * 在文件列表里按路径找条目 id（含一层层展开的子节点）。
+ *
+ * 顶层没找到不代表不在列表里 —— 从文件夹里打开的文件，它的节点在 children 里。
+ * 只查顶层的话，重启后恢复文档时左边列表不会高亮，看起来像"没打开"。
+ */
+function findNodeIdByPath(path: string, list: readonly FileNode[] = fileNodes.value): string | null {
+  for (const n of list) {
+    if (n.path === path && n.kind === 'file') return n.id
+    if (n.children) {
+      const hit = findNodeIdByPath(path, n.children)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
 async function onPickFile(e: Event): Promise<void> {
   const input = e.target as HTMLInputElement
   const f = input.files?.[0]
   input.value = ''
   if (!f) return
-  await openBytes(new Uint8Array(await f.arrayBuffer()), f.name)
+  await openDocument(new Uint8Array(await f.arrayBuffer()), f.name)
 }
 
 function onDrop(e: DragEvent): void {
@@ -624,11 +856,16 @@ function onDrop(e: DragEvent): void {
   dragging.value = false
   const f = e.dataTransfer?.files?.[0]
   if (!f) return
-  if (!/\.pdf$/i.test(f.name) && f.type !== 'application/pdf') {
-    errorText.value = '只支持 PDF 文件'
+  /*
+   * 拖放的白名单必须和对话框 / 目录扫描**用同一套判断**（`docKindOf`）。
+   * 以前这里写的是 `/\.pdf$/i`，加格式时最容易漏的就是它 ——
+   * 症状是"从文件夹点得开，拖进来却说不支持"。
+   */
+  if (!docKindOf(f.name)) {
+    errorText.value = UNSUPPORTED_HINT
     return
   }
-  void f.arrayBuffer().then((b) => openBytes(new Uint8Array(b), f.name))
+  void f.arrayBuffer().then((b) => openDocument(new Uint8Array(b), f.name))
 }
 
 function onDragOver(e: DragEvent): void {
@@ -735,8 +972,44 @@ async function syncMaximized(): Promise<void> {
   }
 }
 
+/**
+ * 缩放 —— 按文档类型分流。
+ *
+ * ⚠️ 两个值不能混用：PDF 的 `scale` 是"页面放大倍数"（0.25–8），
+ *    Markdown 的 `mdScale` 是"字号倍数"（0.75–2.5）。共用一个 ref 会让
+ *    "从 150% 的 PDF 切到 Markdown"时正文直接变成 24px 起。
+ */
 function setScale(s: number): void {
+  if (docKind.value === 'markdown') {
+    mdScale.value = clampMdScale(s)
+    return
+  }
   void viewerRef.value?.applyScale(s)
+}
+
+/** 点大纲里的标题 */
+function goHeading(id: string): void {
+  mdViewerRef.value?.scrollToHeading(id, true)
+}
+
+/**
+ * 打开外部链接。
+ *
+ * 桌面端走受控命令（Rust 侧再验一次协议白名单），浏览器端用新标签页。
+ * **绝不**让 WebView 在当前窗口导航 —— 那会把整个阅读界面顶掉，
+ * 而且回退之后 Vue 的状态已经没了。
+ */
+async function openExternalLink(href: string): Promise<void> {
+  if (!IS_TAURI) {
+    window.open(href, '_blank', 'noopener,noreferrer')
+    return
+  }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('open_external_url', { url: href })
+  } catch (e) {
+    errorText.value = `打不开链接：${errTextOf(e)}`
+  }
 }
 
 function fitWidth(): void {
@@ -977,18 +1250,59 @@ function onKeydown(e: KeyboardEvent): void {
    *    这一条必须留着，否则"在文本框里改字"这个功能基本没法用。
    */
   if (target?.isContentEditable) return
-  if (!doc.value) return
+  if (!doc.value && !mdDoc.value) return
 
   const ctrl = e.ctrlKey || e.metaKey
+  const isMd = docKind.value === 'markdown'
+  const curScale = isMd ? mdScale.value : scale.value
+  /*
+   * Ctrl+F：只对 Markdown 生效（PDF 的页内查找是另一条链路，本期没做）。
+   * ⚠️ 必须 preventDefault：否则 WebView2 / 浏览器会自己弹原生查找条，
+   *    那东西和我们的阅读区各管各的，用户会以为"搜不到"。
+   */
+  if (ctrl && (e.key === 'f' || e.key === 'F')) {
+    if (isMd) {
+      e.preventDefault()
+      mdViewerRef.value?.toggleFind()
+    }
+    return
+  }
   if (ctrl && (e.key === '=' || e.key === '+')) {
     e.preventDefault()
-    setScale(scale.value * 1.2)
+    setScale(curScale * 1.2)
   } else if (ctrl && e.key === '-') {
     e.preventDefault()
-    setScale(scale.value / 1.2)
+    setScale(curScale / 1.2)
   } else if (ctrl && e.key === '0') {
     e.preventDefault()
     setScale(1)
+  } else if (isMd) {
+    /*
+     * Markdown 只保留**滚动**相关的键位。
+     *
+     * ⚠️ 撤销/重做/删除/翻页在 Markdown 下必须**什么都不做**，不能"顺手沿用 PDF 的分支"：
+     *    那些分支最终会调到 `viewerRef`（PDF 组件），而它此刻是 null ——
+     *    看起来没反应，实际是"按了键、被吃掉了"，跟"没这个功能"是两回事。
+     */
+    if (e.key === 'PageDown' || (e.key === ' ' && !e.shiftKey)) {
+      e.preventDefault()
+      mdViewerRef.value?.scrollByPage(1)
+    } else if (e.key === 'PageUp' || (e.key === ' ' && e.shiftKey)) {
+      e.preventDefault()
+      mdViewerRef.value?.scrollByPage(-1)
+    } else if (e.key === 'Home') {
+      e.preventDefault()
+      mdViewerRef.value?.scrollToEdge('start')
+    } else if (e.key === 'End') {
+      e.preventDefault()
+      mdViewerRef.value?.scrollToEdge('end')
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      mdViewerRef.value?.scrollByStep(1)
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      mdViewerRef.value?.scrollByStep(-1)
+    }
   } else if (ctrl && e.shiftKey && (e.key === 'z' || e.key === 'Z')) {
     // ⚠️ 必须排在"Ctrl+Z"前面：Ctrl+Shift+Z 的 e.key 是大写 'Z'，
     // 顺序反了就永远走不到重做这条分支（撤销会吃掉它）
@@ -1006,6 +1320,11 @@ function onKeydown(e: KeyboardEvent): void {
       deleteSelected()
     }
   } else if (e.key === 'Escape') {
+    /*
+     * Markdown：先把查找条关掉（这是用户此刻最可能想 Escape 的东西）。
+     * 焦点在查找框里时由输入框自己的 keydown 处理，走不到这里 —— 两条都不落空。
+     */
+    if (isMd && mdViewerRef.value?.closeFindIfOpen()) return
     // 退回阅读模式 —— 避免"工具还开着但忘了"导致误画
     tool.value = 'none'
     viewerRef.value?.clearSelection()
@@ -1020,7 +1339,7 @@ function onKeydown(e: KeyboardEvent): void {
     goTo(1)
   } else if (e.key === 'End') {
     e.preventDefault()
-    goTo(doc.value.numPages)
+    goTo(doc.value?.numPages ?? 1)
   } else if (e.key === 'ArrowRight') {
     e.preventDefault()
     stepPage(1)
@@ -1038,7 +1357,7 @@ onMounted(() => {
   // 关页面前把阅读位置落盘（防抖可能还没到点）；顺带拦住未保存的批注
   window.addEventListener('beforeunload', onBeforeUnload)
   // pagehide 覆盖"切到后台/移动设备被杀"这类不触发 beforeunload 的情况
-  window.addEventListener('pagehide', flushSave)
+  window.addEventListener('pagehide', flushAllReading)
   // 应用形态判断 + 安装事件（见上面 installPrompt 的注释：只能在这儿挂）
   standalone.value = window.matchMedia?.('(display-mode: standalone)').matches ?? false
   window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt)
@@ -1137,7 +1456,7 @@ async function installCloseGuard(): Promise<void> {
         window.addEventListener('beforeunload', onBeforeUnload)
         return
       }
-      flushSave()
+      flushAllReading()
       await win.destroy()
     })
   } catch (e) {
@@ -1153,13 +1472,14 @@ onBeforeUnmount(() => {
   window.removeEventListener('dragleave', onDragLeave)
   window.removeEventListener('drop', onDrop)
   window.removeEventListener('beforeunload', onBeforeUnload)
-  window.removeEventListener('pagehide', flushSave)
+  window.removeEventListener('pagehide', flushAllReading)
   window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt)
   window.removeEventListener('appinstalled', onInstalled)
   unlistenClose?.()
   unlistenClose = null
-  flushSave()
+  flushAllReading()
   void doc.value?.close()
+  mdDoc.value?.close()
 })
 </script>
 
@@ -1169,6 +1489,7 @@ onBeforeUnmount(() => {
       :file-name="fileName"
       :side-open="sideOpen"
       :panel="panel"
+      :doc-kind="docKind"
       :maximized="maximized"
       @toggle-side="sideOpen = !sideOpen"
       @set-panel="setPanel"
@@ -1176,9 +1497,10 @@ onBeforeUnmount(() => {
     />
 
     <ViewerToolbar
-      :num-pages="doc?.numPages ?? 0"
+      :doc-kind="docKind"
+      :num-pages="docKind === 'pdf' ? (doc?.numPages ?? 0) : 0"
       :page="page"
-      :scale="scale"
+      :scale="docKind === 'markdown' ? mdScale : scale"
       :mode="mode"
       :spread-offset="spreadOffset"
       :tool="tool"
@@ -1206,6 +1528,7 @@ onBeforeUnmount(() => {
       @redo="viewerRef?.redoAnnot()"
       @delete-selected="deleteSelected"
       @export-annot="exportAnnotated"
+      @convert-guide="showConvertGuide = true"
     />
 
     <!--
@@ -1217,8 +1540,11 @@ onBeforeUnmount(() => {
         v-if="sideOpen"
         :panel="panel"
         :doc="doc"
+        :doc-kind="docKind"
         :outline="outline"
         :outline-loading="outlineLoading"
+        :md-headings="mdHeadings"
+        :md-active-heading-id="mdActiveHeading"
         :sizes="pageSizes"
         :current-page="page"
         :file-nodes="fileNodes"
@@ -1226,6 +1552,7 @@ onBeforeUnmount(() => {
         :busy="busy"
         @go-dest="goToDest"
         @go-page="goTo"
+        @go-heading="goHeading"
         @open-file="openFromList"
         @set-panel="setPanel"
         @toast="showToast"
@@ -1252,10 +1579,28 @@ onBeforeUnmount(() => {
         @tool-auto-exit="tool = 'none'"
       />
 
+      <!--
+        `:key` 用内容指纹：换了文档就**重建组件**。
+        复用同一个实例的话，滚动位置、已加载的图片 Blob URL、标题缓存都会残留，
+        而"清干净"要写一堆 watch —— 重建比清理便宜也更不容易漏。
+      -->
+      <MarkdownViewer
+        v-else-if="mdDoc"
+        :key="mdOpenSeq"
+        ref="mdViewerRef"
+        :doc="mdDoc"
+        :scale="mdScale"
+        @ready="onMdReady"
+        @scroll="scheduleMdSave"
+        @heading-change="(id) => (mdActiveHeading = id)"
+        @set-scale="setScale"
+        @open-link="openExternalLink"
+      />
+
       <div v-else class="welcome">
         <div class="welcome-box">
           <h1>edge-pdf-lite</h1>
-          <p>把 PDF 拖进来，或者点顶栏的文件夹图标 / 左侧「文件」面板添加。</p>
+          <p>把 PDF / Markdown 拖进来，或者点顶栏的文件夹图标 / 左侧「文件」面板添加。</p>
           <div class="welcome-actions">
             <button class="btn primary" @click="fileInputRef?.click()">选择文件</button>
             <button v-if="canInstall" class="btn" @click="installApp">安装为应用</button>
@@ -1267,7 +1612,7 @@ onBeforeUnmount(() => {
             快捷键：<kbd>Ctrl</kbd>+<kbd>滚轮</kbd> 缩放 ·
             <kbd>PageUp</kbd>/<kbd>PageDown</kbd> 翻页 ·
             <kbd>Ctrl</kbd>+<kbd>0</kbd> 回到 100%<br />
-            批注：<kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤销 ·
+            批注（仅 PDF）：<kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤销 ·
             <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> 重做 ·
             <kbd>Delete</kbd> 删除所选 ·
             <kbd>Esc</kbd> 退出工具
@@ -1277,7 +1622,7 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 下面这些是覆盖层（position: fixed），留在 .app 下而不是侧边栏的 .main 里 -->
-    <div v-if="dragging" class="drop-hint">松手打开 PDF</div>
+    <div v-if="dragging" class="drop-hint">松手打开 PDF / Markdown</div>
     <div v-if="busy" class="overlay">{{ busyLabel }}</div>
     <div v-if="toast" class="toast">
       <span class="toast-msg">{{ toast }}</span>
@@ -1300,9 +1645,19 @@ onBeforeUnmount(() => {
     <input
       ref="fileInputRef"
       type="file"
-      accept="application/pdf,.pdf"
+      data-tid="open-input"
+      :accept="OPEN_ACCEPT"
       hidden
       @change="onPickFile"
+    />
+
+    <!-- 「转 PDF 后批注」说明框：Markdown 是只读的，这是唯一的批注出路 -->
+    <ConvertGuideDialog
+      v-if="showConvertGuide"
+      :file-name="fileName"
+      :file-path="currentSourcePath"
+      @close="showConvertGuide = false"
+      @toast="showToast"
     />
   </div>
 </template>

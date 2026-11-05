@@ -113,6 +113,16 @@ check(
   '没有任何指令用裸通配 *',
   !Object.values(csp ?? {}).some((v) => /(^|\s)\*(\s|$)/.test(String(v))),
 )
+/*
+ * Markdown 的本地图片是 **Blob URL** 渲染的（字节由 Rust 读、前端转 Blob）。
+ * `img-src` 少了 `blob:` 时不会报错，只是图片**静默不显示** —— 桌面版看起来
+ * 就像"这个功能没做"。所以这条要作为策略的一部分被守住，而不是靠人记得。
+ */
+check(
+  'img-src 放行 blob:（Markdown 本地图片靠它显示）',
+  /(^|\s)blob:(\s|$)/.test(d('img-src')),
+  d('img-src'),
+)
 
 // 内联 style 属性是这条策略的"隐形地雷"：它归 style-src-attr 管，
 // 出现一处就得给整站开 'unsafe-inline'。历史上 index.html 里就有一处。

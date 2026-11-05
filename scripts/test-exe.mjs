@@ -349,6 +349,30 @@ const kidFiles = await evaluate(
 check('点开文件夹才扫出里面的 PDF（懒加载生效）', kidFiles > 0, `扫出 ${kidFiles} 个`)
 
 /*
+ * 类型徽标：文件行上要能一眼分出 PDF / MD。
+ * testdata 目录里两种都有，正好做阳性对照；文件夹行**不该**有徽标。
+ */
+{
+  const badge = JSON.parse(
+    await evaluate(`(() => {
+      const panel = document.querySelector('[data-tid="files-panel"]');
+      const rows = [...panel.querySelectorAll('[data-node-id]')];
+      const has = (t) => rows.some((r) => r.querySelector('[data-kind-badge="' + t + '"]'));
+      return JSON.stringify({
+        pdf: has('PDF'),
+        md: has('MD'),
+        folderBadged: [...panel.querySelectorAll('[data-kind="folder"]')].some(
+          (f) => !!f.querySelector('[data-kind-badge]'),
+        ),
+      });
+    })()`),
+  )
+  check('PDF 行显示 PDF 徽标', badge.pdf)
+  check('MD 行显示 MD 徽标', badge.md)
+  check('文件夹行没有徽标', !badge.folderBadged)
+}
+
+/*
  * ---- 5b. 展开状态要跨面板切换记住 -------------------------------------------
  *
  * 用户报的："打开大纲之后返回文件列表，又要重新展开一次文件夹。"
@@ -1208,8 +1232,8 @@ check('磁盘上的文件**真的**改名了', await invoke('path_exists', { pat
 check('是改名不是复制（原名已经不在了）', !(await invoke('path_exists', { path: REN_SRC })))
 check(
   '后缀没被改（还是 .pdf）',
-  /\.pdf$/i.test(await evaluate(`document.querySelector('[data-tid="files-panel"]').textContent.match(/renamed-ok[^\\s]*/)?.[0] ?? ''`)),
-  await evaluate(`document.querySelector('[data-tid="files-panel"]').textContent.match(/renamed-ok[^\\s]*/)?.[0] ?? '（没找到）'`),
+  /\.pdf$/i.test(await evaluate(`[...document.querySelectorAll('[data-tid="files-panel"] .name')].find((n) => n.textContent.includes('renamed-ok'))?.textContent ?? ''`)),
+  await evaluate(`[...document.querySelectorAll('[data-tid="files-panel"] .name')].find((n) => n.textContent.includes('renamed-ok'))?.textContent ?? '（没找到）'`),
 )
 
 // ---- 复制路径：剪贴板在 CDP 里可能被拒，但**无论如何都要有反馈**
@@ -1349,6 +1373,82 @@ r = await tryInvoke('read_pdf_bytes', { path: NOT_PDF })
 check('（对照）放行目录里的非 .pdf 仍然读不了（后缀那一道）', !r.ok && /只处理/.test(r.err), r.ok ? '竟然读到了' : r.err)
 await rm(NOT_PDF, { force: true }).catch(() => {})
 
+/*
+ * ---- 7b-2. Markdown 的本地图片闸门（`read_doc_asset`）
+ *
+ * 这是本期新增的**最高风险**命令：它让前端第一次能"按相对路径读磁盘文件"。
+ * 端到端只证明"读不到"是没牙的判据 —— 文件不存在也会读不到。
+ * 所以每一条拒绝都要**同时**有：明确的拒绝原因 + 一条阳性对照。
+ */
+const MD_DOC = join(TESTDATA_DIR, 'md-basic.md')
+const MD_BASIC_ASSET = join(TESTDATA_DIR, 'md-assets', 'diagram.png')
+if (existsSync(MD_DOC) && existsSync(MD_BASIC_ASSET)) {
+  r = await tryInvoke('read_doc_asset', { docPath: MD_DOC, relPath: 'md-assets/diagram.png' })
+  check('（对照）文档目录内的图片读得到', r.ok && r.len > 1000, r.ok ? `${r.len} 字节` : r.err)
+
+  for (const [label, rel] of [
+    ['.. 越界', '../real-1706.03762.pdf'],
+    ['子目录里绕回上级', 'md-assets/../../secret.png'],
+    ['绝对路径', 'C:////Windows////win.ini'],
+    ['UNC 路径', '\\\\server\\share\\x.png'],
+    ['以 / 开头', '/etc/passwd'],
+  ]) {
+    r = await tryInvoke('read_doc_asset', { docPath: MD_DOC, relPath: rel })
+    check(`图片路径拒绝：${label}`, !r.ok, r.ok ? `竟然读到了 ${r.len} 字节` : '')
+  }
+
+  // 扩展名那一道：同目录内的 .md 也不能借这个命令读（否则它就是通用读文件）
+  r = await tryInvoke('read_doc_asset', { docPath: MD_DOC, relPath: 'md-basic.md' })
+  check('同目录下的非图片仍然读不了（扩展名那一道）', !r.ok && /只支持/.test(r.err), r.err)
+
+  // 文档本身必须是 Markdown
+  r = await tryInvoke('read_doc_asset', { docPath: PDF, relPath: 'md-assets/diagram.png' })
+  check('只有 Markdown 能引用本地图片（PDF 不行）', !r.ok && /Markdown/.test(r.err), r.err)
+
+  // 统一读取入口：Markdown 走 read_doc_bytes；非文档后缀仍然被拒
+  r = await tryInvoke('read_doc_bytes', { path: MD_DOC })
+  check('（对照）read_doc_bytes 读得到 Markdown', r.ok && r.len > 500, r.ok ? `${r.len} 字节` : r.err)
+  const NOT_DOC = join(TESTDATA_DIR, 'not-a-doc.txt')
+  await writeFile(NOT_DOC, 'hello\n')
+  r = await tryInvoke('read_doc_bytes', { path: NOT_DOC })
+  check('read_doc_bytes 仍然拒绝非文档后缀', !r.ok && /只处理/.test(r.err), r.err)
+  await rm(NOT_DOC, { force: true }).catch(() => {})
+
+  /*
+   * 桌面端最关键的一条：**本地图片真的能画出来**。
+   *
+   * 它同时穿过三道关：CSP 的 `img-src` 允许 `blob:`、`read_doc_asset` 返回真字节、
+   * 字节本身是合法 PNG。少任何一道都不报错，只是图片静默不显示 ——
+   * 所以必须"真的解出一张图"才算过。这条只有 exe 能验（浏览器拿不到兄弟文件）。
+   */
+  const blobWidth = Number(
+    await evaluate(`(async () => {
+      try {
+        const res = await window.__TAURI_INTERNALS__.invoke('read_doc_asset', {
+          docPath: ${JSON.stringify(MD_DOC)},
+          relPath: 'md-assets/diagram.png',
+        });
+        const bytes = res instanceof ArrayBuffer ? new Uint8Array(res) : new Uint8Array(res);
+        const url = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+        const img = new Image();
+        await new Promise((ok, bad) => {
+          img.onload = ok;
+          img.onerror = bad;
+          img.src = url;
+        });
+        const w = img.naturalWidth;
+        URL.revokeObjectURL(url);
+        return String(w);
+      } catch (e) {
+        return '0';
+      }
+    })()`),
+  )
+  check('CSP(blob:) + 读取命令 这条链能画出本地图片', blobWidth > 0, `${blobWidth}px 宽`)
+} else {
+  check('Markdown 测试语料存在（先跑 node scripts/make-md-testdata.mjs）', false)
+}
+
 // 放行列表要能跨重启活着，否则"上次打开的文件"和整个文件列表下次全读不了
 // （路径在沙箱里 —— 测试不碰用户的真实数据目录）
 const WHITELIST = join(SANDBOX, 'allowed-paths.txt')
@@ -1457,6 +1557,61 @@ check(
   (await countAnnots(roPath)) === (await countAnnots(PDF)) + 1,
   `${await countAnnots(PDF)} → ${await countAnnots(roPath)}`,
 )
+
+// ---------------------------------------------------------------- 7c. 桌面版的 Markdown（拖入路径）
+console.log('\n[7c] 桌面版打开 Markdown：拖入的文件没有真实路径')
+/*
+ * 这一段守的是**文案不要骗人**：
+ * 桌面版把 md **拖**进来时，HTML5 只给 File 字节、没有真实路径，
+ * 本地图片读不到是必然的。但提示**不能**写成"本地图片只在桌面版显示" ——
+ * 用户就在桌面版，看到那句只会认为功能坏了。
+ * 正确说法是"没有真实路径 + 从文件列表打开"。
+ */
+{
+  const d = await send('DOM.getDocument', { depth: -1 })
+  const inp = await send('DOM.querySelector', {
+    nodeId: d.root.nodeId,
+    selector: 'input[data-tid="open-input"]',
+  })
+  const MD_TEST = join(TESTDATA_DIR, 'md-basic.md')
+  await send('DOM.setFileInputFiles', { files: [MD_TEST], nodeId: inp.nodeId })
+
+  let mdOk = false
+  for (let i = 0; i < 60; i++) {
+    await sleep(200)
+    mdOk = await evaluate(`!!document.querySelector('[data-tid="md-viewer"]')`)
+    if (mdOk) break
+  }
+  check('桌面版能打开 Markdown', mdOk)
+  check(
+    '标题真的提取出来了（大纲有内容）',
+    Number(
+      await evaluate(
+        `document.querySelector('[data-tid="md-viewer"]')?.dataset.mdHeadings || 0`,
+      ),
+    ) >= 5,
+  )
+
+  const noPath = JSON.parse(
+    await evaluate(`(() => {
+      const el = document.querySelector('[data-md-blocked="no-path"]');
+      return JSON.stringify({
+        exists: !!el,
+        text: el ? el.textContent : '',
+        imgs: document.querySelectorAll('.md-body img').length,
+        annot: !!document.querySelector('[data-tid="annot-toggle"]'),
+        save: !!document.querySelector('[data-tid="save"]'),
+      });
+    })()`),
+  )
+  check(
+    '提示说清"没有真实路径 + 从文件列表打开"（不是"只在桌面版显示"）',
+    noPath.exists && /从左侧/.test(noPath.text) && !/只在桌面版/.test(noPath.text),
+    noPath.text.replace(/\s+/g, ' ').slice(0, 70),
+  )
+  check('确实没有去磁盘读图片（没有 img 元素）', noPath.imgs === 0, `img=${noPath.imgs}`)
+  check('Markdown 下批注 / 保存入口都不存在', !noPath.annot && !noPath.save)
+}
 
 // ---------------------------------------------------------------- 8. 控制台
 console.log('\n[8] 控制台')

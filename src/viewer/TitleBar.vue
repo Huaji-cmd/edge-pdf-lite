@@ -14,11 +14,14 @@ import { computed } from 'vue'
 import Icon from './Icon.vue'
 import { IS_TAURI } from '@/platform'
 import type { SidePanelKind } from './types'
+import type { DocKind } from './documentKind'
 
 const props = defineProps<{
   fileName: string
   sideOpen: boolean
   panel: SidePanelKind | null
+  /** 当前文档类型；Markdown 下没有"缩略图"这个概念 */
+  docKind: DocKind | null
   /** 窗口是否最大化（决定显示「最大化」还是「还原」图标） */
   maximized?: boolean
 }>()
@@ -29,13 +32,25 @@ const emit = defineEmits<{
   win: [action: 'min' | 'max' | 'close']
 }>()
 
-/** 左部 5 个面板入口。顺序即屏幕上的顺序（与原型一致） */
-const ENTRIES = [
+/**
+ * 左部面板入口。顺序即屏幕上的顺序（与原型一致）。
+ *
+ * ⚠️ 缩略图对 Markdown 不存在 —— 一列连续文字没有"页"，
+ *    点开只会看到一个空面板。宁可少一个按钮，也不要留一个点开没反应的入口。
+ */
+const ENTRIES = computed(() => [
   { kind: 'files' as const, icon: 'file' as const, tip: '文件列表', tid: 'side-file' },
   { kind: 'search' as const, icon: 'search' as const, tip: '搜索文件（只匹配文件名）', tid: 'side-search' },
-  { kind: 'outline' as const, icon: 'list' as const, tip: '目录（PDF 书签）', tid: 'side-outline' },
-  { kind: 'thumbs' as const, icon: 'grid' as const, tip: '缩略图（每页小图）', tid: 'side-thumbs' },
-]
+  {
+    kind: 'outline' as const,
+    icon: 'list' as const,
+    tip: props.docKind === 'markdown' ? '目录（Markdown 标题）' : '目录（PDF 书签）',
+    tid: 'side-outline',
+  },
+  ...(props.docKind === 'markdown'
+    ? []
+    : [{ kind: 'thumbs' as const, icon: 'grid' as const, tip: '缩略图（每页小图）', tid: 'side-thumbs' }]),
+])
 
 const title = computed(() =>
   props.fileName ? `${props.fileName} — edge-pdf-lite` : 'edge-pdf-lite',

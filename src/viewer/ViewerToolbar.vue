@@ -13,12 +13,22 @@
 import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import Icon from './Icon.vue'
 import type { ViewMode } from './types'
+import type { DocKind } from './documentKind'
 import type { ToolKind, ToolColors, PointerMode, Rgb } from '@/annot/types'
 import { swatchesFor, POINTER_MODES, isColorTool, INK_WIDTHS, INK_WIDTH_LABELS } from '@/annot/types'
 import type { SelectedInfo } from '@/annot/types'
 import { rgbCss } from '@/annot/draw'
 
 const props = defineProps<{
+  /**
+   * 当前文档类型。
+   * `null` = 还没打开文档（工具栏只显示「打开」和缩放）。
+   *
+   * ⚠️ Markdown 下**必须隐藏**所有页式与批注控件，而不是禁用它们：
+   *    禁用态会让人以为"是不是这个文件有问题"，隐藏才是诚实的 ——
+   *    这些能力对 Markdown 根本不存在。
+   */
+  docKind: DocKind | null
   numPages: number
   page: number
   scale: number
@@ -66,7 +76,12 @@ const emit = defineEmits<{
   redo: []
   'delete-selected': []
   'export-annot': []
+  /** Markdown：「转 PDF 后批注」说明框 */
+  'convert-guide': []
 }>()
+
+/** 当前是不是 Markdown（决定一整排控件显不显示） */
+const isMd = computed(() => props.docKind === 'markdown')
 
 // ---------------------------------------------------------------- 批注面板开合
 
@@ -92,13 +107,25 @@ function pickTool(t: ToolKind): void {
 
 // ---------------------------------------------------------------- 缩放
 
+/** PDF 的页式缩放档位（0.25×–8×） */
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 6, 8]
+
+/**
+ * Markdown 的字号档位：**收窄到 75%–250%**，而且步长更细。
+ *
+ * 为什么不能跟 PDF 共用：PDF 放大 4× 是"看细节"（图、公式），页面跟着变大很正常；
+ * Markdown 放大 4× 是一行只剩七八个汉字，排版直接散掉。字号缩放的有效区间本来就窄。
+ */
+const MD_ZOOM_STEPS = [0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.4, 1.6, 1.8, 2, 2.25, 2.5]
+
+const steps = computed(() => (isMd.value ? MD_ZOOM_STEPS : ZOOM_STEPS))
 
 function stepZoom(dir: 1 | -1): void {
   const cur = props.scale
+  const list = steps.value
   let next = cur
-  if (dir > 0) next = ZOOM_STEPS.find((s) => s > cur + 1e-4) ?? ZOOM_STEPS[ZOOM_STEPS.length - 1]!
-  else next = [...ZOOM_STEPS].reverse().find((s) => s < cur - 1e-4) ?? ZOOM_STEPS[0]!
+  if (dir > 0) next = list.find((s) => s > cur + 1e-4) ?? list[list.length - 1]!
+  else next = [...list].reverse().find((s) => s < cur - 1e-4) ?? list[0]!
   emit('set-scale', next)
 }
 
@@ -226,12 +253,12 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
 <template>
   <div class="ribbon" :class="{ 'annot-open': annotOpen }">
     <!-- ============================================ 左半：阅读 -->
-    <button class="rb" data-tid="open" title="打开 PDF" @click="emit('open')">
+    <button class="rb" data-tid="open" title="打开 PDF / Markdown" @click="emit('open')">
       <Icon name="folder" />
     </button>
     <span class="sep" />
 
-    <template v-if="numPages">
+    <template v-if="numPages && !isMd">
       <button class="rb" data-tid="prev" title="上一页 (PageUp)" @click="emit('step-page', -1)">
         <Icon name="prev" />
       </button>
@@ -275,16 +302,40 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
     <button class="rb" data-tid="zoom-in" title="放大 (Ctrl++)" @click="stepZoom(1)">
       <Icon name="plus" />
     </button>
-    <button class="rb" data-tid="fit-width" title="适应宽度" @click="emit('fit-width')">
+    <button
+      v-if="!isMd"
+      class="rb"
+      data-tid="fit-width"
+      title="适应宽度"
+      @click="emit('fit-width')"
+    >
       <Icon name="fitw" />
     </button>
-    <button class="rb" data-tid="fit-page" title="适应整页" @click="emit('fit-page')">
+    <button
+      v-if="!isMd"
+      class="rb"
+      data-tid="fit-page"
+      title="适应整页"
+      @click="emit('fit-page')"
+    >
       <Icon name="fitp" />
     </button>
 
-    <!-- 展开批注时收起这两组，给批注工具腾地方 -->
-    <span class="sep grp-optional" />
-    <span class="grp grp-optional">
+    <!-- Markdown：唯一的「批注」入口 —— 它不给工具，只给一条出路（见 ConvertGuideDialog） -->
+    <button
+      v-if="isMd"
+      class="rb md-convert"
+      data-tid="md-convert"
+      title="Markdown 不能批注：先用外部工具转成 PDF，再把 PDF 拖回来"
+      @click="emit('convert-guide')"
+    >
+      <Icon name="text" />
+      <span class="md-convert-label">转 PDF 后批注</span>
+    </button>
+
+    <!-- 展开批注时收起这两组，给批注工具腾地方（Markdown 下整组不存在） -->
+    <span v-if="!isMd" class="sep grp-optional" />
+    <span v-if="!isMd" class="grp grp-optional">
       <button
         class="rb"
         :class="{ on: mode === 'single' }"
@@ -313,8 +364,8 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
       </button>
     </span>
 
-    <span class="sep grp-optional" />
-    <span class="grp grp-optional">
+    <span v-if="!isMd" class="sep grp-optional" />
+    <span v-if="!isMd" class="grp grp-optional">
       <button
         v-for="m in POINTER_MODES"
         :key="m"
@@ -330,6 +381,13 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
 
     <!-- ============================================ 右边缘（从右到左：保存·未保存·撤销·重做·批注） -->
     <span class="spacer" />
+
+    <!--
+      Markdown 下这一整排**不存在**：批注、撤销/重做、未保存、保存都是 PDF 专属。
+      用 `<template v-if>` 一次性摘掉，而不是逐个加 v-if —— 少一个就是"Markdown 上
+      出现了一个点不动的保存按钮"。
+    -->
+    <template v-if="!isMd">
     <span class="sep" />
 
     <!-- 批注工具组：默认收起，点「批注」向左展开 -->
@@ -506,6 +564,7 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
     >
       <Icon name="save" />
     </button>
+    </template>
 
   </div>
 
@@ -606,6 +665,25 @@ const POINTER_MODE_TIP: Record<PointerMode, string> = {
   min-width: 52px;
   font-variant-numeric: tabular-nums;
   color: var(--dim-2);
+}
+
+/*
+ * Markdown 的「转 PDF 后批注」：**带文字**的按钮。
+ * 工具栏其他按钮全是纯图标（那一排图标都自解释），这个动作没有通用图标可言，
+ * 画一个"神秘的小方块"只会让人不敢点。
+ */
+.md-convert {
+  padding: 0 10px 0 8px;
+  border-color: var(--line-strong);
+  color: var(--fg-2);
+}
+.md-convert:hover {
+  border-color: var(--accent-solid);
+  color: var(--fg);
+}
+.md-convert-label {
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .pager {

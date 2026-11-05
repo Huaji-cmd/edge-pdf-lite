@@ -8,6 +8,7 @@
  */
 import { computed, nextTick, ref, watch } from 'vue'
 import Icon from './Icon.vue'
+import { docKindTag } from './documentKind'
 import {
   addFiles,
   addFolder,
@@ -435,7 +436,7 @@ const rows = computed(() => {
       ref="fileInput"
       class="hidden-input"
       type="file"
-      accept="application/pdf,.pdf"
+      accept=".pdf,.md,.markdown,application/pdf,text/markdown"
       multiple
       @change="onFilesPicked"
     />
@@ -471,7 +472,17 @@ const rows = computed(() => {
         </span>
         <span v-else class="twisty" />
 
-        <Icon :name="r.node.kind === 'folder' ? 'folder' : 'file'" class="leaf" />
+        <!--
+          文件行：用**类型徽标**代替通用文件图标 —— 图标人人都长得一样，
+          徽标能一眼分出 PDF / MD，而且比图标窄，文件名反而更宽。
+        -->
+        <span
+          v-if="r.node.kind === 'file'"
+          class="kind-badge"
+          :data-kind-badge="docKindTag(r.node.name)"
+          >{{ docKindTag(r.node.name) }}</span
+        >
+        <Icon v-else name="folder" class="leaf" />
 
         <!--
           重命名：行内编辑，**只编辑主文件名**，后缀拼在旁边当固定后缀显示。
@@ -702,6 +713,25 @@ const rows = computed(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/*
+ * 类型徽标：站在文件名**前面**（替代原来的文件图标）。
+ * min-width 对齐两种标签的宽度，文件名的起始位置才不会一行一个样。
+ */
+.kind-badge {
+  flex: 0 0 auto;
+  min-width: 30px;
+  padding: 0 4px;
+  text-align: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 16px;
+  color: var(--mute);
+  letter-spacing: 0.05em;
+  user-select: none;
+}
+
 
 /* 重命名：输入框后面紧跟一个灰掉的后缀 —— 视觉上就说明了"后缀改不了" */
 .ren-wrap {

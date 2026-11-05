@@ -333,6 +333,20 @@ fn heal_webview_profile(identifier: &str) {
  */
 const MAX_PDF_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/*
+ * Markdown 的软上限：16 MiB。
+ *
+ * ⚠️ 与 PDF 的 2 GiB 是**不同性质的成本**：PDF 按页渲染，一次只碰一页；
+ *    Markdown 要一次解析完、一次建完整个 DOM，16 MiB 纯文本在 8 GB 机器上
+ *    已经是"十几万行"的规模了。这道闸门防的是"一个 500 MB 的日志被改名成 .md"，
+ *    不是防合法长文 —— 前端还有一次同样的兜底（两处都要有：
+ *    Rust 挡住真实路径，前端挡住拖进来的 File 对象）。
+ */
+const MAX_MD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 单张本地图片的上限。图片是"引用"不是"文档"，但同样不能没边。
+const MAX_ASSET_BYTES: u64 = 20 * 1024 * 1024;
+
 /// 允许被访问的路径。判定规则统一是 `路径 == 条目 || 路径.starts_with(条目)`：
 /// `starts_with` 是**按路径分量**比对的，所以"文件条目"天然只命中它自己
 /// （`D:\a\b.pdf` 不可能是 `D:\a\b.pdf\…` 的前缀，那种路径不存在）。
@@ -520,6 +534,86 @@ fn ensure_size(len: u64) -> Result<(), String> {
     }
 }
 
+/// 是不是 Markdown（`.md` / `.markdown`，大小写不敏感）。
+fn is_markdown_path(p: &Path) -> bool {
+    p.extension()
+        .map(|e| {
+            let e = e.to_string_lossy();
+            e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown")
+        })
+        .unwrap_or(false)
+}
+
+/// 只收本应用能读的文档：`.pdf` / `.md` / `.markdown`。
+///
+/// ⚠️ 这条闸门的目的是**别让读取命令变成"通用读文件"**：光有路径放行还不够 ——
+///    用户随手把一个目录加进列表，不应该意味着那个目录里的 `.env` / `.ssh` 也能读。
+///    写入仍然只走 `ensure_pdf_ext`（批注只写回 PDF，Markdown 是只读的）。
+fn ensure_doc_ext(p: &Path) -> Result<(), String> {
+    let is_pdf = p
+        .extension()
+        .map(|e| e.to_string_lossy().eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false);
+    if is_pdf || is_markdown_path(p) {
+        Ok(())
+    } else {
+        Err(format!(
+            "只处理 .pdf / .md / .markdown 文件：{}",
+            p.display()
+        ))
+    }
+}
+
+/// 按类型取大小上限：PDF 2 GiB，Markdown 16 MiB。
+fn ensure_doc_size(p: &Path, len: u64) -> Result<(), String> {
+    let max = if is_markdown_path(p) {
+        MAX_MD_BYTES
+    } else {
+        MAX_PDF_BYTES
+    };
+    if len <= max {
+        return Ok(());
+    }
+    let (shown, unit) = if max >= 1 << 30 {
+        (max / (1 << 30), "GB")
+    } else {
+        (max / (1 << 20), "MB")
+    };
+    Err(format!(
+        "文件太大（{} MB），{} 的上限是 {} {}{}",
+        len / (1 << 20),
+        if is_markdown_path(p) { "Markdown" } else { "PDF" },
+        shown,
+        unit,
+        if is_markdown_path(p) {
+            "。这类文件要一次性解析完，太大在低配机上会卡住界面"
+        } else {
+            ""
+        }
+    ))
+}
+
+/// 本地图片只允许常见位图。**SVG 不支持** —— 它是可执行文档（能带脚本），
+/// 而这条命令的定位是"读一张图"，不该顺手把脚本能力引进来。
+fn ensure_image_ext(p: &Path) -> Result<(), String> {
+    let ok = p
+        .extension()
+        .map(|e| {
+            let e = e.to_string_lossy().to_ascii_lowercase();
+            matches!(e.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+        })
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "只支持 png / jpg / jpeg / gif / webp / bmp 图片：{}",
+            p.display()
+        ))
+    }
+}
+
+
 /// 把对话框返回的路径**在 Rust 侧**登记进白名单，再把字符串回给前端。
 /// 🔴 登记必须发生在这里，理由见本节开头的说明（前端不能有登记能力）。
 fn register_picked(picked: Vec<FilePath>, allowed: &Allowed) -> Vec<String> {
@@ -537,14 +631,19 @@ fn register_picked(picked: Vec<FilePath>, allowed: &Allowed) -> Vec<String> {
     out
 }
 
-/// 弹系统对话框选 PDF（可多选）。返回**已经登记过的**真实路径。
+/// 弹系统对话框选文档（PDF / Markdown，可多选）。返回**已经登记过的**真实路径。
 #[tauri::command]
-async fn pick_pdfs(app: tauri::AppHandle, allowed: State<'_, Allowed>) -> Result<Vec<String>, String> {
+async fn pick_documents(
+    app: tauri::AppHandle,
+    allowed: State<'_, Allowed>,
+) -> Result<Vec<String>, String> {
     let mut dlg = app
         .dialog()
         .file()
-        .set_title("选择 PDF")
-        .add_filter("PDF", &["pdf"]);
+        .set_title("选择 PDF / Markdown")
+        .add_filter("文档（PDF / Markdown）", &["pdf", "md", "markdown"])
+        .add_filter("PDF", &["pdf"])
+        .add_filter("Markdown", &["md", "markdown"]);
     // 带上父窗口才是"模态于主窗口"的对话框（不加会跑到窗口后面去，像没反应）
     #[cfg(desktop)]
     if let Some(win) = app.get_webview_window("main") {
@@ -583,8 +682,9 @@ struct DirEntry {
  *    几万文件的目录，也只会扫它点开的那一级 —— 这个项目是给低配机做的，
  *    "一次性干大批活"是这类机器最痛的地方（M0 实验已经证明过）。
  *
- * 只返回子目录和 .pdf，其他文件一律过滤掉（这是 PDF 阅读器，
- * 混进一堆 docx 只会让列表变噪音）。
+ * 只返回子目录和本应用能读的文档（.pdf / .md / .markdown），其他文件一律过滤掉 ——
+ * 混进一堆 docx / 图片只会让列表变噪音。类型判断必须与前端 `documentKind.ts`
+ * **完全一致**，否则会出现"能打开但列表里看不见"。
  */
 #[tauri::command]
 fn list_dir(allowed: State<Allowed>, path: String) -> Result<Vec<DirEntry>, String> {
@@ -606,8 +706,11 @@ fn list_dir(allowed: State<Allowed>, path: String) -> Result<Vec<DirEntry>, Stri
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let is_pdf = name.to_lowercase().ends_with(".pdf");
-        if !is_dir && !is_pdf {
+        let lower = name.to_lowercase();
+        let is_doc = lower.ends_with(".pdf")
+            || lower.ends_with(".md")
+            || lower.ends_with(".markdown");
+        if !is_dir && !is_doc {
             continue;
         }
         // ⚠️ 这里也要去掉 `\\?\`：`path` 会进文件列表的 localStorage、
@@ -653,6 +756,182 @@ fn read_pdf_bytes(allowed: State<Allowed>, path: String) -> Result<tauri::ipc::R
     ensure_size(len)?;
     let bytes = std::fs::read(p).map_err(|e| format!("读不了 {}: {}", path, e))?;
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// 读一份文档的字节（PDF / Markdown 都走这条）。
+///
+/// 为什么不干脆让 `read_pdf_bytes` 也收 md：那条命令的存在意义就是"只读 PDF"，
+/// 端到端测试还在用它做**阴性对照**（"放行目录里的非 .pdf 读不出来"）。
+/// 把它放宽，等于把那条判据偷偷删掉。所以两条命令各守一段：
+/// · `read_pdf_bytes` —— 只 pdf（旧链路、旧判据、批注保存前的原文件读取）
+/// · `read_doc_bytes` —— pdf / md / markdown（新的统一入口）
+///
+/// 三道闸门与 `read_pdf_bytes` 完全一致：白名单 → 扩展名 → 大小（先 stat 再 read）。
+#[tauri::command]
+fn read_doc_bytes(allowed: State<Allowed>, path: String) -> Result<tauri::ipc::Response, String> {
+    allowed.check(&path)?;
+    let p = Path::new(&path);
+    ensure_doc_ext(p)?;
+    let len = std::fs::metadata(p)
+        .map_err(|e| format!("读不了 {}: {}", path, e))?
+        .len();
+    ensure_doc_size(p, len)?;
+    let bytes = std::fs::read(p).map_err(|e| format!("读不了 {}: {}", path, e))?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/*
+ * 把「文档目录 + 相对路径」解析成真实路径，并确认它**没有跳出文档目录**。
+ *
+ * 抽成独立函数有两个理由：
+ *   ① `read_doc_asset` 里那一段是本期**最高风险**的代码（它决定前端能读哪些文件），
+ *      单独出来才能写单元测试；
+ *   ② 这里是"只接受相对路径"的**结构保证**：逐分量解析，`..` / 盘符 / 根
+ *      在类型层面就进不来，不靠字符串里有没有 `..` 这种易漏的判断。
+ *
+ * 注意 canonicalize 之后再比一次 `starts_with`：软链接、`sub/../..`、
+ * 大小写差异都会被这一步吃掉，是防越界的最后一道。
+ */
+fn resolve_asset(doc_dir: &Path, rel_path: &str) -> Result<PathBuf, String> {
+    let raw = rel_path.replace('\\', "/");
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("图片路径是空的".to_string());
+    }
+    if raw.starts_with('/') || raw.starts_with('~') {
+        return Err("只支持文档目录内的相对图片路径".to_string());
+    }
+    let mut rel = PathBuf::new();
+    for comp in Path::new(raw).components() {
+        match comp {
+            std::path::Component::Normal(c) => rel.push(c),
+            std::path::Component::CurDir => {}
+            // `..`、盘符（Prefix）、根（RootDir）—— 一律拒绝
+            _ => return Err("图片路径不能跳出文档所在目录".to_string()),
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        return Err("图片路径是空的".to_string());
+    }
+
+    let candidate = doc_dir.join(&rel);
+    let real = candidate
+        .canonicalize()
+        .map_err(|_| format!("找不到这张图片：{}", rel.display()))?;
+    let root = doc_dir
+        .canonicalize()
+        .map_err(|e| format!("取不到文档目录：{}", e))?;
+    if !real.starts_with(&root) {
+        return Err("图片路径不能跳出文档所在目录".to_string());
+    }
+    Ok(real)
+}
+
+/*
+ * 读一份 Markdown 引用的**本地图片**。
+ *
+ * 🔴 这是本期新增的**最高风险**命令：它让前端能按"相对路径"读磁盘上的文件。
+ *    必须同时满足下面全部条件才放行 —— 缺任何一条，它就变成"按文档路径
+ *    构造任意文件读取"的洞：
+ *      ① `doc_path` 在白名单里，且确实是 .md / .markdown；
+ *      ② `rel_path` **只能是相对路径**（逻辑在 `resolve_asset` 里，有单元测试）；
+ *      ③ 解析出来的真实路径（canonicalize 展开软链接、吃掉 `..`）必须
+ *         **仍在文档所在目录之内**；
+ *      ④ 只允许常见位图扩展名（SVG 不支持，它能带脚本）；
+ *      ⑤ 单图 20 MiB 上限，先 stat 再 read。
+ *
+ * ⚠️ 返回 `tauri::ipc::Response` 的理由同 `read_pdf_bytes`（二进制直传）。
+ */
+#[tauri::command]
+fn read_doc_asset(
+    allowed: State<Allowed>,
+    doc_path: String,
+    rel_path: String,
+) -> Result<tauri::ipc::Response, String> {
+    // ① 文档本身必须在白名单里
+    let doc = allowed.check(&doc_path)?;
+    if !is_markdown_path(&doc) {
+        return Err("只有 Markdown 文档可以引用本地图片".to_string());
+    }
+    let doc_dir = doc
+        .parent()
+        .ok_or_else(|| "取不到文档所在目录".to_string())?;
+
+    // ②③ 相对路径 + 目录包含校验
+    let real = resolve_asset(doc_dir, &rel_path)?;
+
+    // ④ 扩展名白名单
+    ensure_image_ext(&real)?;
+
+    // ⑤ 大小
+    let len = std::fs::metadata(&real)
+        .map_err(|e| format!("读不了图片 {}: {}", rel_path, e))?
+        .len();
+    if len > MAX_ASSET_BYTES {
+        return Err(format!(
+            "图片太大（{} MB），上限是 {} MB：{}",
+            len / (1 << 20),
+            MAX_ASSET_BYTES / (1 << 20),
+            rel_path
+        ));
+    }
+    let bytes = std::fs::read(&real).map_err(|e| format!("读不了图片 {}: {}", rel_path, e))?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/*
+ * 用系统默认程序打开一个**外部链接**。
+ *
+ * 🔴 为什么不直接在页面里 `<a target="_blank">`：WebView2 会按它自己的窗口策略
+ *    弹一个没有任何配置的子窗口（或者干脆什么都不做），这两种表现都不可控。
+ *    统一交给系统浏览器是唯一"用户预期内"的行为。
+ *
+ * 🔴 协议白名单写在 Rust 侧，**前端说了不算**：只允许 http / https / mailto，
+ *    其余（file: / javascript: / data: / 自定义协议）直接拒绝。
+ *    参数用 `Command::arg()` 逐个传，**不过 shell**，所以没有引号拼接注入的问题。
+ */
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return Err("链接是空的".to_string());
+    }
+    if u.len() > 4096 {
+        return Err("链接太长，已拒绝".to_string());
+    }
+    if u.chars().any(|c| c.is_control()) {
+        return Err("链接里含有控制字符，已拒绝".to_string());
+    }
+    let lower = u.to_ascii_lowercase();
+    let ok = lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:");
+    if !ok {
+        return Err("只允许打开 http / https / mailto 链接".to_string());
+    }
+
+    #[cfg(windows)]
+    fn spawn_url(u: &str) -> std::io::Result<std::process::Child> {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("rundll32.exe")
+            // CREATE_NO_WINDOW：别为了开个链接闪一下黑框
+            .creation_flags(0x0800_0000)
+            .arg("url.dll,FileProtocolHandler")
+            .arg(u)
+            .spawn()
+    }
+    #[cfg(target_os = "macos")]
+    fn spawn_url(u: &str) -> std::io::Result<std::process::Child> {
+        std::process::Command::new("open").arg(u).spawn()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn spawn_url(u: &str) -> std::io::Result<std::process::Child> {
+        std::process::Command::new("xdg-open").arg(u).spawn()
+    }
+
+    spawn_url(u)
+        .map(|_| ())
+        .map_err(|e| format!("打不开链接：{}", e))
 }
 
 /*
@@ -1169,6 +1448,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_dir,
             read_pdf_bytes,
+            read_doc_bytes,
+            read_doc_asset,
+            open_external_url,
             read_system_font,
             path_exists,
             default_save_dir,
@@ -1177,9 +1459,122 @@ pub fn run() {
             reveal_in_folder,
             rename_file,
             app_ready,
-            pick_pdfs,
+            pick_documents,
             pick_folder
         ])
         .run(context)
         .expect("error while building tauri application");
+}
+
+/*
+ * 单元测试：只测**纯逻辑**（路径解析、扩展名、大小闸门）。
+ *
+ * 为什么单独补这一组：`read_doc_asset` 让前端第一次拥有了"按相对路径读文件"的能力，
+ * 而它最好写的端到端判据是"读不到"—— 但"读不到"也可能是文件真的不存在。
+ * 只有把 `resolve_asset` 拎出来单独测，才能区分
+ * **"被规则拒绝"** 和 **"碰巧不存在"** 这两种完全不同的原因。
+ *
+ * 跑法：cd src-tauri && cargo test
+ */
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个临时目录：`a.png` + `sub/b.jpg` + `sub/c.txt` + `sub/deep/d.webp`
+    fn fixture(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("epl-asset-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub/deep")).unwrap();
+        std::fs::write(dir.join("a.png"), b"png").unwrap();
+        std::fs::write(dir.join("sub/b.jpg"), b"jpg").unwrap();
+        std::fs::write(dir.join("sub/c.txt"), b"txt").unwrap();
+        std::fs::write(dir.join("sub/deep/d.webp"), b"webp").unwrap();
+        dir
+    }
+
+    #[test]
+    fn asset_allows_inside_relative_paths() {
+        let dir = fixture("ok");
+        assert!(resolve_asset(&dir, "a.png").is_ok());
+        assert!(resolve_asset(&dir, "sub/b.jpg").is_ok());
+        assert!(resolve_asset(&dir, "sub/deep/d.webp").is_ok());
+        // 前导 `./` 与反斜杠分隔符都是合法的相对写法
+        assert!(resolve_asset(&dir, "./sub/b.jpg").is_ok());
+        assert!(resolve_asset(&dir, "sub\\b.jpg").is_ok());
+    }
+
+    #[test]
+    fn asset_rejects_any_parent_escape() {
+        let dir = fixture("escape");
+        for bad in [
+            "../a.png",
+            "sub/../../a.png",
+            "sub/deep/../../../secret.png",
+            "..\\..\\secret.png",
+        ] {
+            assert!(resolve_asset(&dir, bad).is_err(), "竟然放行了 {bad}");
+        }
+    }
+
+    #[test]
+    fn asset_rejects_absolute_forms() {
+        let dir = fixture("abs");
+        assert!(resolve_asset(&dir, "/etc/passwd").is_err());
+        assert!(resolve_asset(&dir, "~/secret.png").is_err());
+        #[cfg(windows)]
+        {
+            assert!(resolve_asset(&dir, r"C:/Windows/win.ini").is_err());
+            assert!(resolve_asset(&dir, r"\\server\share\x.png").is_err());
+        }
+    }
+
+    #[test]
+    fn asset_reports_missing_separately() {
+        let dir = fixture("missing");
+        // 合法的相对路径、但文件不存在 —— 这是"找不到"，不是"越界"
+        let err = resolve_asset(&dir, "sub/none.png").unwrap_err();
+        assert!(err.contains("找不到"), "{err}");
+    }
+
+    #[test]
+    fn doc_ext_accepts_pdf_and_markdown() {
+        for ok in ["a.pdf", "A.PDF", "b.md", "c.markdown", "D.MarkDown"] {
+            assert!(ensure_doc_ext(Path::new(ok)).is_ok(), "{ok} 应该放行");
+        }
+        for bad in ["a.txt", "b.docx", "c", "d.pdf.bak", "e.html"] {
+            assert!(ensure_doc_ext(Path::new(bad)).is_err(), "{bad} 应该拒绝");
+        }
+    }
+
+    #[test]
+    fn image_ext_rejects_svg_and_unknowns() {
+        for ok in ["a.png", "b.JPG", "c.jpeg", "d.gif", "e.webp", "f.bmp"] {
+            assert!(ensure_image_ext(Path::new(ok)).is_ok(), "{ok} 应该放行");
+        }
+        // SVG 能带脚本，不能当"一张图"读
+        for bad in ["a.svg", "b.txt", "c", "d.png.html"] {
+            assert!(ensure_image_ext(Path::new(bad)).is_err(), "{bad} 应该拒绝");
+        }
+    }
+
+    #[test]
+    fn md_size_limit_is_16_mib_pdf_is_2_gib() {
+        let md = Path::new("note.md");
+        assert!(ensure_doc_size(md, MAX_MD_BYTES).is_ok());
+        assert!(ensure_doc_size(md, MAX_MD_BYTES + 1).is_err());
+        let pdf = Path::new("book.pdf");
+        assert!(ensure_doc_size(pdf, MAX_PDF_BYTES).is_ok());
+        assert!(ensure_doc_size(pdf, MAX_PDF_BYTES + 1).is_err());
+        // 同样的字节数，对 md 是超限、对 pdf 不是 —— 证明按类型分流
+        assert!(ensure_doc_size(Path::new("x.md"), 64 * 1024 * 1024).is_err());
+        assert!(ensure_doc_size(Path::new("x.pdf"), 64 * 1024 * 1024).is_ok());
+    }
+
+    #[test]
+    fn markdown_detection_is_extension_only() {
+        assert!(is_markdown_path(Path::new("a.md")));
+        assert!(is_markdown_path(Path::new("a.MARKDOWN")));
+        assert!(!is_markdown_path(Path::new("a.pdf")));
+        assert!(!is_markdown_path(Path::new("a.mdx")));
+    }
 }

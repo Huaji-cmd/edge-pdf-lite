@@ -11,9 +11,12 @@ import type { PdfDocument } from './pdfDocument'
 import type { OutlineNode } from './outline'
 import type { PageSize, SidePanelKind } from './types'
 import type { FileNode } from './fileList'
+import type { DocKind } from './documentKind'
+import type { MdHeading } from './markdownDocument'
 import FilesPanel from './FilesPanel.vue'
 import SearchPanel from './SearchPanel.vue'
 import OutlinePanel from './OutlinePanel.vue'
+import MarkdownOutlinePanel from './MarkdownOutlinePanel.vue'
 import Thumbnails from './Thumbnails.vue'
 import SettingsPanel from './SettingsPanel.vue'
 import Icon from './Icon.vue'
@@ -22,8 +25,13 @@ defineProps<{
   /** 当前显示哪个面板 */
   panel: SidePanelKind
   doc: PdfDocument | null
+  /** 文档类型：目录面板按它分流（PDF 书签 / Markdown 标题），缩略图只在 PDF 出现 */
+  docKind: DocKind | null
   outline: readonly OutlineNode[]
   outlineLoading: boolean
+  /** Markdown 的标题大纲 + 当前高亮 */
+  mdHeadings: readonly MdHeading[]
+  mdActiveHeadingId: string | null
   sizes: PageSize[] | null
   currentPage: number
   /** 文件列表（文件 / 搜索两个面板共用） */
@@ -37,6 +45,8 @@ const emit = defineEmits<{
   'go-dest': [pageNumber: number, destTop: number | null]
   /** 跳到某一页 */
   'go-page': [pageNumber: number]
+  /** 跳到 Markdown 的某个标题 */
+  'go-heading': [id: string]
   /** 点文件列表 / 搜索结果里的一个文件（桌面端有真实路径，浏览器端只有 File） */
   'open-file': [node: FileNode]
   /** 文件列表内容变了 */
@@ -67,6 +77,17 @@ const emit = defineEmits<{
         @open="(n) => emit('open-file', n)"
       />
 
+      <!--
+        目录：按文档类型分两套组件（PDF 书签 / Markdown 标题）。
+        它们的"跳转目标"语义完全不同（页码 + 页内坐标 vs 元素 id），
+        合在一个组件里只会在某一侧留下"看起来能用、其实跳错"的分支。
+      -->
+      <MarkdownOutlinePanel
+        v-else-if="panel === 'outline' && docKind === 'markdown'"
+        :headings="mdHeadings"
+        :active-id="mdActiveHeadingId"
+        @go="(id) => emit('go-heading', id)"
+      />
       <OutlinePanel
         v-else-if="panel === 'outline'"
         :nodes="outline"
@@ -75,7 +96,7 @@ const emit = defineEmits<{
         @go="(p, t) => emit('go-dest', p, t)"
       />
       <Thumbnails
-        v-else-if="panel === 'thumbs' && doc"
+        v-else-if="panel === 'thumbs' && doc && docKind === 'pdf'"
         :doc="doc"
         :sizes="sizes"
         :current-page="currentPage"
