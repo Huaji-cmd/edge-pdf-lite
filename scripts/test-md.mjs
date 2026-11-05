@@ -296,13 +296,64 @@ try {
   )
 
   check(
-    '浏览器版本地图片显示"仅桌面版"占位（不是"拖进来的没路径"）',
+    '浏览器版本地图片：占位是**可点的授权入口**（不再是"仅桌面版"死文案）',
     await evaluate(`(() => {
-      const el = document.querySelector('[data-md-blocked="desktop-only"]');
-      return !!el && /桌面版/.test(el.textContent || '') && !/拖进来/.test(el.textContent || '');
+      const el = document.querySelector('[data-md-need-pick]');
+      return !!el &&
+        el.classList.contains('pickable') &&
+        /文件夹/.test(el.textContent || '') &&
+        !/仅桌面版/.test(el.textContent || '');
     })()`),
   )
   check('远程图片不加载（占位 + 无 img）', await evaluate(`document.querySelectorAll('.md-body img').length === 0`))
+
+  // ---------------------------------------------------------------- 1b. 浏览器本地图片（File System Access）
+  console.log('\n[1b] 浏览器本地图片：授权文件夹后真的显示')
+  /*
+   * 无头浏览器弹不了真实的目录选择框，但 **OPFS**（Origin Private File System）
+   * 的根句柄和"用户选到的目录句柄"是**同一个接口**：把样本 PNG 写进 OPFS、
+   * 把 showDirectoryPicker 换成"返回这个根"的桩，就能用**真代码路径**走完
+   * 选目录 → 解析相对路径 → Blob → <img> 的全程（没有为测试开任何后门）。
+   */
+  const wrote = await evaluate(`(async () => {
+    try {
+      const res = await fetch('/testdata/md-assets/diagram.png');
+      const buf = await res.arrayBuffer();
+      const root = await navigator.storage.getDirectory();
+      const dir = await root.getDirectoryHandle('md-assets', { create: true });
+      const f = await dir.getFileHandle('diagram.png', { create: true });
+      const w = await f.createWritable();
+      await w.write(buf);
+      await w.close();
+      window.showDirectoryPicker = async () => root;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  })()`)
+  check('测试环境就绪（样本写入 OPFS + 选择器打桩）', wrote)
+
+  // lazy 图片不在视口就不解码 —— 先滚过去再点
+  await evaluate(`document.querySelector('[data-md-need-pick]')?.scrollIntoView({ block: 'center' })`)
+  await sleep(300)
+  await evaluate(`document.querySelector('[data-md-need-pick]')?.click()`)
+  let browserImg = { ok: false, w: 0, src: '' }
+  for (let i = 0; i < 40; i++) {
+    browserImg = JSON.parse(
+      await evaluate(`(() => {
+        const img = document.querySelector('.md-body img');
+        return JSON.stringify({
+          ok: !!img,
+          w: img ? img.naturalWidth : 0,
+          src: img ? (img.src.startsWith('blob:') ? 'blob:' : img.src.slice(0, 24)) : '',
+        });
+      })()`),
+    )
+    if (browserImg.ok && browserImg.w > 0) break
+    await sleep(150)
+  }
+  check('授权文件夹后本地图片显示出来', browserImg.ok && browserImg.w === 240, `${browserImg.w}px ${browserImg.src}`)
+  check('图片走 Blob URL（字节来自授权目录，不是网络）', browserImg.src === 'blob:')
   await shot('01-md-basic')
 
   // ---------------------------------------------------------------- 2. 能力矩阵

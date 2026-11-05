@@ -18,6 +18,13 @@ import type { MarkdownDocument } from './markdownDocument'
 import { anchorOf, clampMdScale } from './mdReadingState'
 import type { MdReadingState } from './mdReadingState'
 import { IS_TAURI } from '@/platform'
+import {
+  canPickDirectory,
+  ensurePermission,
+  getStoredRoot,
+  pickRoot,
+  readAsset,
+} from './mdBrowserAssets'
 
 const props = defineProps<{
   doc: MarkdownDocument
@@ -112,6 +119,88 @@ function markBlocked(el: HTMLElement, reason: string, alt: string): void {
   el.textContent = alt ? `${alt}（${blockedText(reason)}）` : blockedText(reason)
 }
 
+/** 占位变成"点我授权"的形态（浏览器版专用） */
+function markPickNeeded(el: HTMLElement, kind: 'pick' | 'perm'): void {
+  el.classList.add('pickable')
+  el.setAttribute('data-md-need-pick', kind)
+  el.textContent =
+    kind === 'pick'
+      ? '点击选择笔记所在文件夹，显示本地图片'
+      : '点击允许访问上次选择的文件夹，显示本地图片'
+}
+
+/**
+ * 浏览器版的图片装载。
+ *
+ * 三种状态：
+ *   · 没选过文件夹 / 权限回落到 'prompt' → 占位变成**可点击的授权入口**；
+ *   · 已授权 → 逐个解析相对路径（`..` 在 API 层面就进不来，逃不出授权目录）；
+ *   · 读不到 → "找不到"，同时保留**重新选文件夹**的点击出路（可能选错了目录）。
+ */
+async function loadBrowserImages(slots: HTMLElement[]): Promise<void> {
+  const root = await getStoredRoot()
+  if (!root) {
+    for (const el of slots) markPickNeeded(el, 'pick')
+    return
+  }
+  if (!(await ensurePermission(root))) {
+    for (const el of slots) markPickNeeded(el, 'perm')
+    return
+  }
+  let n = 0
+  for (const el of slots) {
+    const alt = el.getAttribute('data-md-alt') ?? ''
+    if (n >= MAX_IMAGES) {
+      markBlocked(el, 'limit', alt)
+      continue
+    }
+    const rel = el.getAttribute('data-md-img') ?? ''
+    if (!rel) {
+      markBlocked(el, 'empty', alt)
+      continue
+    }
+    n++
+    try {
+      const file = await readAsset(root, rel)
+      const url = URL.createObjectURL(file)
+      blobUrls.push(url)
+      const img = new Image()
+      img.src = url
+      img.alt = alt
+      const title = el.getAttribute('data-md-title')
+      if (title) img.title = title
+      img.loading = 'lazy'
+      img.addEventListener('load', markOffsetsDirty, { once: true })
+      el.replaceWith(img)
+    } catch {
+      markBlocked(el, 'missing', alt)
+      // 读不到多半是"选错了文件夹" —— 保留重新选择的出路，别让用户卡死
+      el.classList.add('pickable')
+      el.setAttribute('data-md-need-pick', 'repick')
+    }
+  }
+}
+
+/** 占位的点击入口：授权（或重新授权）后把整篇的图重新装一遍 */
+let picking = false
+async function enableBrowserImages(): Promise<void> {
+  if (picking) return
+  picking = true
+  try {
+    let root = await getStoredRoot()
+    if (!root || !(await ensurePermission(root))) root = await pickRoot()
+    if (!root) {
+      // 用户关掉了选择框 —— 占位保持，不打扰
+      emit('toast', '没有选择文件夹，本地图片保持隐藏')
+      return
+    }
+    const slots = [...(body.value?.querySelectorAll<HTMLElement>('[data-md-img]') ?? [])]
+    await loadBrowserImages(slots)
+  } finally {
+    picking = false
+  }
+}
+
 /** 把占位 span 换成真正的 `<img>`；失败就改成"说清原因"的占位 */
 async function loadImages(): Promise<void> {
   const root = body.value
@@ -119,11 +208,18 @@ async function loadImages(): Promise<void> {
   const slots = [...root.querySelectorAll<HTMLElement>('[data-md-img]')]
   if (!slots.length) return
 
-  // 浏览器版**根本拿不到**同目录的兄弟文件 —— 和"桌面版但没路径"是两件事，分开说
   if (!IS_TAURI) {
-    for (const el of slots) {
-      markBlocked(el, 'desktop-only', el.getAttribute('data-md-alt') ?? '')
+    /*
+     * 浏览器版：File System Access API —— 用户授权一个文件夹，就能读到里面的图。
+     * 不支持的浏览器（Firefox / Safari）才退回"仅桌面版"的死文案。
+     */
+    if (!canPickDirectory()) {
+      for (const el of slots) {
+        markBlocked(el, 'desktop-only', el.getAttribute('data-md-alt') ?? '')
+      }
+      return
     }
+    await loadBrowserImages(slots)
     return
   }
   // 桌面版拖进来的文件：有字节、没路径（见 blockedText 里 'no-path' 的说明）
@@ -284,6 +380,11 @@ function onWheel(e: WheelEvent): void {
 // ---------------------------------------------------------------- 链接
 
 function onClick(e: MouseEvent): void {
+  // 浏览器版：点占位 → 授权文件夹 → 装图（必须在链接判断之前）
+  if ((e.target as HTMLElement | null)?.closest('[data-md-need-pick]')) {
+    void enableBrowserImages()
+    return
+  }
   const a = (e.target as HTMLElement | null)?.closest('a')
   if (!a) return
   const ext = a.getAttribute('data-md-href')
@@ -1178,6 +1279,16 @@ onBeforeUnmount(() => {
   color: var(--mute);
   font-size: 0.86em;
   text-align: center;
+}
+/* 浏览器版：占位即按钮（点它授权文件夹）。实线 + 强调色 = "这是能点的" */
+.md-body :deep(.md-img-ph.pickable) {
+  border-style: solid;
+  border-color: var(--accent-solid);
+  color: var(--accent);
+  cursor: pointer;
+}
+.md-body :deep(.md-img-ph.pickable:hover) {
+  background: var(--accent-wash);
 }
 </style>
 
