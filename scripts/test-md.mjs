@@ -746,6 +746,8 @@ try {
         deadLinks: b.querySelectorAll('a.md-link-dead').length,
         imgs: b.querySelectorAll('img').length,
         blocked: [...b.querySelectorAll('[data-md-blocked]')].map(e => e.dataset.mdBlocked),
+        remoteText: b.querySelector('[data-md-blocked="remote"]')?.textContent ?? '',
+        remoteTitle: b.querySelector('[data-md-blocked="remote"]')?.getAttribute('title') ?? '',
         normal: /正常显示/.test(b.textContent || ''),
       });
     })()`),
@@ -765,6 +767,17 @@ try {
     `count=${safe.deadLinks}`,
   )
   check('没有加载任何图片（含远程/越界）', safe.imgs === 0, `imgs=${safe.imgs}`)
+  /*
+   * 🔴 被拦的原因必须**写在占位字面上**（不能只藏在 data 属性里）——
+   *    alt 为空时以前只显示"图片"两个字，用户无从判断为什么（真实用户就这么报的）。
+   *    原始地址挂在 title 上，悬停可查。
+   */
+  check(
+    '被拦的原因写在占位字面上，原始地址挂 title',
+    /远程图片不自动加载/.test(safe.remoteText) &&
+      /example\.com\/track\.png/.test(safe.remoteTitle),
+    `${safe.remoteText.slice(0, 40)} | title=${safe.remoteTitle.slice(0, 40)}`,
+  )
   const ALLOWED_REASONS = ['remote', 'absolute', 'scheme', 'empty', 'desktop-only', 'no-path', 'missing', 'limit']
   check(
     '每张图都被替换成带原因的占位（远程图片被点名）',

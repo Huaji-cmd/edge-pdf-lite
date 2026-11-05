@@ -14,7 +14,8 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
-import type { MarkdownDocument } from './markdownDocument'
+import { mdImgBlockedText } from './markdownDocument'
+import type { MdImgReason, MarkdownDocument } from './markdownDocument'
 import { anchorOf, clampMdScale } from './mdReadingState'
 import type { MdReadingState } from './mdReadingState'
 import { IS_TAURI } from '@/platform'
@@ -86,14 +87,12 @@ function mimeOf(rel: string): string {
 
 function blockedText(reason: string): string {
   switch (reason) {
+    // 文档层拦下的四种：文案统一走 markdownDocument（占位创建时就写在字面上）
     case 'remote':
-      return '远程图片不自动加载'
     case 'absolute':
-      return '不支持绝对路径图片'
     case 'scheme':
-      return '不支持这种链接形式的图片'
     case 'empty':
-      return '图片地址是空的'
+      return mdImgBlockedText(reason as MdImgReason)
     case 'desktop-only':
       return '本地图片只在桌面版显示'
     /*

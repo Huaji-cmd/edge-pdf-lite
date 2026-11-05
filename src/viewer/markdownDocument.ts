@@ -66,6 +66,22 @@ function slugify(text: string): string {
     .replace(/^-+|-+$/g, '')
 }
 
+/** 文档层拦下的图片（远程 / 绝对路径 / 协议不允许 / 空地址）给**看得见**的原因。
+ *  🔴 不能只写在 data 属性里：alt 为空时用户看到的就只有一个"图片"，
+ *     完全无从判断为什么 —— 这正是用户报"怎么还是占位符"时查不到原因的原因。 */
+export function mdImgBlockedText(reason: MdImgReason): string {
+  switch (reason) {
+    case 'remote':
+      return '远程图片不自动加载'
+    case 'absolute':
+      return '不支持绝对路径图片（请把图片放进笔记文件夹，用相对路径引用）'
+    case 'scheme':
+      return '不支持这种链接形式的图片'
+    case 'empty':
+      return '图片地址是空的'
+  }
+}
+
 /** 图片 `src` 分类。决策结果直接决定"加载 / 占位 / 拒绝" */
 function classifyImg(src: string):
   | { kind: 'data'; value: string }
@@ -129,7 +145,8 @@ function upgradeDom(box: HTMLElement): MdHeading[] {
   for (const img of [...box.querySelectorAll<HTMLImageElement>('img')]) {
     const alt = (img.getAttribute('alt') ?? '').trim()
     const title = (img.getAttribute('title') ?? '').trim()
-    const cls = classifyImg(img.getAttribute('src') ?? '')
+    const src = img.getAttribute('src') ?? ''
+    const cls = classifyImg(src)
     const ph = document.createElement('span')
     ph.className = 'md-img-ph'
     ph.setAttribute('data-md-alt', alt)
@@ -145,10 +162,19 @@ function upgradeDom(box: HTMLElement): MdHeading[] {
     }
     if (cls.kind === 'relative') {
       ph.setAttribute('data-md-img', cls.value)
+      ph.textContent = alt || '图片'
     } else {
+      /*
+       * 被安全规则拦下（远程 / 绝对路径 / 协议 / 空地址）。
+       * 🔴 原因必须**写在字面上**，不能只留在 data 属性里 —— alt 为空时
+       *    用户看到的就只有一个"图片"，完全无从判断为什么；
+       *    原始地址挂 title，悬停可查（照着改笔记就能修）。
+       */
       ph.setAttribute('data-md-blocked', cls.reason)
+      const t = mdImgBlockedText(cls.reason)
+      ph.textContent = alt ? `${alt}（${t}）` : t
+      ph.title = src
     }
-    ph.textContent = alt || '图片'
     img.replaceWith(ph)
   }
 
