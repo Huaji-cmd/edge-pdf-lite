@@ -25,7 +25,8 @@
   --btn: #262b33; /* 按钮 */
   --btn-hover: #2f353f;
   --viewport-bg: #14161a; /* 阅读区（PDF 白纸周围） */
-  --md-code-bg: #21252d; /* Markdown 代码块 */
+  --md-page-bg: #1d2128; /* Markdown 的"纸面"：比阅读区抬一档（对应 PDF 的白纸） */
+  --md-code-bg: #262b33; /* Markdown 代码块 */
 
   /* 线与面 */
   --line: #2e333d;
@@ -84,7 +85,8 @@
    * 这个值要跟"白纸"有明确反差，但别深到像暗色模式。
    */
   --viewport-bg: #dfe2e8;
-  --md-code-bg: #e6e9ee; /* Markdown 代码块：比卡片灰一档，和"白纸"拉开 */
+  --md-page-bg: #ffffff; /* Markdown 的"纸面"：和 PDF 的白纸同一档 */
+  --md-code-bg: #e6e9ee; /* Markdown 代码块：纸面上的灰块 */
 
   --line: #d8dce3;
   --line-strong: #c8cdd6;

@@ -269,6 +269,32 @@ try {
   }
   check('代码块真的被高亮了（有 token span）', hl.kw >= 2, `keyword span=${hl.kw}`)
   check('高亮不改变代码文本', hl.text.includes('function demo'), hl.text.slice(0, 40))
+  /*
+   * 纸面结构（日间）：阅读区灰底 + 白纸 + 纸面上的灰代码块。
+   * 🔴 颜色判据读**计算样式**，不靠眼睛 —— 之前"整个背景是灰的"就是因为
+   *    Markdown 缺了纸面，整片都漏出了灰底。
+   */
+  const surfaces = JSON.parse(
+    await evaluate(`(() => {
+      const root = document.documentElement;
+      const prev = root.dataset.theme;
+      root.dataset.theme = 'light';
+      const page = getComputedStyle(document.querySelector('.md-page')).backgroundColor;
+      const view = getComputedStyle(document.querySelector('[data-tid="md-viewer"]')).backgroundColor;
+      const pre = document.querySelector('.md-body pre');
+      const code = pre ? getComputedStyle(pre).backgroundColor : '';
+      root.dataset.theme = prev;
+      return JSON.stringify({ page, view, code });
+    })()`),
+  )
+  check(
+    '日间：灰底 + 白纸 + 纸面上的灰代码块（三层分得开）',
+    surfaces.page === 'rgb(255, 255, 255)' &&
+      surfaces.view === 'rgb(223, 226, 232)' &&
+      surfaces.code === 'rgb(230, 233, 238)',
+    JSON.stringify(surfaces),
+  )
+
   check(
     '浏览器版本地图片显示"仅桌面版"占位（不是"拖进来的没路径"）',
     await evaluate(`(() => {
