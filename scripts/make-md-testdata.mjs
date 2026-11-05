@@ -13,7 +13,7 @@
  *   md-large.md            ~2 MB，用来量首屏与缩放
  *   md-assets/diagram.png  一张 240×120 的纯色 PNG（本地图片的阳性对照）
  */
-import { mkdir, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { deflateSync } from 'node:zlib'
@@ -244,11 +244,18 @@ code block ${i}
 // 用**运行时**的绝对路径引用样本图片 —— 模拟 Typora 默认行为。
 // 路径用正斜杠（Windows API 都认，还能避开 markdown 转义反斜杠的坑）。
 const absImg = resolve(outDir, 'md-assets/diagram.png').replaceAll('\\', '/')
+// 反斜杠形态（Typora 默认）+ 中文目录 —— 真实用户笔记就是这么写的
+const absImgWin = resolve(outDir, 'md-assets/图库/图.png')
+await mkdir(resolve(outDir, 'md-assets/图库'), { recursive: true })
+await copyFile(resolve(outDir, 'md-assets/diagram.png'), absImgWin)
+const absImgBs = absImgWin // 保留反斜杠
 const absolute = `# 绝对路径图片样本
 
-![本地示意图](${absImg})
+![本地示意图（正斜杠）](${absImg})
 
-这张图用的是**绝对路径** —— 桌面版会弹授权确认，允许后显示。
+![本地示意图（反斜杠 + 中文目录）](${absImgBs})
+
+这两张图用的是**绝对路径** —— 桌面版会弹授权确认，允许后显示。
 `
 
 // ---------------------------------------------------------------- 落盘

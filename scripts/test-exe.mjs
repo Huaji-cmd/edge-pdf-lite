@@ -1301,6 +1301,8 @@ const tryInvoke = async (cmd, args) =>
              : (v != null && v.byteLength !== undefined) ? v.byteLength
              : null,
           val: (typeof v === 'boolean') ? v : null,
+          // 授权清单这类命令回的是**对象**（{authorized, failed}）—— 原样带回来
+          obj: (v != null && typeof v === 'object' && !Array.isArray(v) && v.byteLength === undefined) ? v : null,
         });
       } catch (e) {
         return JSON.stringify({ ok: false, err: String(e) });
@@ -1424,12 +1426,32 @@ if (existsSync(MD_DOC) && existsSync(MD_BASIC_ASSET)) {
   const ABS_PNG = resolve(TESTDATA_DIR, 'md-assets', 'diagram.png')
   r = await tryInvoke('read_absolute_image', { path: ABS_PNG })
   check('没授权前读不到（清单是空的）', !r.ok && /清单/.test(r.err), r.err)
+  /*
+   * 授权是**部分成功**语义：真实笔记里死图很常见（截图被删/挪走了），
+   * 一张失败就否决整批 = 全部不显示（真实用户就是这么踩的）。
+   * 坏的进 failed（带原因），好的照常授权 —— 混合批次单独验证。
+   */
   r = await tryInvoke('allow_image_paths', { paths: [join(TESTDATA_DIR, 'md-basic.md')] })
-  check('授权清单拒绝非图片（扩展名那一道）', !r.ok && /只支持/.test(r.err), r.err)
+  check(
+    '授权清单拒绝非图片（原因进 failed，不整体报错）',
+    r.ok && r.obj && r.obj.authorized.length === 0 && /只支持/.test(r.obj.failed[0].reason),
+    r.obj ? r.obj.failed[0].reason : r.err,
+  )
   r = await tryInvoke('allow_image_paths', { paths: [join(TESTDATA_DIR, 'no-such.png')] })
-  check('授权清单拒绝不存在的图片', !r.ok, r.err)
-  r = await tryInvoke('allow_image_paths', { paths: [ABS_PNG] })
-  check('（对照）授权真实图片成功', r.ok, r.err)
+  check(
+    '不存在的图片不进清单（failed 给原因）',
+    r.ok && r.obj && r.obj.authorized.length === 0 && /找不到/.test(r.obj.failed[0].reason),
+    r.obj ? r.obj.failed[0].reason : r.err,
+  )
+  r = await tryInvoke('allow_image_paths', {
+    paths: [ABS_PNG, join(TESTDATA_DIR, 'md-basic.md')],
+  })
+  check(
+    '混合批次：好的授权、坏的给原因（不整体失败）',
+    r.ok && r.obj && r.obj.authorized.length === 1 && r.obj.failed.length === 1 &&
+      /只支持/.test(r.obj.failed[0].reason),
+    r.obj ? `授权 ${r.obj.authorized.length}，失败 ${r.obj.failed.length}` : r.err,
+  )
   r = await tryInvoke('read_absolute_image', { path: ABS_PNG })
   check('授权后读得到（只此一张，不放开目录）', r.ok && r.len > 1000, r.ok ? `${r.len} 字节` : r.err)
 
@@ -1670,18 +1692,31 @@ console.log('\n[7d] Typora 绝对路径图片：弹窗 → 允许 → 显示')
   check('弹窗里有完整路径与「仅本次有效」的说明', dlg.pathShown && dlg.onlyOnce && dlg.yes && dlg.no)
   await evaluate(`document.querySelector('[data-tid="md-allow-yes"]')?.click()`)
 
-  let absImg = { ok: false, w: 0 }
+  /*
+   * 样本里有两张绝对路径图：正斜杠一张、**反斜杠 + 中文目录**一张 ——
+   * 后者是真实用户笔记的形态（markdown-it 会把 \ 和中文编码成 %5C/%E7..，
+   * 净化器与分类器都得认）。两张都要显示出来才算过。
+   */
+  let absImg = { ok: false, n: 0, w: 0 }
   for (let i = 0; i < 40; i++) {
     await sleep(200)
     absImg = JSON.parse(
       await evaluate(`(() => {
-        const img = document.querySelector('.md-body img');
-        return JSON.stringify({ ok: !!img, w: img ? img.naturalWidth : 0 });
+        const imgs = [...document.querySelectorAll('.md-body img')];
+        return JSON.stringify({
+          ok: imgs.length > 0,
+          n: imgs.length,
+          w: imgs.length ? imgs[0].naturalWidth : 0,
+        });
       })()`),
     )
-    if (absImg.ok && absImg.w > 0) break
+    if (absImg.ok && absImg.n >= 2 && absImg.w > 0) break
   }
-  check('允许后图片真的显示（Blob URL 解码成功）', absImg.ok && absImg.w === 240, `${absImg.w}px`)
+  check(
+    '允许后两张绝对路径图都显示（正斜杠 + 反斜杠中文目录）',
+    absImg.ok && absImg.n === 2 && absImg.w === 240,
+    `${absImg.n} 张, ${absImg.w}px`,
+  )
 }
 
 // ---------------------------------------------------------------- 8. 控制台

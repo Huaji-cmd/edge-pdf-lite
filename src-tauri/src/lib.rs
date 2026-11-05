@@ -918,54 +918,102 @@ impl ImageAllowed {
 }
 
 /// 弹窗"允许"后登记图片。只做校验 + 登记，读文件走 `read_absolute_image`。
+/// 授权结果：**部分成功**语义。真实笔记里死图很常见（截图被删/挪走了），
+/// 一张失败就否决整批 = 全部不显示（真实用户就是这么踩的）。
+/// 所以：能过的授权，过不了的进 `failed`（占位上会写明原因）。
+#[derive(serde::Serialize)]
+struct FailedImage {
+    path: String,
+    reason: String,
+}
+
+#[derive(serde::Serialize)]
+struct ImageAllowResult {
+    authorized: Vec<String>,
+    failed: Vec<FailedImage>,
+}
+
 #[tauri::command]
 fn allow_image_paths(
     image_allowed: State<ImageAllowed>,
     paths: Vec<String>,
-) -> Result<Vec<String>, String> {
+) -> Result<ImageAllowResult, String> {
     if paths.is_empty() {
         return Err("没有要授权的图片".to_string());
     }
     if paths.len() > 500 {
         return Err("一次最多授权 500 张图片".to_string());
     }
-    let mut shown: Vec<String> = Vec::new();
+    let mut authorized: Vec<String> = Vec::new();
+    let mut failed: Vec<FailedImage> = Vec::new();
     for t in &paths {
         let t = t.trim();
         if t.is_empty() {
             continue;
         }
+        // 单条失败只记原因，不否决整批 —— "清单上限"这种全局性问题才返回 Err
         if t.len() > 1024 {
-            return Err("图片路径过长，已拒绝".to_string());
+            failed.push(FailedImage {
+                path: t.to_string(),
+                reason: "路径过长，已拒绝".to_string(),
+            });
+            continue;
         }
         if t.chars().any(|c| c.is_control()) {
-            return Err("图片路径里含控制字符，已拒绝".to_string());
+            failed.push(FailedImage {
+                path: t.to_string(),
+                reason: "路径里含控制字符，已拒绝".to_string(),
+            });
+            continue;
         }
-        let real = PathBuf::from(t)
-            .canonicalize()
-            .map_err(|_| format!("找不到这张图片：{}", t))?;
-        ensure_image_ext(&real)?;
-        let len = std::fs::metadata(&real)
-            .map_err(|e| format!("读不了图片 {}: {}", t, e))?
-            .len();
+        let real = match PathBuf::from(t).canonicalize() {
+            Ok(p) => p,
+            Err(_) => {
+                failed.push(FailedImage {
+                    path: t.to_string(),
+                    reason: "找不到这张图片（文件可能已被删除或挪走）".to_string(),
+                });
+                continue;
+            }
+        };
+        if let Err(e) = ensure_image_ext(&real) {
+            failed.push(FailedImage {
+                path: t.to_string(),
+                reason: e,
+            });
+            continue;
+        }
+        let len = match std::fs::metadata(&real) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                failed.push(FailedImage {
+                    path: t.to_string(),
+                    reason: format!("读不了图片：{}", e),
+                });
+                continue;
+            }
+        };
         if len > MAX_ASSET_BYTES {
-            return Err(format!(
-                "图片太大（{} MB），上限是 {} MB：{}",
-                len / (1 << 20),
-                MAX_ASSET_BYTES / (1 << 20),
-                t
-            ));
+            failed.push(FailedImage {
+                path: t.to_string(),
+                reason: format!(
+                    "图片太大（{} MB），上限是 {} MB",
+                    len / (1 << 20),
+                    MAX_ASSET_BYTES / (1 << 20)
+                ),
+            });
+            continue;
         }
         let mut list = image_allowed.list.lock().unwrap_or_else(|p| p.into_inner());
+        if list.len() >= 2000 {
+            return Err("已授权的图片太多，请把图片挪进笔记文件夹用相对路径".to_string());
+        }
         if !list.contains(&real) {
-            if list.len() >= 2000 {
-                return Err("已授权的图片太多，请把图片挪进笔记文件夹用相对路径".to_string());
-            }
             list.push(real.clone());
         }
-        shown.push(display_path(&real));
+        authorized.push(display_path(&real));
     }
-    Ok(shown)
+    Ok(ImageAllowResult { authorized, failed })
 }
 
 /// 读一张**已授权**的笔记外图片。清单是会话级的，重启即清空。

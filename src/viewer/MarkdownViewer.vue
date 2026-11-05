@@ -351,6 +351,12 @@ async function loadAbsoluteImages(absSlots: HTMLElement[]): Promise<void> {
 }
 
 /** 弹窗"允许"：把清单交给 Rust 校验登记，然后整篇重装一遍图 */
+/** Rust 侧的授权结果（部分成功语义，见 ImageAllowResult） */
+interface ImageAllowResult {
+  authorized: string[]
+  failed: { path: string; reason: string }[]
+}
+
 async function approveAbsImages(): Promise<void> {
   const paths = absDialogPaths.value ?? []
   absDialogPaths.value = null
@@ -358,9 +364,17 @@ async function approveAbsImages(): Promise<void> {
   if (!paths.length) return
   try {
     const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('allow_image_paths', { paths })
-    absApprovedDocs.add(props.doc.fingerprint)
-    await loadImages()
+    const res = (await invoke<unknown>('allow_image_paths', { paths })) as ImageAllowResult
+    if (res.authorized.length > 0) {
+      absApprovedDocs.add(props.doc.fingerprint)
+      await loadImages()
+    }
+    if (res.failed.length > 0) {
+      emit(
+        'toast',
+        `${res.failed.length} 张图片无法显示（文件可能已不存在或格式不支持），占位上有说明`,
+      )
+    }
   } catch {
     emit('toast', '授权失败：请确认图片存在且是 png/jpg/webp/gif/bmp，然后重试')
   }

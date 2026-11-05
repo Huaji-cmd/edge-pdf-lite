@@ -55,12 +55,16 @@ const SANITIZE = {
   ALLOW_DATA_ATTR: true,
   /*
    * 🔴 默认的 URI 白名单只认 http/https/mailto/ftp 等协议 —— **盘符绝对路径
-   *    （`D:/xxx/img.png`）会被整条剥掉**，src 变空 → 分类成"图片地址是空的"，
+   *    会被整条剥掉**，src 变空 → 分类成"图片地址是空的"，
    *    用户看到的提示完全误导（真实用户就这么踩的）。
    *
    * 追加两条放行（危险协议仍然进不来）：
-   *   · `[a-z]:[\\/]` —— 单字母 + 冒号 + 斜杠的盘符形态。`javascript:`/`data:`
-   *     冒号前有多个字母，撞不上这条；`file:` 的协议判断仍在 classifyImg。
+   *   · `[a-z]:(?:[/\\]|%5c)` —— 单字母 + 冒号的盘符形态。⚠️ 冒号后除了斜杠
+   *     还要接受 **%5c**：markdown-it 会把目的地里的 `\` 编码成 %5C
+   *     （`D:\图\x.png` → `D:%5C图%5Cx.png`，冒号后跟的是 `%` 不是斜杠），
+   *     不认 %5c 的话反斜杠路径全被剥掉（真实用户踩的就是这个）。
+   *     `javascript:`/`data:` 冒号前有多个字母，撞不上这条；`file:` 的
+   *     协议判断仍在 classifyImg。
    *   · `data:` —— 只为 `<img>` 的内联图；`<a href="data:...">` 会在
    *     upgradeDom 的链接重写里被移除（只留 http/https/mailto），不构成执行面。
    *
@@ -68,7 +72,7 @@ const SANITIZE = {
    * "别让净化器把我们要分类的原料扔掉"。
    */
   ALLOWED_URI_REGEXP:
-    /^(?:(?:https?|mailto|ftp|tel|callto|sms|cid|xmpp|data):|[^a-z]|[a-z+.-]+(?:[^a-z+.-:]|$)|[a-z]:[/\\])/i,
+    /^(?:(?:https?|mailto|ftp|tel|callto|sms|cid|xmpp|data):|[^a-z]|[a-z+.-]+(?:[^a-z+.-:]|$)|[a-z]:(?:[/\\]|%5c))/i,
 }
 
 /** GitHub 风格的标题 slug：小写、去标点、空格转连字符；中文原样保留 */
@@ -143,8 +147,15 @@ function classifyImg(src: string):
   /*
    * 盘符绝对路径 / UNC / 根路径：**必须排在协议判断之前** ——
    * `D:` 单字母+冒号会被下面的通用协议正则当成自定义协议吃掉。
+   * ⚠️ 盘符后除了斜杠还要认 **%5c**：probe 的解码失败时会保留原始编码形态
+   *    （`D:%5C图.png`），不能因为解码不了就把它判成"协议不允许"。
    */
-  if (/^[a-z]:[\\/]/i.test(probe) || probe.startsWith('\\\\') || probe.startsWith('/')) {
+  if (
+    /^[a-z]:(?:[/\\]|%5c)/i.test(probe) ||
+    probe.startsWith('\\\\') ||
+    /^%5c/i.test(probe) ||
+    probe.startsWith('/')
+  ) {
     return { kind: 'blocked', reason: 'absolute', absolutePath: probe }
   }
   // 其他协议（javascript: / 自定义）
