@@ -849,6 +849,13 @@ function buildPrintHtmlFor(d: MarkdownDocument): Promise<string> {
 if (IS_TAURI) {
   ;(globalThis as unknown as Record<string, unknown>).__eplMdPrint = {
     buildHtml: () => (mdDoc.value ? buildPrintHtmlFor(mdDoc.value) : Promise.resolve('')),
+    /** 测试用：按路径打开文档 —— 等价于从列表点开，免去"塞列表/reload/展开"的 UI 铺垫 */
+    open: async (path: string) => {
+      const { readBytesByPath } = await import('./viewer/fileList')
+      const bytes = await readBytesByPath(path)
+      const name = path.split(/[\\/]/).pop() ?? 'doc.md'
+      await openDocument(bytes, name, path)
+    },
   }
 }
 

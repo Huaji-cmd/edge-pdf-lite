@@ -1220,9 +1220,10 @@ fn run_print_to_pdf(edge: &Path, html_path: &Path, pdf_path: &Path, profile_dir:
     if !pdf_path.is_file() {
         let d = diag();
         return Err(format!(
-            "Edge 没有生成 PDF（退出码 {:?}，输出：{}）。临时文件 {} 保留着，可反馈排查",
+            "Edge 没有生成 PDF（退出码 {:?}，输出：{}）。输出目标：{}；现场文件已保留：{}",
             status.code(),
             if d.is_empty() { "无日志" } else { &d[..d.len().min(400)] },
+            pdf_path.display(),
             html_path.display(),
         ));
     }
@@ -1290,28 +1291,43 @@ async fn convert_md_to_pdf(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let temp_html = std::env::temp_dir().join(format!("epl-print-{}-{}.html", std::process::id(), stamp));
-    let profile_dir = std::env::temp_dir().join(format!("epl-edge-prof-{}-{}", std::process::id(), stamp));
-    std::fs::write(&temp_html, html.as_bytes())
-        .map_err(|e| format!("写临时文件失败：{}", e))?;
 
-    // ⑤ 打印（放 blocking 线程，别把 async 运行时挂住）
+    // ⑤ 打印（放 blocking 线程，别把 async 运行时挂住）。失败自动重试一次：
+    //    瞬态问题（杀软扫盘 / profile 竞争）在第一次尝试中最常见，重试即恢复。
     let edge = find_edge().ok_or_else(|| {
         "没找到 Microsoft Edge（转换需要它做打印引擎）。请确认系统装有 Edge，或继续用外部工具（Typora / Pandoc）转 PDF".to_string()
     })?;
-    let edge2 = edge.clone();
-    let th = temp_html.clone();
-    let out2 = real_out.clone();
-    let prof2 = profile_dir.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        run_print_to_pdf(&edge2, &th, &out2, &prof2)
-    })
-    .await
-    .map_err(|e| format!("转换任务失败：{}", e))?;
-
-    // ⑥ 临时文件用完即删（profile 里可能有几百个缓存小文件；删不掉也不影响结果）
-    let _ = std::fs::remove_file(&temp_html);
-    let _ = std::fs::remove_dir_all(&profile_dir);
+    let mut last_err: Option<String> = None;
+    let mut result = Err(String::new());
+    for attempt in 0..2 {
+        let retry_stamp = stamp + attempt as u128;
+        let th = std::env::temp_dir()
+            .join(format!("epl-print-{}-{}.html", std::process::id(), retry_stamp));
+        let prof = std::env::temp_dir()
+            .join(format!("epl-edge-prof-{}-{}", std::process::id(), retry_stamp));
+        std::fs::write(&th, html.as_bytes()).map_err(|e| format!("写临时文件失败：{}", e))?;
+        let edge2 = edge.clone();
+        let out2 = real_out.clone();
+        let th2 = th.clone();
+        let prof2 = prof.clone();
+        let r = tauri::async_runtime::spawn_blocking(move || {
+            run_print_to_pdf(&edge2, &th2, &out2, &prof2)
+        })
+        .await
+        .map_err(|e| format!("转换任务失败：{}", e));
+        let ok = r.as_ref().is_ok();
+        if let Err(e) = &r {
+            last_err = Some(e.clone());
+        }
+        // 成功：清现场（HTML + profile）；失败：**全部保留**——现场 HTML/profile
+        // 是排查"退出码 0 无产物"的唯一物证，删了就只能靠猜（上一轮就是这么瞎的）
+        result = r;
+        if ok {
+            let _ = std::fs::remove_file(&th);
+            let _ = std::fs::remove_dir_all(&prof);
+            break;
+        }
+    }
 
     result?;
     Ok(shown_out)
