@@ -13,7 +13,7 @@
  * 不该为了迁就它们把整篇文字缩小）。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import Icon from './Icon.vue'
+import FindBar from './FindBar.vue'
 import ImageAllowDialog from './ImageAllowDialog.vue'
 import { mdImgBlockedText } from './markdownDocument'
 import type { MdImgReason, MarkdownDocument } from './markdownDocument'
@@ -625,7 +625,7 @@ const findOpen = ref(false)
 const findQuery = ref('')
 const findIndex = ref(0)
 const findCount = ref(0)
-const findInput = ref<HTMLInputElement | null>(null)
+const findBarRef = ref<InstanceType<typeof FindBar> | null>(null)
 
 interface HighlightLike {
   add(r: Range): void
@@ -759,8 +759,7 @@ async function openFind(): Promise<void> {
     findQuery.value = text
   }
   await nextTick()
-  findInput.value?.focus()
-  findInput.value?.select()
+  findBarRef.value?.focus()
 }
 
 function closeFind(): void {
@@ -1024,44 +1023,16 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 页内查找（Ctrl+F）。输入框自己吃掉键盘事件，别让全局快捷键抢走 -->
-    <div v-if="findOpen" class="findbar" data-tid="md-find">
-      <input
-        ref="findInput"
-        v-model="findQuery"
-        class="find-input"
-        data-tid="md-find-input"
-        type="text"
-        placeholder="在本文中查找"
-        spellcheck="false"
-        autocomplete="off"
-        @keydown.enter.prevent="stepFind($event.shiftKey ? -1 : 1)"
-        @keydown.esc.prevent.stop="closeFind"
-      />
-      <span class="find-count" data-tid="md-find-count">
-        {{ findQuery.trim() ? (findCount ? `${findIndex + 1} / ${findCount}` : '无匹配') : '' }}
-      </span>
-      <button
-        class="find-btn"
-        data-tid="md-find-prev"
-        :disabled="!findCount"
-        title="上一个 (Shift+Enter)"
-        @click="stepFind(-1)"
-      >
-        <Icon name="prev" />
-      </button>
-      <button
-        class="find-btn"
-        data-tid="md-find-next"
-        :disabled="!findCount"
-        title="下一个 (Enter)"
-        @click="stepFind(1)"
-      >
-        <Icon name="next" />
-      </button>
-      <button class="find-btn" data-tid="md-find-close" title="关闭 (Esc)" @click="closeFind">
-        <Icon name="close" />
-      </button>
-    </div>
+    <FindBar
+      v-if="findOpen"
+      ref="findBarRef"
+      v-model:query="findQuery"
+      scope="md"
+      :count="findQuery.trim() ? (findCount ? `${findIndex + 1} / ${findCount}` : '无匹配') : ''"
+      @next="stepFind(1)"
+      @prev="stepFind(-1)"
+      @close="closeFind"
+    />
 
     <!-- 桌面端：绝对路径图片的授权确认（安全模型的一部分，见 ImageAllowDialog） -->
     <ImageAllowDialog
@@ -1128,77 +1099,6 @@ onBeforeUnmount(() => {
   /* 内容里的表格 / 代码块靠这个限制宽度，超出时自己滚 */
   min-width: 0;
   overflow-wrap: break-word;
-}
-
-/* ---------------------------------------------------------------- 查找条 */
-
-.findbar {
-  position: absolute;
-  top: 10px;
-  right: 18px;
-  z-index: 5;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 6px;
-  background: var(--surface-2);
-  border: 1px solid var(--line-strong);
-  border-radius: 8px;
-  box-shadow: 0 6px 20px var(--shadow);
-}
-
-.find-input {
-  width: 180px;
-  height: 26px;
-  padding: 0 8px;
-  background: var(--btn);
-  color: var(--fg);
-  border: 1px solid var(--line-strong);
-  border-radius: 5px;
-  font: inherit;
-  font-size: 12.5px;
-  outline: none;
-}
-.find-input:focus {
-  border-color: var(--accent-solid);
-}
-.find-input::placeholder {
-  color: var(--mute);
-}
-
-.find-count {
-  min-width: 54px;
-  text-align: center;
-  font-size: 11.5px;
-  color: var(--dim);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-.find-btn {
-  width: 26px;
-  height: 26px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  background: transparent;
-  color: var(--dim);
-  border: 0;
-  border-radius: 5px;
-  cursor: pointer;
-}
-.find-btn:hover:not(:disabled) {
-  background: var(--btn-hover);
-  color: var(--fg);
-}
-.find-btn:disabled {
-  opacity: 0.35;
-  cursor: default;
-}
-.find-btn :deep(svg) {
-  width: 15px;
-  height: 15px;
 }
 
 .md-foot {

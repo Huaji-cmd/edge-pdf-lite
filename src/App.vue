@@ -1330,6 +1330,9 @@ function onKeydown(e: KeyboardEvent): void {
     if (isMd) {
       e.preventDefault()
       mdViewerRef.value?.toggleFind()
+    } else if (docKind.value === 'pdf' && viewerRef.value) {
+      e.preventDefault()
+      void viewerRef.value.toggleFind()
     }
     return
   }
@@ -1391,6 +1394,7 @@ function onKeydown(e: KeyboardEvent): void {
      * 焦点在查找框里时由输入框自己的 keydown 处理，走不到这里 —— 两条都不落空。
      */
     if (isMd && mdViewerRef.value?.closeFindIfOpen()) return
+    if (docKind.value === 'pdf' && viewerRef.value?.closeFindIfOpen()) return
     // 退回阅读模式 —— 避免"工具还开着但忘了"导致误画
     tool.value = 'none'
     viewerRef.value?.clearSelection()

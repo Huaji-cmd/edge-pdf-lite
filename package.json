@@ -46,7 +46,7 @@
     "test:touch": "node scripts/test-touch.mjs",
     "test:pwa": "node scripts/test-pwa.mjs",
     "test:preview": "node scripts/test-preview.mjs",
-    "test": "node scripts/test-csp.mjs && node scripts/test-viewer.mjs && node scripts/test-md.mjs && node scripts/test-annot.mjs && node scripts/test-writer.mjs && node scripts/test-interact.mjs && node scripts/test-touch.mjs && node scripts/test-pwa.mjs && node scripts/test-preview.mjs",
+    "test": "node scripts/test-csp.mjs && node scripts/test-viewer.mjs && node scripts/test-md.mjs && node scripts/test-annot.mjs && node scripts/test-writer.mjs && node scripts/test-interact.mjs && node scripts/test-touch.mjs && node scripts/test-pwa.mjs && node scripts/test-pdf-find.mjs && node scripts/test-preview.mjs",
     "variants": "node scripts/make-highlight-variants.mjs",
     "edge:shot": "node scripts/edge-pdf-shot.mjs",
     "tauri": "node scripts/tauri.mjs",

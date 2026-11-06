@@ -9,6 +9,9 @@ import {
   PRIORITY_NEAR,
   type RendererStats,
 } from './pageRenderer'
+import FindBar from './FindBar.vue'
+import { buildPageText, findInPage } from './pdfFind'
+import type { PdfMatch, PdfPageText } from './pdfFind'
 import type { PageSize, ViewMode } from './types'
 import { AnnotationStore } from '@/annot/store'
 import { AnnotLayer } from '@/annot/annotLayer'
@@ -1797,9 +1800,234 @@ async function restoreTo(nextScale: number, pageNumber: number): Promise<boolean
   return landedRow != null && l.pages.some((p) => p.y === landedRow.y && p.pageNumber === target.pageNumber)
 }
 
+// ---------------------------------------------------------------- 页内查找（Ctrl+F）
+
+/*
+ * 与 Markdown 查找同构的交互，引擎完全不同：
+ *   · 匹配数据 = getTextContent（与文本层同参数，见 pdfFind.ts）
+ *   · 高亮 = 文本层 span 里包 <mark>（TextLayer 的 textDivs 给了
+ *     "文本项 ↔ 元素"的精确映射，高亮位置像素级准）
+ *   · 未渲染的页只参与**计数与跳转**（文本层按需重建时自动打标）
+ * 查找条 UI 是共享的 FindBar 组件 —— 两边不允许样式/快捷键漂移。
+ */
+const findOpen = ref(false)
+const findQuery = ref('')
+const findCount = ref('')
+const findSearching = ref(false)
+const findBarRef = ref<InstanceType<typeof FindBar> | null>(null)
+
+const FIND_CAP = 2000
+/** 页文本缓存（页号 → 可搜索文本）；缩放不影响（字符层），换文档随组件销毁 */
+const pageTexts = new Map<number, PdfPageText>()
+/** 当前有文本层的页（renderer 回调维护） */
+const textLayers = new Map<number, HTMLElement[]>()
+/** 每页打上的 mark 元素（清场 / 加"当前项"用） */
+const findMarks = new Map<number, HTMLElement[]>()
+let findMatches: PdfMatch[] = []
+let findIndex = -1
+let findToken = 0
+
+function onTextLayerReady(page: number, divs: HTMLElement[] | null): void {
+  if (divs) {
+    textLayers.set(page, divs)
+    applyMarksToPage(page, divs)
+  } else {
+    textLayers.delete(page)
+    findMarks.delete(page)
+  }
+}
+
+async function ensurePageText(page: number): Promise<PdfPageText | null> {
+  const hit = pageTexts.get(page)
+  if (hit) return hit
+  try {
+    const p = await props.doc.getPage(page)
+    const tc = await p.getTextContent({ includeMarkedContent: true, disableNormalization: true })
+    const pt = buildPageText(page, tc.items as { str?: string }[])
+    pageTexts.set(page, pt)
+    return pt
+  } catch {
+    return null
+  }
+}
+
+async function runFind(): Promise<void> {
+  clearAllFindMarks()
+  findMatches = []
+  findIndex = -1
+  findCount.value = ''
+  if (!findQuery.value.trim()) return
+  const token = ++findToken
+  findSearching.value = true
+  try {
+    // 分批取文本 + 渐进计数：长文档搜几秒，用户能看到计数在动
+    for (let start = 1; start <= props.doc.numPages && findMatches.length < FIND_CAP; start += 12) {
+      const end = Math.min(props.doc.numPages, start + 11)
+      const pts = await Promise.all(
+        Array.from({ length: end - start + 1 }, (_, i) => ensurePageText(start + i)),
+      )
+      if (token !== findToken) return
+      for (const pt of pts) {
+        if (!pt) continue
+        findMatches.push(...findInPage(pt, findQuery.value, FIND_CAP - findMatches.length))
+        if (findMatches.length >= FIND_CAP) break
+      }
+      findCount.value = findMatches.length ? String(findMatches.length) : ''
+    }
+  } finally {
+    if (token === findToken) findSearching.value = false
+  }
+  for (const [page, divs] of textLayers) applyMarksToPage(page, divs)
+  if (findMatches.length) await activateMatch(0)
+}
+
+/**
+ * 把一页的匹配画进文本层。🔴 一个文本项里可能有**多个**匹配，
+ * 必须按项分组后一次重建（逐个重建会互相覆盖）。
+ */
+function applyMarksToPage(page: number, divs: HTMLElement[]): void {
+  clearMarksFor(page)
+  if (!findMatches.length) return
+  if (!pageTexts.get(page)) return
+  const byItem = new Map<number, { matchIdx: number; start: number; end: number }[]>()
+  findMatches.forEach((m, mi) => {
+    if (m.page !== page) return
+    for (const seg of m.segments) {
+      const arr = byItem.get(seg.item) ?? []
+      arr.push({ matchIdx: mi, start: seg.start, end: seg.end })
+      byItem.set(seg.item, arr)
+    }
+  })
+  if (!byItem.size) return
+  const kept: HTMLElement[] = []
+  for (const [itemIdx, segs] of byItem) {
+    const div = divs[itemIdx]
+    if (!div) continue
+    // 原文存在 dataset：打过标的 div 靠它还原（TextLayer 的 span 只有文本，安全）
+    const orig = div.dataset.findOrig ?? div.textContent ?? ''
+    if (div.dataset.findOrig === undefined) div.dataset.findOrig = orig
+    segs.sort((a, b) => a.start - b.start)
+    const frag = document.createDocumentFragment()
+    let cursor = 0
+    for (const s of segs) {
+      if (s.start > cursor) frag.append(orig.slice(cursor, s.start))
+      const mark = document.createElement('mark')
+      // 缩放/翻页重建文本层后走这里重打 —— 当前项的橙色要在此恢复
+      mark.className = s.matchIdx === findIndex ? 'find-hl on' : 'find-hl'
+      mark.dataset.findMatch = String(s.matchIdx)
+      mark.append(orig.slice(s.start, s.end))
+      frag.append(mark)
+      kept.push(mark)
+      cursor = s.end
+    }
+    if (cursor < orig.length) frag.append(orig.slice(cursor))
+    div.replaceChildren(frag)
+  }
+  if (kept.length) findMarks.set(page, kept)
+}
+
+function clearMarksFor(page: number): void {
+  const marks = findMarks.get(page)
+  if (!marks?.length) {
+    findMarks.delete(page)
+    return
+  }
+  const seen = new Set<HTMLElement>()
+  for (const m of marks) {
+    const div = m.parentElement
+    if (div && !seen.has(div)) {
+      seen.add(div)
+      const orig = div.dataset.findOrig
+      if (orig !== undefined) div.textContent = orig
+    }
+  }
+  findMarks.delete(page)
+}
+
+function clearAllFindMarks(): void {
+  for (const page of [...findMarks.keys()]) clearMarksFor(page)
+}
+
+/** 激活第 index 个匹配：跳页（若不在视口）→ 等打标 → 标橙 → 滚到 1/4 处 */
+async function activateMatch(index: number): Promise<void> {
+  if (!findMatches.length) return
+  const n = findMatches.length
+  findIndex = ((index % n) + n) % n
+  for (const arr of findMarks.values()) for (const el of arr) el.classList.remove('on')
+  const m = findMatches[findIndex]
+  /*
+   * 跳页与滚动**一次到位**，走 goToDestination（目录跳转同款坐标换算）——
+   * 🔴 不能"goToPage(页顶) 再自己 scrollToMark 二次滚"：两次滚动会让
+   *    updateCurrentPage 的行判定与最终视口错位（实测页码停在上一页）。
+   *    destTop 用匹配项基线的页面坐标（原点左下），再加一点余量让目标
+   *    不贴着视口顶。
+   */
+  const pt = pageTexts.get(m.page)
+  const destTop = pt ? (pt.ys[m.segments[0].item] ?? null) : null
+  const y = destTop !== null && Number.isFinite(destTop) ? destTop + 30 : null
+  if (m.page !== currentPage.value || y !== null) {
+    await goToDestination(m.page, y)
+  }
+  // 文本层异步构建 —— 轮询等打标落地（最多 ~7s）
+  for (let i = 0; i < 60; i++) {
+    const marks = findMarks.get(m.page)
+    const on = marks?.filter((el) => el.dataset.findMatch === String(findIndex)) ?? []
+    if (on.length) {
+      for (const el of on) el.classList.add('on')
+      break
+    }
+    await new Promise((r) => setTimeout(r, 120))
+  }
+  findCount.value = `${findIndex + 1} / ${findMatches.length}`
+}
+
+function stepFind(dir: 1 | -1): void {
+  if (findMatches.length) void activateMatch(findIndex + dir)
+}
+
+async function toggleFind(): Promise<void> {
+  if (findOpen.value) {
+    closeFind()
+    return
+  }
+  findOpen.value = true
+  // v-if 刚翻转，组件还没挂载 —— 等一帧再聚焦（否则 ref 是 null，聚焦静默丢失）
+  await nextTick()
+  await findBarRef.value?.focus()
+}
+
+function closeFind(): void {
+  findOpen.value = false
+  findQuery.value = ''
+  findToken++
+  clearAllFindMarks()
+  findMatches = []
+  findIndex = -1
+  findCount.value = ''
+}
+
+function closeFindIfOpen(): boolean {
+  if (!findOpen.value) return false
+  closeFind()
+  return true
+}
+
+/** 输入防抖：全文搜索比 Markdown 慢，350ms 合一次 */
+let findDebounce: number | null = null
+watch(findQuery, () => {
+  if (findDebounce !== null) clearTimeout(findDebounce)
+  findDebounce = window.setTimeout(() => {
+    findDebounce = null
+    void runFind()
+  }, 350)
+})
+
 defineExpose({
   applyScale,
   goToPage,
+  toggleFind,
+  closeFind,
+  closeFindIfOpen,
   /** 跳到书签位置：页 + 页内纵向位置（目录点击用） */
   goToDestination,
   /** 按行翻页（‹ › / PageUp·PageDown）。双页模式一次翻一屏，见函数注释 */
@@ -1897,7 +2125,7 @@ function makeEditor(layer: AnnotLayer, doc: PdfDocument): AnnotEditor {
 }
 
 onMounted(() => {
-  renderer = new PageRenderer(props.doc, dpr, 2, (s) => emit('stats', s))
+  renderer = new PageRenderer(props.doc, dpr, 2, (s) => emit('stats', s), onTextLayerReady)
 
   annotLayer = new AnnotLayer(props.doc, dpr, (pn) =>
     // ⚠️ 编辑中的那个文本框要排除掉：画布画一遍、DOM 编辑框再画一遍，
@@ -2039,7 +2267,7 @@ watch(
   () => props.doc,
   (doc) => {
     renderer?.destroy()
-    renderer = new PageRenderer(doc, dpr, 2, (s) => emit('stats', s))
+    renderer = new PageRenderer(doc, dpr, 2, (s) => emit('stats', s), onTextLayerReady)
 
     // 换文档 = 批注全部作废（批注是按文档归属的，不能跨文件漂）
     annotEditor?.cancelSession()
@@ -2294,6 +2522,19 @@ watch(
       文本框不再有"居中弹窗"这回事了 —— 改成页面上的就地编辑（见 .text-edit）。
       原来那个模态的模板/CSS 一起删掉了，免得留一堆没人用的死样式。
     -->
+
+    <!-- 页内查找（Ctrl+F）：条浮在阅读区上，共享组件（与 Markdown 同款交互） -->
+    <FindBar
+      v-if="findOpen"
+      ref="findBarRef"
+      v-model:query="findQuery"
+      scope="pdf"
+      :count="findCount"
+      :searching="findSearching"
+      @next="stepFind(1)"
+      @prev="stepFind(-1)"
+      @close="closeFind"
+    />
   </div>
 </template>
 
@@ -2303,6 +2544,8 @@ watch(
   min-height: 0;
   display: flex;
   flex-direction: column;
+  /* 查找条（FindBar）absolute 定位的参照 */
+  position: relative;
 }
 
 .viewport {
@@ -2897,5 +3140,22 @@ watch(
 }
 .page-slot :deep(.text-layer ::selection) {
   background: var(--sel-wash-strong);
+}
+</style>
+
+<!--
+  ⚠️ 这个块不能加 scoped：查找的 <mark> 是运行时在文本层里创建的，
+  没有 data-v 属性，scoped 规则选择器拼上属性后永远不命中。
+-->
+<style>
+/* 全部匹配：浅黄；当前项：橙色（与 Markdown 的 ::highlight 同一套色感） */
+mark.find-hl {
+  background-color: rgba(255, 205, 60, 0.45);
+  color: inherit;
+  padding: 0;
+}
+mark.find-hl.on {
+  background-color: rgba(255, 150, 20, 0.85);
+  color: #1a1a1a;
 }
 </style>

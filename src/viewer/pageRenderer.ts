@@ -40,6 +40,9 @@ interface SlotState {
   textKey: string
   /** 文本层异步构建的令牌，用来丢弃过期的结果 */
   textToken: number
+  /** 文本项字符串 ↔ span 元素的映射（页内查找打标用），回收时清空 */
+  textDivs: HTMLElement[] | null
+  textStrs: string[] | null
 }
 
 export interface RendererStats {
@@ -78,6 +81,8 @@ export class PageRenderer {
     /** M0 实测：并发 2 在目标机上效果最好（避免多页首次渲染互相争抢） */
     private readonly concurrency = 2,
     private readonly onStats?: (s: RendererStats) => void,
+    /** 文本层就绪/被回收时通知（页内查找打标用；null = 该页文本层没了） */
+    private readonly onTextLayer?: (page: number, divs: HTMLElement[] | null) => void,
     /** 是否构建文本层（选中/复制文字）。关掉它就是"lite 模式" */
     private readonly textLayerEnabled = true,
   ) {}
@@ -119,6 +124,9 @@ export class PageRenderer {
     slot.textEl?.remove()
     slot.textEl = null
     slot.textKey = ''
+    slot.textDivs = null
+    slot.textStrs = null
+    this.onTextLayer?.(pageNumber, null)
     slot.doneKey = ''
     // ⚠️ 必须把需求也清掉。
     // 之前这里只清 doneKey，导致这个 bug：
@@ -202,6 +210,8 @@ export class PageRenderer {
       slot.task?.cancel()
       slot.textToken++
       slot.textEl?.remove()
+      slot.textDivs = null
+      slot.textStrs = null
       if (slot.canvas) {
         slot.canvas.remove()
         slot.canvas.width = slot.canvas.height = 0
@@ -227,6 +237,8 @@ export class PageRenderer {
         textEl: null,
         textKey: '',
         textToken: 0,
+        textDivs: null,
+        textStrs: null,
       }
       this.slots.set(pageNumber, slot)
     }
@@ -373,6 +385,11 @@ export class PageRenderer {
       reorderTextLayer(div)
       slot.textEl = div
       slot.textKey = key
+      // item 字符串 ↔ span 元素的映射（页内查找打标的数据源）。
+      // TextLayer 的这两个 getter 与渲染顺序严格对齐 —— 这就是打标能"准"的原因
+      slot.textDivs = layer.textDivs
+      slot.textStrs = layer.textContentItemsStr
+      this.onTextLayer?.(slot.pageNumber, slot.textDivs)
       old?.remove()
     } catch (e) {
       if (!isCancelled(e)) {
