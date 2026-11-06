@@ -1122,6 +1122,10 @@ fn find_edge() -> Option<PathBuf> {
 /// 🔴 `--user-data-dir` 指到**独立临时目录**是必须的：不加的话，用户正开着
 ///    Edge 浏览器时，这个调用会把 URL 丢给**现有实例**然后立即退出 ——
 ///    表现是"转换秒回但 PDF 没生成"。
+///
+/// 🔴 失败时错误信息必须带 **Edge 的 stderr**：headless 打印失败（退出码 0
+///    但没产物）光看退出码什么都查不出来，Chromium 自己会在 stderr 上
+///    说"为什么"（`--enable-logging=stderr`）。
 fn run_print_to_pdf(edge: &Path, html_path: &Path, pdf_path: &Path, profile_dir: &Path) -> Result<(), String> {
     let url = tauri::Url::from_file_path(html_path)
         .map_err(|_| format!("临时文件路径不合法：{}", html_path.display()))?
@@ -1137,14 +1141,38 @@ fn run_print_to_pdf(edge: &Path, html_path: &Path, pdf_path: &Path, profile_dir:
         "--disable-extensions",
         "--disable-crash-reporter",
         "--no-pdf-header-footer",
+        "--enable-logging=stderr",
+        "--v=0",
     ])
     .arg(format!("--print-to-pdf={}", pdf_path.display()))
     .arg(&url)
-    .arg(format!("--user-data-dir={}", profile_dir.display()));
+    .arg(format!("--user-data-dir={}", profile_dir.display()))
+    // stderr 收进管道，另起线程读 —— 管道不读会把子进程写满卡死
+    .stderr(std::process::Stdio::piped());
 
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("启动 Edge 打印失败：{}", e))?;
+
+    // 后台线程收 stderr（Chromium 的诊断都在这里）
+    let mut stderr_buf = String::new();
+    let stderr_reader = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut tmp = [0u8; 4096];
+            loop {
+                match s.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stderr_buf.len() < 16 * 1024 {
+                            stderr_buf.push_str(&String::from_utf8_lossy(&tmp[..n]));
+                        }
+                    }
+                }
+            }
+            stderr_buf
+        })
+    });
 
     // 等待退出但带超时（wait 会永久挂起；try_wait 轮询 + 到点 kill）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -1153,16 +1181,49 @@ fn run_print_to_pdf(edge: &Path, html_path: &Path, pdf_path: &Path, profile_dir:
             break s;
         }
         if std::time::Instant::now() > deadline {
+            // 🔴 kill 主进程不够 —— Edge 是多进程，杀整棵树（否则残留子进程
+            //    锁着 profile，之后所有转换都会被"转发后秒退"）
+            let pid = child.id();
             let _ = child.kill();
+            let _ = child.wait();
+            {
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                    .spawn();
+            }
             return Err("转换超时（120 秒）：文档太大或 Edge 失去响应".to_string());
         }
         std::thread::sleep(std::time::Duration::from_millis(150));
     };
 
+    let stderr_tail = stderr_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let diag = || -> String {
+        let interesting = |l: &str| {
+            let lo = l.to_ascii_lowercase();
+            ["error", "failed", "print", "pdf", "crash", "reject"]
+                .iter()
+                .any(|k| lo.contains(k))
+        };
+        let tail: Vec<&str> = stderr_tail.lines().filter(|l| interesting(l)).collect();
+        let out = if tail.is_empty() {
+            stderr_tail.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
+        } else {
+            tail.join(" | ")
+        };
+        out[..out.len().min(400)].to_string()
+    };
+
     if !pdf_path.is_file() {
+        let d = diag();
         return Err(format!(
-            "Edge 没有生成 PDF（退出码 {:?}）。文档里可能有指向不存在文件的资源，请重试一次",
-            status.code()
+            "Edge 没有生成 PDF（退出码 {:?}，输出：{}）。临时文件 {} 保留着，可反馈排查",
+            status.code(),
+            if d.is_empty() { "无日志" } else { &d[..d.len().min(400)] },
+            html_path.display(),
         ));
     }
     let len = std::fs::metadata(pdf_path).map_err(|e| e.to_string())?.len();
@@ -1222,13 +1283,15 @@ async fn convert_md_to_pdf(
     allowed.add(real_out.clone());
     let shown_out = display_path(&real_out);
 
-    // ④ 临时 HTML（%TEMP%）+ 独立 Edge profile 目录
+    // ④ 临时 HTML（%TEMP%）+ **每次独立**的 Edge profile 目录
+    //    🔴 profile 固定路径是"第一次失败后全失败"的温床：一次残留锁，
+    //    之后所有转换都被转发给残留实例秒退。独立目录 + 用完即删，状态不跨转换。
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let temp_html = std::env::temp_dir().join(format!("epl-print-{}-{}.html", std::process::id(), stamp));
-    let profile_dir = std::env::temp_dir().join("epl-edge-profile");
+    let profile_dir = std::env::temp_dir().join(format!("epl-edge-prof-{}-{}", std::process::id(), stamp));
     std::fs::write(&temp_html, html.as_bytes())
         .map_err(|e| format!("写临时文件失败：{}", e))?;
 
@@ -1239,14 +1302,16 @@ async fn convert_md_to_pdf(
     let edge2 = edge.clone();
     let th = temp_html.clone();
     let out2 = real_out.clone();
+    let prof2 = profile_dir.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        run_print_to_pdf(&edge2, &th, &out2, &profile_dir)
+        run_print_to_pdf(&edge2, &th, &out2, &prof2)
     })
     .await
     .map_err(|e| format!("转换任务失败：{}", e))?;
 
-    // ⑥ 临时文件用完即删（删不掉也不影响结果）
+    // ⑥ 临时文件用完即删（profile 里可能有几百个缓存小文件；删不掉也不影响结果）
     let _ = std::fs::remove_file(&temp_html);
+    let _ = std::fs::remove_dir_all(&profile_dir);
 
     result?;
     Ok(shown_out)
