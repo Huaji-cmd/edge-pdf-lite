@@ -16,7 +16,7 @@
  * 做法：给 WebView2 开远程调试端口（`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`），
  * 然后用 CDP 连上去，塞一个 PDF 进去，数画布。
  */
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { chmod, copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -1717,6 +1717,151 @@ console.log('\n[7d] Typora 绝对路径图片：弹窗 → 允许 → 显示')
     absImg.ok && absImg.n === 2 && absImg.w === 240,
     `${absImg.n} 张, ${absImg.w}px`,
   )
+}
+
+// ---------------------------------------------------------------- 7e. 应用内转 PDF（打印 HTML 质量 + Edge 产物）
+console.log('\n[7e] 应用内转 PDF：组装 → Edge 无头打印 → 产物验证')
+/*
+ * 保存对话框是原生模态、CDP 点不了，所以这条链在测试里**只跳过那一环**：
+ * 打印 HTML 用 `__eplMdPrint.buildHtml()`（调试钩子，与真转换同一函数）拿；
+ * Edge 打印这一步测试进程自己跑（和 Rust 的 run_print_to_pdf 同参数同引擎，
+ * 引擎本身另有 cargo 冒烟测覆盖）。产物文本用 pdfium（pymupdf）验 ——
+ * 跟 Edge 同一个渲染世界，文本提不出来就说明"画上去"是假的。
+ */
+{
+  /*
+   * 🔴 不依赖前面测试留下的状态：列表被重命名测试改过、打开的可能是别的文档
+   *    （第一轮跑的时候 buildHtml 拿到的是 [7d] 的 md-absolute —— 无公式无代码，
+   *    公式/高亮判据全在测空气）。这里把 testdata **追加**进列表（不是覆盖 ——
+   *    覆盖会把后面 [6f] 还要用的 readonly-src 条目冲掉，踩过）→ reload → 展开 → 点行。
+   */
+  await evaluate(`(() => {
+    const cur = JSON.parse(localStorage.getItem('epl:file-list') || '[]');
+    if (!cur.some((x) => x.path === ${JSON.stringify(TESTDATA_DIR)})) {
+      cur.push({ name: 'testdata', path: ${JSON.stringify(TESTDATA_DIR)}, kind: 'folder' });
+    }
+    localStorage.setItem('epl:file-list', JSON.stringify(cur));
+  })()`)
+  await send('Page.reload')
+  await sleep(2600)
+  await evaluate(clickByTidExpr('文件'))
+  await sleep(700)
+  /*
+   * ⚠️ 不能盲点文件夹：[5] 已把"testdata 展开"存进 epl:files-expanded，
+   *    reload 后 restoreExpanded 会**自动展开** —— 再点一下就是收起（踩过）。
+   *    先看 md-basic 行在不在，不在才点。
+   */
+  let hasRow = await evaluate(
+    `[...document.querySelectorAll('[data-tid="files-panel"] [data-node-id]')].some((r) => (r.querySelector('.name')?.textContent || '').includes('md-basic.md'))`,
+  )
+  if (!hasRow) {
+    await evaluate(`document.querySelector('[data-tid="files-panel"] [data-kind="folder"]')?.click()`)
+    await sleep(1500)
+  }
+  // 从文件列表打开 md-basic.md —— 必须走列表（有真实路径，图片才改写得成 file://）
+  const clicked = await evaluate(`(() => {
+    const rows = [...document.querySelectorAll('[data-tid="files-panel"] [data-node-id]')];
+    const row = rows.find((r) => (r.querySelector('.name')?.textContent || '').includes('md-basic.md'));
+    if (!row) return 'no-row';
+    (row.querySelector('.name') || row).click();
+    return 'ok';
+  })()`)
+  if (clicked !== 'ok') {
+    const diag = await evaluate(`(() => {
+      const panel = document.querySelector('[data-tid="files-panel"]');
+      const rows = [...(panel?.querySelectorAll('[data-node-id]') ?? [])];
+      return JSON.stringify({
+        rowCount: rows.length,
+        items: rows.slice(0, 8).map((r) => [r.dataset.kind, (r.textContent || '').slice(0, 24)]),
+      });
+    })()`)
+    console.log('  [diag] panel after expand:', diag)
+  }
+  check('从文件列表打开了 md-basic.md（有真实路径）', clicked === 'ok', String(clicked))
+  let mdUp = false
+  for (let i = 0; i < 60; i++) {
+    await sleep(300)
+    mdUp = await evaluate(`!!document.querySelector('[data-tid="md-viewer"]')`)
+    if (mdUp) break
+  }
+  check('md-viewer 出现', mdUp)
+  await sleep(1200) // 公式/高亮 chunk 落地，CSS 才在 document.styleSheets 里
+
+  const html = String(await evaluate(`globalThis.__eplMdPrint.buildHtml()`))
+  // 诊断：公式区现在长什么样（一次性排查用）
+  {
+    const mi = html.indexOf('md-math')
+    console.log('  [diag] htmlLen=', html.length, ' katexN=', (html.match(/class="katex/g) || []).length, ' mathSpan=', mi >= 0 ? html.slice(mi - 120, mi + 200) : '(无 md-math)')
+    const ph = await evaluate(`(() => {
+      const doc = document.querySelector('.md-body');
+      return JSON.stringify({
+        mdMath: doc.querySelectorAll('[data-md-math]').length,
+        katex: doc.querySelectorAll('.katex').length,
+      });
+    })()`)
+    console.log('  [diag] viewer DOM: ', ph)
+  }
+  check('打印 HTML 非空且自包含声明了 charset', html.length > 1000 && html.includes('charset'))
+  check(
+    '本地图片改写成 file:// 直链（基于文档目录解析相对路径）',
+    /<img src="file:\/\/\/[^"]*md-assets\/diagram\.png"/.test(html),
+    (html.match(/<img src="file:[^"]{0,80}/) || ['(无)'])[0],
+  )
+  check('公式静态化成 KaTeX 标记（3 处）', (html.match(/class="katex/g) || []).length >= 3)
+  /* ⚠️ 查**元素**而不是字符串：打印 CSS 里就有 `.hljs-keyword` 字样，字符串匹配会假绿 */
+  check('代码高亮静态化（ts demo 的 token span）', /<span class="hljs-keyword">/.test(html))
+  check('占位已消化（不再有 data-md-math / data-md-img）', !html.includes('data-md-math') && !html.includes('data-md-img'))
+  check('被拦的远程图片照印占位文字（不说谎）', html.includes('远程图片不自动加载'))
+  check('KaTeX 字体内嵌成 data URI（临时文件拉不到外部资源）', html.includes('data:font/woff2;base64'))
+
+  // 命令闸门：空内容要在**弹对话框之前**被拒（否则这条测试会被模态框挂死）
+  let r = await tryInvoke('convert_md_to_pdf', { html: '' })
+  check('转换命令拒绝空内容（校验在对话框之前）', !r.ok && /没有可转换/.test(r.err), r.err)
+
+  // Edge 真打印（测试进程自己跑，参数与 Rust 的 run_print_to_pdf 完全一致）
+  const EDGE = [
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  ].find((p) => existsSync(p))
+  if (!EDGE) {
+    check('本机有 Microsoft Edge（转换引擎）', false)
+  } else {
+    const stamp = Date.now()
+    const tmpHtml = join(tmpdir(), `epl-convert-${stamp}.html`)
+    const outPdf = join(tmpdir(), `epl-convert-${stamp}.pdf`)
+    const prof = join(tmpdir(), `epl-convert-prof-${stamp}`)
+    await writeFile(tmpHtml, html, 'utf8')
+    const ps = spawnSync(
+      EDGE,
+      [
+        '--headless=new', '--disable-gpu', '--no-first-run', '--disable-extensions',
+        '--disable-crash-reporter', '--no-pdf-header-footer',
+        `--print-to-pdf=${outPdf}`, `file:///${tmpHtml.replace(/\\/g, '/')}`,
+        `--user-data-dir=${prof}`,
+      ],
+      { timeout: 120000 },
+    )
+    check('Edge 无头打印退出且产物存在', existsSync(outPdf), ps.error ? String(ps.error) : 'ok')
+    if (existsSync(outPdf)) {
+      const pdfText = spawnSync(
+        'python',
+        [
+          '-c',
+          `import pymupdf,sys\nd=pymupdf.open(sys.argv[1])\nt=''.join(p.get_text() for p in d)\nprint(d.page_count)\nassert '多格式阅读器验收样本' in t, '正文文本没画上去'\nassert 'E = mc' in t or 'mc' in t, '公式文本没画上去'\nprint('TEXT-OK')`,
+          outPdf,
+        ],
+        { encoding: 'utf8', timeout: 60000 },
+      )
+      check(
+        'PDF 里的正文与公式文本真的画上去了（pdfium 提取验证）',
+        /TEXT-OK/.test(pdfText.stdout ?? ''),
+        (pdfText.stdout || pdfText.stderr || '').trim().split('\n').slice(-2).join(' | '),
+      )
+    }
+    await rm(tmpHtml, { force: true }).catch(() => {})
+    await rm(outPdf, { force: true }).catch(() => {})
+    await rm(prof, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 // ---------------------------------------------------------------- 8. 控制台

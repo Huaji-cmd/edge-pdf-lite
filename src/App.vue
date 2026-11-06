@@ -5,6 +5,7 @@ import PdfViewer from './viewer/PdfViewer.vue'
 import { MarkdownDocument } from './viewer/markdownDocument'
 import type { MdHeading } from './viewer/markdownDocument'
 import MarkdownViewer from './viewer/MarkdownViewer.vue'
+import { buildPrintHtml } from './viewer/mdPrint'
 import ConvertGuideDialog from './viewer/ConvertGuideDialog.vue'
 import ViewerToolbar from './viewer/ViewerToolbar.vue'
 import SidePanel from './viewer/SidePanel.vue'
@@ -794,6 +795,64 @@ async function openFromList(node: FileNode): Promise<void> {
 }
 
 /**
+ * 工具栏「转 PDF 后批注」的分流：
+ * 桌面版**真转换**（Edge 无头打印，见 convertCurrentMd）；
+ * 浏览器版没有本地打印引擎，退回外部工具引导框（Pandoc / Typora）。
+ */
+function onConvertRequest(): void {
+  if (IS_TAURI && docKind.value === 'markdown') {
+    void convertCurrentMd()
+  } else {
+    showConvertGuide.value = true
+  }
+}
+
+/**
+ * 应用内 Markdown → PDF。
+ *
+ * 前端只负责**组装自包含的打印 HTML**（公式/高亮静态化、字体内嵌，见 mdPrint.ts）；
+ * 保存对话框、临时文件、Edge 打印、输出路径登记全在 Rust 侧
+ * （`convert_md_to_pdf` —— 对话框和登记不进前端是路径闸门的一部分）。
+ * 转完**直接打开**转出的 PDF：转 PDF 的唯一目的是批注，别让用户再找一遍文件。
+ */
+async function convertCurrentMd(): Promise<void> {
+  const d = mdDoc.value
+  if (!d) return
+  busyLabel.value = '正在生成 PDF…'
+  busy.value = true
+  try {
+    const html = await buildPrintHtmlFor(d)
+    const core = await import('@tauri-apps/api/core')
+    const out = await core.invoke<string>('convert_md_to_pdf', { html })
+    if (out === '__cancelled__') return // 保存对话框点了取消：不算错误
+    showToast('已转成 PDF，正在打开…')
+    const bytes = await readBytesByPath(out)
+    await openDocument(bytes, out.split(/[\\/]/).pop() ?? '转换结果.pdf', out)
+  } catch (e) {
+    errorText.value = errTextOf(e)
+  } finally {
+    busy.value = false
+  }
+}
+
+/** 组装打印 HTML（转换与调试钩子共用；公式/高亮的懒加载 chunk 顺带预热） */
+function buildPrintHtmlFor(d: MarkdownDocument): Promise<string> {
+  const dirIdx = d.path ? Math.max(d.path.lastIndexOf('\\'), d.path.lastIndexOf('/')) : -1
+  return buildPrintHtml(d, {
+    docDir: dirIdx > 0 ? d.path.slice(0, dirIdx) : undefined,
+    allowAbsoluteImages: mdViewerRef.value?.isAbsApproved() ?? false,
+  })
+}
+
+// 诊断钩子：test-exe 用它拿**当前文档的打印 HTML** 做产物质量断言
+// （保存对话框是原生模态、CDP 点不了，所以全链路在测试里只跳过这一环）
+if (IS_TAURI) {
+  ;(globalThis as unknown as Record<string, unknown>).__eplMdPrint = {
+    buildHtml: () => (mdDoc.value ? buildPrintHtmlFor(mdDoc.value) : Promise.resolve('')),
+  }
+}
+
+/**
  * 启动时自动打开上次那篇 PDF（只有桌面端有路径可存）。
  *
  * 用户的原话：*"我看了一篇 pdf 之后关闭了软件，重新打开需要我重新打开本来的 pdf"*。
@@ -1528,7 +1587,7 @@ onBeforeUnmount(() => {
       @redo="viewerRef?.redoAnnot()"
       @delete-selected="deleteSelected"
       @export-annot="exportAnnotated"
-      @convert-guide="showConvertGuide = true"
+      @convert-guide="onConvertRequest"
     />
 
     <!--

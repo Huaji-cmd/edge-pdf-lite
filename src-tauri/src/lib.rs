@@ -1095,6 +1095,164 @@ fn open_external_url(url: String) -> Result<(), String> {
 }
 
 /*
+ * ---------------------------------------------------------------- Markdown → PDF（应用内转换）
+ *
+ * 方案 B（产品决策见 docs/M15）：**不引入 Pandoc / 排版引擎** ——
+ * 前端把渲染好的打印 HTML 交上来，这里用**系统自带的 Microsoft Edge 无头打印**
+ * 出 PDF。Edge 在装了 WebView2 的机器上几乎必在；输出是矢量文本，
+ * 可选中、可批注 —— 这正是"转 PDF"的唯一目的。
+ */
+
+/// 在惯常位置找 msedge.exe。找不到返回 None（前端会给出明确的替代指引）。
+fn find_edge() -> Option<PathBuf> {
+    for p in [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ] {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 真正的打印：同步、阻塞。调用方负责放进 blocking 线程。
+///
+/// 🔴 `--user-data-dir` 指到**独立临时目录**是必须的：不加的话，用户正开着
+///    Edge 浏览器时，这个调用会把 URL 丢给**现有实例**然后立即退出 ——
+///    表现是"转换秒回但 PDF 没生成"。
+fn run_print_to_pdf(edge: &Path, html_path: &Path, pdf_path: &Path, profile_dir: &Path) -> Result<(), String> {
+    let url = tauri::Url::from_file_path(html_path)
+        .map_err(|_| format!("临时文件路径不合法：{}", html_path.display()))?
+        .to_string();
+
+    let mut cmd = std::process::Command::new(edge);
+    // 🔴 开关必须用 `--switch=value` 等号形式：写成两个独立参数时 Chromium 会把
+    //    路径当**位置参数**（第二个 URL）吞掉，输出根本不写 —— 实测退出码 13。
+    cmd.args([
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--disable-extensions",
+        "--disable-crash-reporter",
+        "--no-pdf-header-footer",
+    ])
+    .arg(format!("--print-to-pdf={}", pdf_path.display()))
+    .arg(&url)
+    .arg(format!("--user-data-dir={}", profile_dir.display()));
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("启动 Edge 打印失败：{}", e))?;
+
+    // 等待退出但带超时（wait 会永久挂起；try_wait 轮询 + 到点 kill）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(s) = child.try_wait().map_err(|e| format!("等待 Edge 失败：{}", e))? {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            return Err("转换超时（120 秒）：文档太大或 Edge 失去响应".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    };
+
+    if !pdf_path.is_file() {
+        return Err(format!(
+            "Edge 没有生成 PDF（退出码 {:?}）。文档里可能有指向不存在文件的资源，请重试一次",
+            status.code()
+        ));
+    }
+    let len = std::fs::metadata(pdf_path).map_err(|e| e.to_string())?.len();
+    if len == 0 {
+        return Err("生成的 PDF 是空的，请重试一次".to_string());
+    }
+    Ok(())
+}
+
+/**
+ * 应用内把 Markdown 转成 PDF。
+ *
+ * 流程：前端组装好**自包含**的打印 HTML（公式/高亮已静态化、字体已内嵌）→
+ * 这里弹**保存对话框**（Rust 侧，沿用"对话框和登记都不在前端"的闸门模式）→
+ * 写 %TEMP% 临时文件 → Edge 无头打印 → 校验产物 → 删临时文件 → 登记输出路径
+ * （转出来的 PDF 用户是亲手选的位置，登记后能直接在应用里打开批注）。
+ *
+ * 安全边界：HTML 是前端从**净化后的** doc.html 组装的；临时文件落在
+ * %TEMP% 且用完即删；输出路径只来自保存对话框 —— 前端给不了任意写盘能力。
+ */
+#[tauri::command]
+async fn convert_md_to_pdf(
+    app: tauri::AppHandle,
+    allowed: State<'_, Allowed>,
+    html: String,
+) -> Result<String, String> {
+    // ① 内容闸门：非空 + 大小上限（内嵌 KaTeX 字体的文档会有 1-2 MB，上限放宽到 32 MB）
+    let html = html.trim().to_string();
+    if html.is_empty() {
+        return Err("没有可转换的内容".to_string());
+    }
+    if html.len() > 32 * 1024 * 1024 {
+        return Err("转换内容太大，请精简文档后重试".to_string());
+    }
+
+    // ② 保存对话框（Rust 侧模态，用户亲手选输出位置）
+    let mut dlg = app
+        .dialog()
+        .file()
+        .set_title("把 Markdown 转成 PDF")
+        .add_filter("PDF", &["pdf"]);
+    #[cfg(desktop)]
+    if let Some(win) = app.get_webview_window("main") {
+        dlg = dlg.set_parent(&win);
+    }
+    let Some(out) = dlg.blocking_save_file() else {
+        return Err("__cancelled__".to_string()); // 用户取消：不算错误，前端静默处理
+    };
+    let mut out_path = out.into_path().map_err(|e| e.to_string())?;
+    // 补后缀（用户手输名字漏了 .pdf 时别生成一个没有后缀的文件）
+    if out_path.extension().map(|e| e.to_ascii_lowercase()) != Some("pdf".into()) {
+        out_path.set_extension("pdf");
+    }
+
+    // ③ 边打印边登记：输出路径是用户亲手选的，登记符合路径闸门哲学
+    let real_out = resolveish(&out_path).ok_or("输出路径无法解析")?;
+    allowed.add(real_out.clone());
+    let shown_out = display_path(&real_out);
+
+    // ④ 临时 HTML（%TEMP%）+ 独立 Edge profile 目录
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let temp_html = std::env::temp_dir().join(format!("epl-print-{}-{}.html", std::process::id(), stamp));
+    let profile_dir = std::env::temp_dir().join("epl-edge-profile");
+    std::fs::write(&temp_html, html.as_bytes())
+        .map_err(|e| format!("写临时文件失败：{}", e))?;
+
+    // ⑤ 打印（放 blocking 线程，别把 async 运行时挂住）
+    let edge = find_edge().ok_or_else(|| {
+        "没找到 Microsoft Edge（转换需要它做打印引擎）。请确认系统装有 Edge，或继续用外部工具（Typora / Pandoc）转 PDF".to_string()
+    })?;
+    let edge2 = edge.clone();
+    let th = temp_html.clone();
+    let out2 = real_out.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_print_to_pdf(&edge2, &th, &out2, &profile_dir)
+    })
+    .await
+    .map_err(|e| format!("转换任务失败：{}", e))?;
+
+    // ⑥ 临时文件用完即删（删不掉也不影响结果）
+    let _ = std::fs::remove_file(&temp_html);
+
+    result?;
+    Ok(shown_out)
+}
+
+/*
  * 读一份**系统中文字体**，给「把中文写进 PDF」用。
  *
  * 为什么需要它：PDF 的标准 14 字体里**没有 CJK 字形**，硬写中文要么是乱码，
@@ -1614,6 +1772,7 @@ pub fn run() {
             allow_image_paths,
             read_absolute_image,
             open_external_url,
+            convert_md_to_pdf,
             read_system_font,
             path_exists,
             default_save_dir,
@@ -1739,5 +1898,50 @@ mod tests {
         assert!(is_markdown_path(Path::new("a.MARKDOWN")));
         assert!(!is_markdown_path(Path::new("a.pdf")));
         assert!(!is_markdown_path(Path::new("a.mdx")));
+    }
+
+    /// 转换引擎的存在性 + 真打印一次。没装 Edge 的环境跳过（不假红）。
+    #[test]
+    fn edge_print_really_produces_pdf() {
+        use std::io::Read;
+        let Some(edge) = find_edge() else {
+            eprintln!("skip: 本机没装 Microsoft Edge");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("epl-print-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let html = dir.join("sample.html");
+        std::fs::write(
+            &html,
+            "<!doctype html><html><head><meta charset='utf-8'>\
+             <style>@page{size:A4;margin:18mm}</style></head>\
+             <body><h1>转换冒烟样本</h1><p>中文正文，验证字体与分页。</p></body></html>",
+        )
+        .unwrap();
+        let pdf = dir.join("sample.pdf");
+        run_print_to_pdf(
+            &edge,
+            &html,
+            &pdf,
+            &dir.join("profile"),
+        )
+        .expect("Edge 打印应该成功");
+        let len = std::fs::metadata(&pdf).unwrap().len();
+        assert!(len > 1000, "PDF 太小（{} 字节），不像正常产物", len);
+        // PDF 魔数
+        let mut head = [0u8; 5];
+        std::fs::File::open(&pdf).unwrap().read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"%PDF-", "产物不是 PDF");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_edge_locations_are_the_usual_ones() {
+        // 只验证函数不 panic；机器上有没有 Edge 都合法
+        let e = find_edge();
+        if let Some(p) = e {
+            assert!(p.ends_with("msedge.exe"));
+        }
     }
 }

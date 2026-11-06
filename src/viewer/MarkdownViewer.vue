@@ -606,6 +606,8 @@ defineExpose({
   closeFind,
   toggleFind,
   closeFindIfOpen,
+  /** 「转 PDF」要用：这篇文档的绝对路径图片过没过授权弹窗（授权状态按指纹记在 module 级） */
+  isAbsApproved: () => absApprovedDocs.has(props.doc.fingerprint),
 })
 
 // ---------------------------------------------------------------- 页内查找
