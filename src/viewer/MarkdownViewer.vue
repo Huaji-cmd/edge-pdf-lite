@@ -830,6 +830,72 @@ async function highlightCode(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------- 公式渲染（KaTeX 按需加载）
+
+/**
+ * 把文档里 texmath 留下的**公式占位**换成真正的 KaTeX 渲染结果。
+ *
+ * 为什么占位 → 后填：KaTeX 全家（JS + CSS + 字体引用）约 280KB，
+ * 只在文档里**真的出现公式**才加载 —— 和 pdf-lib / highlight.js 同一条
+ * "只在必须付的时候付一次"的纪律。占位本身是空 span，不会闪出原始 TeX。
+ *
+ * 安全：KaTeX 输出**不经过 DOMPurify**，直接 innerHTML —— 这是有意的：
+ *   · 输入是 TeX 源码（从 data 属性解码回来），不是用户 HTML；
+ *   · KaTeX 默认 `trust: false`，不许 \href 等逃逸构造，输出是固定结构；
+ *   · 反过来，DOMPurify 的 FORBID_ATTR 会剥掉 KaTeX 排版必需的内联 style。
+ * 也就是说"绕过净化器"在这里不是漏洞，是唯一正确的管线。
+ */
+interface KatexApi {
+  renderToString(tex: string, opts?: Record<string, unknown>): string
+}
+
+let katexPromise: Promise<KatexApi | null> | null = null
+
+function loadKatex(): Promise<KatexApi | null> {
+  katexPromise ??= Promise.all([
+    import('katex'),
+    // CSS（含字体引用）跟着 JS chunk 一起懒加载；CSP 的 style/font-src 都是 'self'，够用
+    import('katex/dist/katex.min.css'),
+  ])
+    .then(([m]) => (m.default as unknown) as KatexApi)
+    .catch(() => null)
+  return katexPromise
+}
+
+async function renderMath(): Promise<void> {
+  const root = body.value
+  if (!root) return
+  const slots = [...root.querySelectorAll<HTMLElement>('[data-md-math]')]
+  if (!slots.length) return
+  const katex = await loadKatex()
+  // 加载失败（极端网络/磁盘问题）：占位显示原始 TeX —— 比空白好，也比整篇报错好
+  for (const el of slots) {
+    let tex = ''
+    try {
+      tex = decodeURIComponent(el.dataset.mdMath ?? '')
+    } catch {
+      tex = el.dataset.mdMath ?? ''
+    }
+    const display = el.dataset.mdDisplay === '1'
+    if (!katex) {
+      el.textContent = tex
+      el.classList.add('md-math-raw')
+      continue
+    }
+    try {
+      el.innerHTML = katex.renderToString(tex, {
+        displayMode: display,
+        throwOnError: false,
+        strict: false, // 老式 TeX 写法的警告不弹（console 噪音而已）
+        trust: false, // 🔴 关掉 \href / \includegraphics 等可逃逸构造 —— 安全闸门
+      })
+    } catch {
+      el.textContent = tex
+      el.classList.add('md-math-raw')
+    }
+  }
+}
+
 // ---------------------------------------------------------------- 生命周期
 
 /** 首次排版完成前不要响应缩放（否则会和"恢复阅读位置"抢滚动条） */
@@ -906,6 +972,11 @@ onMounted(async () => {
    * 但它要拉一个动态 chunk —— 放在 ready **之前**，保证恢复位置时一切就绪。
    */
   await highlightCode()
+  /*
+   * 公式和图片一样会**改变布局**（display 公式有可观的高度），
+   * 必须也在 ready 之前落地 —— 否则恢复阅读位置时锚点偏移是旧的。
+   */
+  await renderMath()
   // 图片尺寸变化会把后面内容顶下去 —— 再等一帧让布局稳定，再告诉 App "可以恢复了"
   await nextTick()
   mounted = true
@@ -1334,6 +1405,28 @@ onBeforeUnmount(() => {
 }
 .md-body :deep(.hljs-strong) {
   font-weight: 650;
+}
+
+/*
+ * 公式：行内公式跟正文基线走；`$$` 块级公式居中、上下留呼吸空间。
+ * KaTeX 自己的字体大小跟随容器（em），所以缩放字号公式一起变大。
+ */
+.md-body :deep(.md-math) {
+  white-space: normal;
+}
+.md-body :deep(.md-math[data-md-display]) {
+  display: block;
+  margin: 1.2em 0;
+  text-align: center;
+  overflow-x: auto; /* 超宽公式横向滚，不撑破版心（和代码块同一策略） */
+  overflow-y: hidden;
+  padding-bottom: 2px; /* 给下标留一点，别被 overflow 裁掉 */
+}
+/* KaTeX 挂了/没加载出来时显示原始 TeX —— 等宽 + 弱化，一眼知道"这是没渲染的源码" */
+.md-body :deep(.md-math-raw) {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.88em;
+  color: var(--mute);
 }
 
 /* 表格：外面那层 wrap 是渲染时加的（table 自己滚动会破坏列宽） */

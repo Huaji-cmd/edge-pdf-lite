@@ -35,3 +35,4 @@ declare module 'highlight.js/lib/common' {
   const hljs: HljsApi
   export default hljs
 }
+

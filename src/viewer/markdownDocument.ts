@@ -14,6 +14,8 @@
  *    第 3 条是真正的闸门 —— 前两条挡的是"标签注入"，挡不住"点一下就跳走"。
  */
 import MarkdownIt from 'markdown-it'
+import type StateBlock from 'markdown-it/lib/rules_block/state_block.mjs'
+import type StateInline from 'markdown-it/lib/rules_inline/state_inline.mjs'
 import taskLists from 'markdown-it-task-lists'
 import DOMPurify from 'dompurify'
 
@@ -26,6 +28,118 @@ export interface MdHeading {
 
 /** 图片占位的原因 —— 文案在组件里拼，这里只给机器可读的代号 */
 export type MdImgReason = 'remote' | 'absolute' | 'scheme' | 'empty'
+
+/*
+ * ---------------------------------------------------------------- 数学公式定界
+ *
+ * 自己写 `$...$` / `$$...$$` 规则，**不用 markdown-it-texmath**。
+ * 原因是实测踩到的坑：texmath 把 inline 规则注册在 `escape` 之前
+ * （优先级高于一切），于是**行内代码里的 `$E=mc^2$` 也被它吃掉** ——
+ * 对一篇"代码笔记"来说这是致命误判（`` `$VAR` ``、shell 命令随处可见）。
+ *
+ * 自己写的规则注册在 `backticks` **之前**：
+ *   · 解析游标指到 `` ` `` 时，我们的规则不匹配（开头不是 `$`），
+ *     反引号规则先吃掉整段 code span —— 里面的 `$` 从此不可见，天然受保护；
+ *   · 游标指到 `$` 时我们匹配，同时**拒绝内容里含反引号**的配对
+ *     （防止配对区间吞掉后面的 code span）。
+ *
+ * 其余边界（都实测验证过，见 make-md-testdata 的样本）：
+ *   · `\$`（转义）不当定界符 —— 配对时跳过 `\` 开头的 `$`，
+ *     自身的 `\$` 匹配失败后落回 escape 规则正常转义；
+ *   · `$5`、`$ 5`（$ 后紧跟数字/空白）不是公式开头 —— 货币符号不误触；
+ *   · 行内公式不跨行（GitHub/Typora 同款语义）；
+ *   · 内容里出现 `` ` `` 直接拒绝整段配对（保守但可预测）。
+ */
+
+/** 输出占位 span：TeX 编码进 data 属性，阅读器按需渲染 */
+function mathPlaceholder(tex: string, display: boolean): string {
+  const enc = encodeURIComponent(tex)
+  return display
+    ? `<span class="md-math" data-md-math="${enc}" data-md-display="1"></span>`
+    : `<span class="md-math" data-md-math="${enc}"></span>`
+}
+
+function mathInlineRule(state: StateInline, silent: boolean): boolean {
+  const src = state.src
+  const pos = state.pos
+  // 只在 `$` 处触发；前一个字符是 `\` 说明这是被转义的美元符号
+  if (src.charCodeAt(pos) !== 0x24 || src.charCodeAt(pos - 1) === 0x5c) return false
+  const next = src[pos + 1]
+  // `$$` 交给块级规则；`$5` / `$ x`（$ 后紧跟数字或空白）不是公式开头
+  if (!next || next === '$' || /\s|\d/.test(next)) return false
+
+  // 行内公式不跨行：只在当前行内找闭合
+  const lineEnd = src.indexOf('\n', pos + 1)
+  const limit = lineEnd === -1 ? src.length : lineEnd
+  let i = pos + 1
+  let close = -1
+  while (i < limit) {
+    const j = src.indexOf('$', i)
+    if (j === -1 || j >= limit) return false
+    if (src.charCodeAt(j - 1) === 0x5c) {
+      // `\$`：公式内容里的转义美元，继续找
+      i = j + 1
+      continue
+    }
+    close = j
+    break
+  }
+  if (close === -1) return false
+  const tex = src.slice(pos + 1, close)
+  // 内容含反引号 → 可能吞了 code span 的边界，保守拒绝
+  if (tex.includes('`')) return false
+  // 闭合 `$` 前不能是空白（`$ x $` 不是公式）
+  if (/\s$/.test(tex)) return false
+
+  if (!silent) {
+    const token = state.push('md_math_inline', '', 0)
+    token.content = tex
+  }
+  state.pos = close + 1
+  return true
+}
+
+function mathBlockRule(
+  state: StateBlock,
+  startLine: number,
+  endLine: number,
+  silent: boolean,
+): boolean {
+  const startPos = state.bMarks[startLine] + state.tShift[startLine]
+  const max = state.eMarks[startLine]
+  // 行首（允许缩进后）必须是 `$$`
+  if (startPos + 2 > max || state.src.slice(startPos, startPos + 2) !== '$$') return false
+  if (silent) return true
+
+  // 找以 `$$` 开头的闭合行；找不到就不当块级公式（整段按普通段落渲染）
+  let close = -1
+  for (let l = startLine + 1; l < endLine; l++) {
+    const p = state.bMarks[l] + state.tShift[l]
+    if (state.src.slice(p, p + 2) === '$$') {
+      close = l
+      break
+    }
+  }
+  if (close === -1) return false
+
+  // 取公式体：逐行取"缩进后的原文"，保住 `\,` 这类 TeX 转义
+  const lines: string[] = []
+  for (let l = startLine + 1; l < close; l++) {
+    lines.push(state.src.slice(state.bMarks[l] + state.tShift[l], state.eMarks[l]))
+  }
+  const token = state.push('md_math_block', '', 0)
+  token.content = lines.join('\n')
+  state.line = close + 1
+  return true
+}
+
+/** 数学公式的 markdown-it 插件（自定义 dollars 规则，见上方说明） */
+function mathDollars(md: MarkdownIt): void {
+  md.inline.ruler.before('backticks', 'md_math_inline', mathInlineRule)
+  md.block.ruler.before('fence', 'md_math_block', mathBlockRule)
+  md.renderer.rules.md_math_inline = (tokens, idx) => mathPlaceholder(tokens[idx].content, false)
+  md.renderer.rules.md_math_block = (tokens, idx) => mathPlaceholder(tokens[idx].content, true)
+}
 
 const md = new MarkdownIt({
   /*
@@ -45,6 +159,17 @@ const md = new MarkdownIt({
    * disabled checkbox，那个 checkbox 在下面会被换成**纯 span**（见 `upgradeDom`）。
    */
   .use(taskLists, { enabled: false, label: false })
+  .use(mathDollars)
+  /*
+   * 数学公式：`mathDollars`（上面自己写的规则）负责**找** `$...$` / `$$...$$`，
+   * 只输出**空占位 span**（TeX 源码编码进 data 属性）—— 真正"画"公式在阅读器
+   * 里按需加载 KaTeX（见 MarkdownViewer 的 renderMath）。没有公式的文档
+   * 一个字节都不多付（KaTeX 全家 ~280KB，不该进首屏）。
+   *
+   * ⚠️ KaTeX 的输出**不经过 DOMPurify** —— 它是从 TeX 生成的固定结构
+   *    （trust:false，不允许注入任意 HTML），走净化器反而会被
+   *    FORBID_ATTR 的 style 剥掉排版。这是有意的管线设计，不是疏漏。
+   */
 
 /** DOMPurify 的配置：只做"标签/属性"这一层，URL 由下面的规则单独管 */
 const SANITIZE = {

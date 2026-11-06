@@ -242,17 +242,22 @@ try {
   check('h1 文字正确', render.h1.includes('多格式阅读器'), render.h1)
   check('表格 + 滚动容器都在', render.table === 1 && render.tableWrap === 1)
   check('任务列表变成 span（没有 input 留在正文）', render.task === 3 && render.taskOn === 2 && render.inputLeft === 0, `task=${render.task} on=${render.taskOn} input=${render.inputLeft}`)
-  check('删除线 / 代码块 / 引用都渲染了', render.del === 1 && render.pre === 1 && render.quote === 1)
+  // pre=2：```text（公式对照围栏）+ ```ts（高亮 demo）
+  check('删除线 / 代码块 / 引用都渲染了', render.del === 1 && render.pre === 2 && render.quote === 1, `pre=${render.pre}`)
   check('外链被标成受控链接（data-md-href）', render.extLinks >= 2, `ext=${render.extLinks}`)
   check('站内锚点链保留为 .md-anchor', render.anchorLinks >= 1)
   check('所有标题都有 id（含中文）', render.headingsIds && render.cnId !== '', `id=${render.cnId}`)
 
   // 代码高亮：dynamic chunk 要拉一下，轮询等它落地
+  /*
+   * ⚠️ 别用"第一个 code 块"：样本里 ```text 围栏排在 ts demo 前面。
+   *    高亮判据要明确钉在 `language-ts` 的块上（"function demo" 在那里）。
+   */
   let hl = { kw: 0, text: '', script: 0, nolang: false }
   for (let i = 0; i < 50; i++) {
     hl = JSON.parse(
       await evaluate(`(() => {
-        const code = document.querySelector('.md-body pre code');
+        const code = document.querySelector('.md-body pre code.language-ts');
         const text = code ? (code.textContent || '') : '';
         return JSON.stringify({
           kw: code ? code.querySelectorAll('.hljs-keyword').length : 0,
@@ -546,6 +551,67 @@ try {
   check(
     '没有把 md 的位置写进 PDF 的键（两套键不能混）',
     (await evaluate(`Object.keys(localStorage).filter(k => k.startsWith('epl:reading:')).length`)) === 0,
+  )
+
+  // ---------------------------------------------------------------- 5a. 公式渲染（KaTeX 按需加载）
+  console.log('\n[5a] 公式渲染（KaTeX 按需加载）')
+
+  // KaTeX 是动态 chunk，轮询等它落地（和代码高亮同一策略）
+  let math = { total: 0, inline: 0, display: 0, cssLoaded: false }
+  for (let i = 0; i < 50; i++) {
+    math = JSON.parse(
+      await evaluate(`(() => {
+        const all = [...document.querySelectorAll('.md-body .katex')];
+        return JSON.stringify({
+          total: all.length,
+          inline: document.querySelectorAll('.md-body .md-math:not([data-md-display]) .katex').length,
+          display: document.querySelectorAll('.md-body .md-math[data-md-display] .katex').length,
+          cssLoaded: [...document.styleSheets].some((sh) => {
+            try {
+              // Vite 的动态 CSS chunk 是 <link> 注入 —— 查 href，不是 textContent
+              if (sh.href && /katex/i.test(sh.href)) return true
+              for (const r of sh.cssRules) {
+                if ((r.selectorText || '').includes('katex')) return true
+              }
+            } catch {
+              /* 跨域样式表读不了，跳过 */
+            }
+            return false
+          }),
+        });
+      })()`),
+    )
+    if (math.total >= 3) break
+    await sleep(150)
+  }
+  check('三处公式都被 KaTeX 渲染（行内 2 + 块级 1）', math.total === 3 && math.inline === 2 && math.display === 1, `total=${math.total} inline=${math.inline} display=${math.display}`)
+  check('KaTeX 的 CSS（含字体引用）真的加载了', math.cssLoaded)
+  // 块级公式是居中块；超宽时不撑破版心
+  const mathBox = JSON.parse(
+    await evaluate(`(() => {
+      const el = document.querySelector('.md-body .md-math[data-md-display]');
+      const cs = getComputedStyle(el);
+      const body = document.querySelector('[data-tid="md-viewer"]');
+      return JSON.stringify({ block: cs.display === 'block', ta: cs.textAlign, overflow: cs.overflowX, noHSwipe: el.scrollWidth <= body.clientWidth + 40 });
+    })()`),
+  )
+  check('块级公式是居中块（不是行内碎片）', mathBox.block && mathBox.ta === 'center', `ta=${mathBox.ta}`)
+  check('超宽公式横向滚动而不撑破版心', mathBox.overflow === 'auto' && mathBox.noHSwipe)
+  // 行内代码 / 代码块 / 转义 \$ 不被吃（规则层的边界在浏览器里再验一遍）
+  const mathSafe = JSON.parse(
+    await evaluate(`(() => {
+      const body = document.querySelector('.md-body');
+      const codeInline = [...body.querySelectorAll('code')].some((c) => (c.textContent || '').includes('$E = mc^2$'));
+      const codeBlock = [...body.querySelectorAll('pre code')].some((c) => (c.textContent || '').includes('$E = mc^2$'));
+      const escText = (body.textContent || '').includes('$100');
+      return JSON.stringify({ codeInline, codeBlock, escText });
+    })()`),
+  )
+  check('行内代码 / 代码块 / 转义 \\$ 里的 $ 保持纯文本', mathSafe.codeInline && mathSafe.codeBlock && mathSafe.escText)
+  // KaTeX 输出不经过 DOMPurify —— 但它自己的结构里不能混进用户 HTML（trust:false 守住）
+  check(
+    '公式区域没有任何可执行元素（KaTeX trust:false 的输出是安全的）',
+    await evaluate(`document.querySelectorAll('.md-body .katex script, .md-body .katex iframe, .md-body .katex a[href^="javascript"]').length === 0`),
   )
 
   // ---------------------------------------------------------------- 5b. 页内查找
