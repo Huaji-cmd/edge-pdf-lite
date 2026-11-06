@@ -1,7 +1,7 @@
 # edge-pdf-lite
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v1.4.0-4FC08D.svg)](https://github.com/Huaji-cmd/edge-pdf-lite/releases)
+[![Version](https://img.shields.io/badge/version-v2.0.0-4FC08D.svg)](https://github.com/Huaji-cmd/edge-pdf-lite/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-0078D6.svg)](#)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB.svg)](https://v2.tauri.app/)
 [![Vue](https://img.shields.io/badge/Vue-3-4FC08D.svg)](https://vuejs.org/)
@@ -13,7 +13,12 @@
 > —— 双页并排、阅读位置记忆、批注写回 PDF，以及把 Markdown 笔记并进同一个阅读器
 > （只读、可缩放、有标题大纲；要批注就先转 PDF）。
 
-> 📌 **`v1.4.0`**：两条用户报了很久的硬伤一起收了。
+> 📌 **`v2.0.0`**：从"PDF 批注编辑器"长成 **PDF / Markdown 双格式阅读器** ——
+> Markdown 只读阅读（大纲 / 字号缩放 / 公式 / 代码高亮 / 本地图片）、双端 Ctrl+F 页内查找、
+> 应用内一键转 PDF（Edge 无头打印，零安装依赖）。上一版的两条硬伤（划线串行、大文件保存）也已收口。
+
+<details>
+<summary><code>v1.4.0</code> 的两条硬伤修复（点击展开）</summary>
 > **① 划线不再串行** —— 以前想选第 2~3 行，鼠标划过行间空隙就会把页脚那段一起圈进去，
 > 根因是文本层的 DOM 顺序和视觉顺序不一致（pdf.js 按内容流排 span），现在按视觉位置重排。
 > **② 大文件保存不再卡几分钟** —— 92 MB / 376 页的扫描书、18 条批注，
@@ -54,7 +59,7 @@
 
 | 项 | 值 |
 |---|---|
-| **当前版本** | [`v1.4.0`](https://github.com/Huaji-cmd/edge-pdf-lite/releases/tag/v1.4.0) |
+| **当前版本** | [`v2.0.0`](https://github.com/Huaji-cmd/edge-pdf-lite/releases/tag/v2.0.0) |
 | **仓库状态** | 已公开，**未归档**（可读、可 fork） |
 | **维护** | 个人自用，按需更新；**不接收 PR**，Issue 可以提 |
 
@@ -76,7 +81,7 @@
 
 ## 更新日志
 
-### `v1.5.0` — 多格式阅读：PDF + Markdown（开发中）
+### `v2.0.0` — 多格式阅读：PDF + Markdown（2026-11-06）
 
 | 变化 | 说明 |
 |---|---|
@@ -89,9 +94,9 @@
 | **应用内转 PDF** | 桌面版工具栏「转 PDF 后批注」**一键转换**：选保存位置 → 生成 PDF → 自动打开批注。渲染用的是应用自己的管线（预览看到什么 PDF 就是什么，公式/代码高亮/本地图片都在），打印引擎是系统自带的 Edge 无头模式 —— **零安装依赖**。浏览器版仍给出外部工具引导 |
 | **数学公式** | `$...$` 行内 / `$$...$$` 块级，KaTeX **按需加载**（没有公式的文档一个字节不多付）。定界规则是**自己写的**（不用 texmath）—— 行内代码里的 `$VAR`、货币 `$5`、转义 `\$` 都不会误判成公式 |
 | **代码高亮 + 文件徽标** | 代码块按语言着色（颜色全部映射主题变量，日间/夜间都对）；highlight.js 是**动态加载**的 —— 没有代码块的文档一个字节都不多付。文件列表和搜索结果里，通用文件图标被 **PDF / MD 徽标**替代（文件名反而更宽） |
-| **页内查找（Ctrl+F）** | 在 Markdown 里按 Ctrl+F 打开查找条：全部匹配浅黄底、当前项橙色，Enter / Shift+Enter 逐个跳，Esc 关闭。实现用 CSS Custom Highlight API，**不往正文插标记** —— 缩放重排不会把高亮搞乱 |
+| **页内查找（Ctrl+F）** | Markdown 和 PDF **都支持**（共用同一个查找条）：全部匹配浅黄底、当前项橙色，Enter / Shift+Enter 逐个跳，Esc 关闭。Markdown 用 CSS Custom Highlight API（不往正文插标记，缩放重排不乱）；PDF 全文档搜索、跨页跳转（页码与视口自洽）、缩放后高亮自动重打 |
 
-PDF 那条链路**没有改**：批注、写回、单双页、缩略图、保存全部保持原行为（回归测试覆盖）。
+PDF 的批注、写回、单双页、缩略图、保存全部保持原行为（回归测试覆盖）。
 
 ### `v1.4.0` — 划选手感 + 大文件保存（2026-11-05）
 
@@ -109,6 +114,9 @@ PDF 那条链路**没有改**：批注、写回、单双页、缩略图、保存
 `write_pdf_tail` 的前置条件写得很死：必须**有真实文件路径**、产物**以原文件字节为前缀**
 （即真的是增量）、且**原文件长度和读进来时一致**（读完之后被人改过就拒绝写，宁可让你重开）。
 任何一条不成立就走回老路（整份 base64），浏览器版和拖进来的文件都走老路。
+
+
+</details>
 
 ### `v1.3.0` — 中文文本框 + 保存链路修复（2026-10-27）
 
@@ -395,10 +403,11 @@ exe **没有做代码签名**（签名证书要花钱，这是个人项目），
   比如判"批注写进去了"用的是 pdf-lib 直查 `/Annots` 且要求**恰好 +1**
   （测试样本本来就带 113 条批注，写成"大于 0"的话 writer 一行不写也照样绿）。
 - 新判据一律做**变异测试**：把修复注回去，确认测试真的变红，再还原。
-- `npm test` 九套（含新增的 Markdown 通道）；`npm run test:exe` **94** 项（含打包后桌面端专有能力）；
+- `npm test` **十套**（含 Markdown 通道与 PDF 查找）；`npm run test:exe` **133** 项（含打包后桌面端专有能力）；
   `npm run test:exe:heal` 另测 profile 自愈与单实例。
-- Rust 侧另有 **8 项单元测试**（`cd src-tauri && cargo test`），只测纯逻辑：
-  图片相对路径的越界拒绝、扩展名白名单、PDF / Markdown 的大小闸门。
+- Rust 侧另有 **10 项单元测试**（`cd src-tauri && cargo test`），只测纯逻辑：
+  图片相对路径的越界拒绝、扩展名白名单、PDF / Markdown 的大小闸门、
+  Edge 打印冒烟（真转换一份 HTML 验 PDF 魔数）。
   这条是专门为 `read_doc_asset` 加的 —— 端到端只能证明"读不到"，
   分不清是**被规则拒绝**还是**文件刚好不存在**。
 - `npm run test:exe:big` 拿一本真实的大 PDF（自备到 `my-test-books/`）走完整 UI 保存一次，
